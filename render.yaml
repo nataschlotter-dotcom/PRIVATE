@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: nata-schlott
+    runtime: python
+    region: virginia
+    buildCommand: python --version
+    startCommand: python app.py
+    healthCheckPath: /api/estado
+    autoDeploy: true
+    disk:
+      name: datos
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.1
+      - key: NS_HOST
+        value: 0.0.0.0
+      - key: NS_DB
+        value: /var/data/nata_schlott.db
+      - key: NS_CLAVE_INSTALACION
+        generateValue: true
