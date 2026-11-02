@@ -7,6 +7,11 @@
   --borde: #dfe1e3;
   --superficie: #ffffff;
   --suave: #f4f4f3;
+  --celeste-claro: #e3f4fc;
+  --celeste: #bfe6f7;
+  --celeste-fuerte: #a6dbf3;
+  --celeste-borde: #7fbfdd;
+  --celeste-tinta: #0f2f40;
   --acento: #b08d57;
   --acento-claro: #d8bf94;
   --marca: #323e48;
@@ -36,7 +41,7 @@ a { color: inherit; }
 .nav h4 { margin: 14px 10px 4px; font-size: 11px; font-weight: 600; letter-spacing: .04em; color: #b6babd; }
 .nav a { display: block; padding: 7px 10px; border-radius: 6px; text-decoration: none; color: #eceded; }
 .nav a:hover { background: rgba(255,255,255,.08); }
-.nav a.activo { background: var(--acento); color: #1d1a14; font-weight: 600; }
+.nav a.activo { background: var(--celeste); color: var(--celeste-tinta); font-weight: 700; }
 .cuenta { padding: 12px 16px; border-top: 1px solid rgba(255,255,255,.1); font-size: 13px; }
 .cuenta small { display: block; color: #c6c9cc; }
 .cuenta .enlaces { display: flex; gap: 12px; margin-top: 6px; }
@@ -64,7 +69,7 @@ a { color: inherit; }
 .pestanas { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 12px; }
 .pestanas button { background: rgba(255,255,255,.12); color: #fff; border: 0; padding: 7px 12px; border-radius: 6px; cursor: pointer; }
 .pestanas button:hover { background: rgba(255,255,255,.2); }
-.pestanas button.activo { background: #fff; color: var(--tinta); font-weight: 600; }
+.pestanas button.activo { background: var(--celeste); color: var(--celeste-tinta); font-weight: 700; }
 .filtros { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; margin-bottom: 12px; }
 .filtros label { font-size: 12px; color: var(--tinta-2); display: grid; gap: 2px; }
 .filtros.sobre-gris label { color: #e9eaea; }
@@ -75,14 +80,14 @@ input, select, textarea { border: 1px solid #b9bcc0; border-radius: 6px; padding
 input[type=checkbox], input[type=radio] { width: auto; }
 input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-visible, a:focus-visible { outline: 2px solid var(--acento); outline-offset: 1px; }
 input.num { text-align: right; font-variant-numeric: tabular-nums; }
-.btn { background: #fff; border: 1px solid #b9bcc0; border-radius: 6px; padding: 7px 12px; cursor: pointer; white-space: nowrap; color: var(--tinta); }
-.btn:hover { background: var(--suave); }
-.btn.primario { background: var(--acento); border-color: var(--acento); color: #1d1a14; font-weight: 600; }
-.btn.primario:hover { background: #c09d66; }
+.btn { background: var(--celeste-claro); border: 1px solid var(--celeste-borde); border-radius: 6px; padding: 7px 12px; cursor: pointer; white-space: nowrap; color: var(--celeste-tinta); font-weight: 500; }
+.btn:hover { background: var(--celeste); }
+.btn.primario { background: var(--celeste); border-color: var(--celeste-borde); color: var(--celeste-tinta); font-weight: 700; }
+.btn.primario:hover { background: var(--celeste-fuerte); }
 .btn.oscuro { background: var(--marca); border-color: var(--marca); color: #fff; }
-.btn.peligro { color: var(--peligro); border-color: #dcb0ac; }
-.btn.mini { padding: 3px 8px; font-size: 12.5px; }
-.btn:disabled { opacity: .55; cursor: default; }
+.btn.peligro { color: #8f2119; border-color: #d99a94; }
+.btn.mini { padding: 3px 8px; font-size: 13px; }
+.btn:disabled { background: var(--celeste-claro); color: #4a5f6a; border-color: #b9d6e3; cursor: default; }
 .acciones { display: flex; gap: 4px; justify-content: flex-end; flex-wrap: wrap; }
 
 /* Tablas */
@@ -181,7 +186,14 @@ tfoot td { font-weight: 600; border-top: 2px solid var(--borde); border-bottom: 
 .perm td.c, .perm th.c { text-align: center; }
 .logo-vista { width: 120px; height: 120px; object-fit: contain; border: 1px solid var(--borde); border-radius: 10px; padding: 6px; background: #fff; }
 
+/* Pantallas táctiles: botones más grandes y letra legible */
+@media (max-width: 1100px), (pointer: coarse) {
+  .btn, .pestanas button { min-height: 44px; padding: 9px 14px; font-size: 15px; }
+  .btn.mini { min-height: 38px; padding: 6px 10px; font-size: 14px; }
+}
 @media (max-width: 860px) {
+  input, select, textarea { font-size: 16px; }
+  .btn { white-space: normal; }
   .app { display: block; }
   .menu-movil { display: flex; }
   .lateral { position: fixed; inset: 0 auto 0 0; width: 260px; z-index: 15; transform: translateX(-100%); transition: transform .15s; }

@@ -7,17 +7,17 @@ const REGIONES = ['Arica y Parinacota', 'Tarapacá', 'Antofagasta', 'Atacama', '
 const TIPOS_MOV = {
   COMPRA: ['Compra', 'bien'], PRODUCCION: ['Producción', 'bien'], CONSUMO_PRODUCCION: ['Consumo en producción', ''], DESPACHO: ['Despacho', ''],
   RECEPCION_TIENDA: ['Recepción en tienda', 'bien'], MERMA: ['Merma', 'mal'], INVENTARIO: ['Toma de inventario', 'dorada'], VENTA: ['Venta', ''],
-  CONSUMO_INTERNO: ['Consumo interno', ''], ANULACION: ['Anulación', 'alerta'],
+  CONSUMO_INTERNO: ['Consumo interno', ''], ANULACION: ['Anulación', 'alerta'], AJUSTE_ADMIN: ['Actualización de stock', 'dorada'], DEVOLUCION_PROVEEDOR: ['Devolución a proveedor', 'alerta'],
 };
 const NAV = [
   ['', [['panel', 'Panel de inicio']]],
-  ['Compras', [['compras', 'Compras y proveedores', ['compras', 'proveedores']]]],
+  ['Compras', [['compras', 'Compras y proveedores', ['compras', 'proveedores']], ['devoluciones', 'Devoluciones a proveedores']]],
   ['Tiendas', [['tiendas', 'Tiendas'], ['bodegas', 'Bodegas']]],
   ['Artículos', [['articulos', 'Productos e insumos'], ['inventario', 'Toma de inventario'], ['historial', 'Historial'], ['mermas', 'Mermas']]],
   ['Producción', [['recetas', 'Recetas'], ['produccion', 'Producción']]],
   ['Logística', [['despachos', 'Despachos a tiendas']]],
   ['Gestión', [['reportes', 'Reportes']]],
-  ['Administración', [['usuarios', 'Usuarios y perfiles'], ['config', 'Configuración']]],
+  ['Administración', [['stock', 'Actualizar stock'], ['fudo', 'Integración Fudo', ['config']], ['usuarios', 'Usuarios y perfiles'], ['config', 'Configuración']]],
 ];
 
 /* ---------- utilidades ---------- */
@@ -84,7 +84,10 @@ const etq = (t, c = '') => `<span class="etq ${c}">${esc(t)}</span>`;
 const accion = (a, t, c = '') => `<button type="button" class="btn mini ${c}" data-a="${a}">${esc(t)}</button>`;
 const opciones = (lista, sel, vacio) => (vacio !== undefined ? `<option value="">${esc(vacio)}</option>` : '') +
   lista.map(o => `<option value="${esc(o.id)}" ${String(o.id) === String(sel) ? 'selected' : ''}>${esc(o.nombre)}</option>`).join('');
-const claseArticulo = a => a.tipo === 'PRODUCTO' ? 'Producto' : a.tipo === 'SUBPRODUCTO' ? 'Subproducto' : a.desechable ? 'Desechable / aseo' : 'Insumo';
+const claseArticulo = a => a.tipo === 'PRODUCTO' ? 'Producto' : a.tipo === 'SUBPRODUCTO' ? 'Subproducto' : a.punto_venta ? 'Insumo punto de venta' : a.desechable ? 'Desechable / aseo' : 'Insumo';
+const SECCIONES = [{ id: 'INSUMOS', nombre: 'Bodega de insumos' }, { id: 'PUNTO_VENTA', nombre: 'Bodega de insumos puntos de venta' }, { id: 'DESECHABLES', nombre: 'Bodega de desechables y aseo' }, { id: 'ELABORADOS', nombre: 'Bodega de productos y subproductos' }];
+const seccionDe = a => a.punto_venta ? 'PUNTO_VENTA' : a.desechable ? 'DESECHABLES' : a.tipo === 'INSUMO' ? 'INSUMOS' : 'ELABORADOS';
+const grupoDespacho = a => a.punto_venta ? `Insumos puntos de venta · ${a.categoria}` : a.desechable ? 'Desechables y aseo' : 'Productos';
 
 /* Tooltip compartido de gráficos */
 const tip = $('#tip');
@@ -208,7 +211,8 @@ function confirmar(titulo, texto, fn, btn = 'Confirmar') {
 
 /* Editor de líneas: artículo + cantidad (+ precio opcional) */
 function editorLineas(caja, cfg) {
-  const opts = cfg.articulos.map(a => `<option value="${a.id}">${esc(a.codigo)} · ${esc(a.nombre)}</option>`).join('');
+  const opcion = a => `<option value="${a.id}">${esc(a.codigo)} · ${esc(a.nombre)}</option>`;
+  const opts = cfg.grupos ? cfg.grupos.map(g => `<optgroup label="${esc(g.nombre)}">${cfg.articulos.filter(g.filtro).map(opcion).join('')}</optgroup>`).join('') : cfg.articulos.map(opcion).join('');
   caja.innerHTML = `<div class="tabla-marco"><table class="lineas"><thead><tr><th>Artículo</th><th class="n">Cantidad</th><th>Unidad</th>
     ${cfg.stock ? '<th class="n">Disponible</th>' : ''}${cfg.precio ? `<th class="n">${esc(cfg.precio)}</th><th class="n">Subtotal</th>` : ''}<th></th></tr></thead><tbody></tbody></table></div>
     <button type="button" class="btn mini agregar" style="margin-top:6px">+ Agregar línea</button>`;
@@ -440,6 +444,77 @@ async function verCompra(id) {
   return m;
 }
 
+/* ---------- Integración con Fudo ---------- */
+Vistas.fudo = async v => {
+  if (!can('config', 2)) { v.innerHTML = cabecera('Integración Fudo') + '<div class="tarjeta">Tu perfil solo puede ver esta sección con permiso de edición en Configuración.</div>'; return; }
+  const filas = await api('GET', '/fudo');
+  v.innerHTML = cabecera('Integración Fudo', 'Cada tienda se conecta con su propia cuenta de Fudo. Las guías se envían como gastos desde Despachos a tiendas.');
+  const c = v.appendChild(Object.assign(document.createElement('div'), { className: 'tarjeta' }));
+  const ajustes = async r => {
+    const l = await api('POST', `/fudo/${r.tienda_id}/probar`, {});
+    formulario(`Gastos de ${r.nombre}`, [
+      { k: 'categoria_id', t: 'Categoría de gasto en Fudo', tipo: 'select', op: l.categorias, vacio: 'Selecciona…', todo: 1 },
+      { k: 'proveedor_id', t: 'Proveedor en Fudo', tipo: 'select', op: l.proveedores, vacio: 'Sin proveedor', todo: 1 },
+      { k: 'monto', t: 'Monto del gasto', tipo: 'select', op: [{ id: 'TOTAL', nombre: 'Total de la guía, con IVA' }, { id: 'NETO', nombre: 'Neto de la guía, sin IVA' }], todo: 1 }], r, async d => {
+      await api('PUT', `/fudo/${r.tienda_id}/gastos`, { ...d, categoria: l.categorias.find(x => x.id === d.categoria_id)?.nombre || '', proveedor: l.proveedores.find(x => x.id === d.proveedor_id)?.nombre || '' });
+      aviso('Conexión con Fudo lista.'); render();
+    }, 'Guardar');
+  };
+  const credenciales = r => formulario(`Conectar ${r.nombre} con Fudo`, [
+    { k: 'api_key', t: 'API Key', auto: 'off', todo: 1, ayuda: r.key_final ? `Guardada, termina en ${r.key_final}. Déjala en blanco para mantenerla.` : 'En Fudo: Administración → Usuarios.' },
+    { k: 'api_secret', t: 'API Secret', tipo: 'password', auto: 'new-password', todo: 1, ayuda: r.conectada ? 'Guardada. Déjala en blanco para mantenerla.' : 'Se guarda en este sistema y no vuelve a mostrarse.' }], {}, async d => {
+    await api('PUT', `/fudo/${r.tienda_id}/credenciales`, d);
+    await ajustes(r);
+    render();
+  }, 'Guardar y probar');
+  tabla(c, { filas, vacio: 'Aún no hay tiendas.', acciones: { conectar: credenciales, ajustes: r => ajustes(r).catch(x => aviso(x.message, 1)) }, cols: [
+    { t: 'Tienda', v: r => r.nombre },
+    { t: 'Conexión', v: r => r.conectada, h: r => r.conectada && r.categoria_id ? etq('Lista', 'bien') : r.conectada ? etq('Falta categoría', 'alerta') : etq('Sin conectar') },
+    { t: 'Categoría de gasto', v: r => r.categoria }, { t: 'Proveedor', v: r => r.proveedor }, { t: 'Monto', v: r => r.conectada ? (r.monto === 'NETO' ? 'Neto' : 'Total') : '' },
+    { t: '', h: r => `<div class="acciones">${accion('conectar', r.conectada ? 'Cambiar credenciales' : 'Conectar')}${r.conectada ? accion('ajustes', 'Ajustar gastos') : ''}</div>` }] });
+};
+
+/* ---------- Devoluciones a proveedores ---------- */
+Vistas.devoluciones = async v => {
+  const crea = can('devoluciones', 2) && !S.usuario.tienda_id;
+  const filas = await api('GET', '/devoluciones');
+  v.innerHTML = cabecera('Devoluciones a proveedores', 'Cada devolución descuenta de la bodega central. Se devuelven insumos, insumos de puntos de venta, desechables y aseo; no productos ni subproductos.', crea ? '<button class="btn primario" id="n">Nueva devolución</button>' : '');
+  const c = v.appendChild(Object.assign(document.createElement('div'), { className: 'tarjeta' }));
+  tabla(c, { filas, csv: 'devoluciones', vacio: 'Aún no hay devoluciones.', acciones: { ver: r => verDevolucion(r.id),
+    anular: r => confirmar('Anular devolución', `El stock de la devolución #${r.id} volverá a la bodega central.`, async () => { await api('POST', `/devoluciones/${r.id}/anular`, {}); aviso('Devolución anulada.'); render(); }, 'Anular devolución') }, cols: [
+    { t: 'N°', v: r => r.id }, { t: 'Fecha', v: r => r.fecha, h: r => fFecha(r.fecha) }, { t: 'Proveedor', v: r => r.proveedor }, { t: 'RUT', v: r => r.rut }, { t: 'Documento', v: r => r.documento }, { t: 'Motivo', v: r => r.motivo },
+    { t: 'Neto', n: 1, v: r => r.neto, h: r => fPeso(r.neto) }, { t: 'IVA', n: 1, v: r => r.iva, h: r => fPeso(r.iva) }, { t: 'Total', n: 1, v: r => r.total, h: r => fPeso(r.total) },
+    { t: 'Estado', v: r => r.estado, h: r => r.estado === 'ANULADO' ? etq('Anulada', 'mal') : etq('Vigente', 'bien') },
+    { t: '', h: r => `<div class="acciones">${accion('ver', 'Ver')}${r.estado !== 'ANULADO' && crea ? accion('anular', 'Anular', 'peligro') : ''}</div>` }] });
+  $('#n', v)?.addEventListener('click', async () => {
+    const central = await api('GET', '/stock/central');
+    const stock = Object.fromEntries(central.map(a => [a.articulo_id, a.cantidad]));
+    const m = modal('Nueva devolución a proveedor', `<form novalidate><div class="campos"><label class="campo"><span>Proveedor</span><select name="proveedor_id">${opciones(S.cat.proveedores.filter(p => p.activo), '', 'Selecciona…')}</select></label>
+      <label class="campo"><span>Fecha</span><input type="date" name="fecha" value="${hoy()}"></label><label class="campo"><span>N° de documento</span><input name="documento" maxlength="40"></label><label class="campo"><span>Motivo</span><input name="motivo" maxlength="200"></label></div>
+      <h3 style="font-size:14px;margin:14px 0 6px">Detalle</h3><div id="lin"></div><div class="totales" id="tot"></div><div class="error" hidden></div>
+      <div class="modal-pie"><button type="button" class="btn cerrar">Cancelar</button><button class="btn primario">Registrar devolución</button></div></form>`, true);
+    $$('.cerrar', m.el).forEach(b => b.addEventListener('click', m.cerrar));
+    let ed = null;
+    const tot = () => { const n = ed ? ed.neto() : 0, i = n * S.cat.iva / 100; $('#tot', m.el).innerHTML = `<div><span>Neto</span><span>${fPeso(n)}</span></div><div><span>IVA ${fNum(S.cat.iva, 0, 2)}%</span><span>${fPeso(i)}</span></div><div class="total"><span>Total</span><span>${fPeso(n + i)}</span></div>`; };
+    const grupo = a => a.punto_venta ? `Insumos puntos de venta · ${a.categoria}` : a.desechable ? 'Desechables y aseo' : 'Insumos';
+    const articulos = S.cat.articulos.filter(a => a.tipo === 'INSUMO');
+    ed = editorLineas($('#lin', m.el), { articulos, stock, precio: 'Precio neto', editaPrecio: true, alCambiar: tot,
+      grupos: [...new Set(articulos.map(grupo))].sort().map(nombre => ({ nombre, filtro: a => grupo(a) === nombre })) });
+    tot();
+    const f = $('form', m.el);
+    conEnvio(f, m, async () => {
+      await api('POST', '/devoluciones', { proveedor_id: f.proveedor_id.value, fecha: f.fecha.value, documento: f.documento.value, motivo: f.motivo.value, items: ed.leer() });
+      aviso('Devolución registrada: el stock de la bodega central disminuyó.'); render();
+    });
+  });
+};
+async function verDevolucion(id) {
+  const d = await api('GET', `/devoluciones/${id}`);
+  modal(`Devolución #${d.id}`, `<div class="guia-datos"><div><b>Proveedor:</b> ${esc(d.proveedor)}</div><div><b>RUT:</b> ${esc(d.rut)}</div><div><b>Fecha:</b> ${fFecha(d.fecha)}</div><div><b>Documento:</b> ${esc(d.documento) || '—'}</div><div><b>Motivo:</b> ${esc(d.motivo)}</div><div><b>Registrada por:</b> ${esc(d.usuario)}</div></div>
+    <div class="tabla-marco"><table><thead><tr><th>Código</th><th>Insumo</th><th class="n">Cantidad</th><th class="n">Precio neto</th><th class="n">Subtotal</th></tr></thead><tbody>${d.items.map(i => `<tr><td>${esc(i.codigo)}</td><td>${esc(i.nombre)}</td><td class="n">${fCant(i.cantidad)} ${esc(i.unidad)}</td><td class="n">${fPrecio(i.precio)}</td><td class="n">${fPeso(i.cantidad * i.precio)}</td></tr>`).join('')}</tbody></table></div>
+    <div class="totales"><div><span>Neto</span><span>${fPeso(d.neto)}</span></div><div><span>IVA ${fNum(d.iva_pct, 0, 2)}%</span><span>${fPeso(d.iva)}</span></div><div class="total"><span>Total</span><span>${fPeso(d.total)}</span></div></div>`, true);
+}
+
 /* ---------- Tiendas ---------- */
 Vistas.tiendas = async v => {
   const filas = await api('GET', '/tiendas');
@@ -461,9 +536,9 @@ Vistas.tiendas = async v => {
 /* ---------- Artículos ---------- */
 let tabArt = 'PRODUCTO';
 Vistas.articulos = async v => {
-  const tabs = [['PRODUCTO', 'Productos'], ['SUBPRODUCTO', 'Subproductos'], ['INSUMO', 'Insumos'], ['DESECHABLE', 'Desechables y aseo'], ['categorias', 'Categorías'], ['unidades', 'Unidades de medida']];
+  const tabs = [['PRODUCTO', 'Productos'], ['SUBPRODUCTO', 'Subproductos'], ['INSUMO', 'Insumos'], ['PUNTO_VENTA', 'Insumos puntos de venta'], ['DESECHABLE', 'Desechables y aseo'], ['categorias', 'Categorías'], ['unidades', 'Unidades de medida']];
   const edita = can('articulos', 2), esArt = !['categorias', 'unidades'].includes(tabArt);
-  const notas = { PRODUCTO: 'Artículos terminados. El precio es el de venta, neto.', SUBPRODUCTO: 'Preparaciones que forman parte de un producto. Se fabrican con receta.', INSUMO: 'Ingredientes comprados a proveedores que forman parte de una receta. El precio se actualiza con la última compra.', DESECHABLE: 'Comprados a proveedores, no forman parte de una receta y se despachan a tiendas: vasos, bombillas, sachets, limpiavidrios.' };
+  const notas = { PRODUCTO: 'Artículos terminados. El precio es el de venta, neto.', SUBPRODUCTO: 'Preparaciones que forman parte de un producto. Se fabrican con receta.', INSUMO: 'Ingredientes comprados a proveedores que forman parte de una receta. El precio se actualiza con la última compra.', PUNTO_VENTA: 'Comprados a proveedores y despachados a tiendas, clasificados en café, chocolate, leches, té, agua, utensilios para café, utensilios de aseo y azúcar. No forman parte de una receta.', DESECHABLE: 'Comprados a proveedores, no forman parte de una receta y se despachan a tiendas: vasos, bombillas, sachets, limpiavidrios.' };
   v.innerHTML = cabecera('Productos, subproductos e insumos', notas[tabArt] || 'Tablas maestras', edita ? `<button class="btn primario" id="n">${esArt ? 'Nuevo artículo' : tabArt === 'categorias' ? 'Nueva categoría' : 'Nueva unidad'}</button>` : '');
   v.append(pestanas(tabs, tabArt, k => { tabArt = k; render(); }));
   const c = v.appendChild(Object.assign(document.createElement('div'), { className: 'tarjeta' }));
@@ -478,12 +553,14 @@ Vistas.articulos = async v => {
     return;
   }
   const todos = await api('GET', '/articulos');
-  const filas = todos.filter(a => tabArt === 'DESECHABLE' ? a.desechable : tabArt === 'INSUMO' ? a.tipo === 'INSUMO' && !a.desechable : a.tipo === tabArt);
+  const filas = todos.filter(a => tabArt === 'PUNTO_VENTA' ? a.punto_venta : tabArt === 'DESECHABLE' ? a.desechable && !a.punto_venta : tabArt === 'INSUMO' ? a.tipo === 'INSUMO' && !a.desechable : a.tipo === tabArt);
   const form = r => {
-    const inicial = r || { tipo: tabArt === 'DESECHABLE' ? 'INSUMO' : tabArt, desechable: tabArt === 'DESECHABLE' };
+    const despachable = tabArt === 'DESECHABLE' || tabArt === 'PUNTO_VENTA';
+    const inicial = r || { tipo: despachable ? 'INSUMO' : tabArt, desechable: despachable };
+    const categorias = tabArt === 'PUNTO_VENTA' && !r ? S.cat.categorias.filter(x => x.punto_venta) : despachable ? S.cat.categorias : S.cat.categorias.filter(x => !x.punto_venta);
     formulario(r ? 'Editar artículo' : 'Nuevo artículo', [
       { k: 'codigo', t: 'Código' }, { k: 'nombre', t: 'Nombre' },
-      { k: 'categoria_id', t: 'Clasificación o categoría', tipo: 'select', op: S.cat.categorias, vacio: 'Selecciona…' },
+      { k: 'categoria_id', t: 'Clasificación o categoría', tipo: 'select', op: categorias, vacio: 'Selecciona…' },
       { k: 'unidad_id', t: 'Unidad de medida', tipo: 'select', op: S.cat.unidades, vacio: 'Selecciona…' },
       { k: 'stock_minimo', t: 'Stock mínimo', tipo: 'num', dec: 5, min: 5, ayuda: 'Se muestra con miles y 5 decimales.' },
       { k: 'precio', t: inicial.tipo === 'INSUMO' ? 'Precio de compra neto' : inicial.tipo === 'PRODUCTO' ? 'Precio de venta neto' : 'Precio', tipo: 'num', dec: 2, ayuda: 'Con separador de miles.' },
@@ -494,27 +571,31 @@ Vistas.articulos = async v => {
     });
   };
   $('#n', v)?.addEventListener('click', () => form());
-  tabla(c, { filas, csv: 'articulos', vacio: 'Sin artículos en esta clasificación.', acciones: { editar: form }, cols: [
+  tabla(c, { filas, csv: 'articulos', vacio: 'Sin artículos en esta clasificación.', acciones: { editar: form,
+    borrar: r => confirmar('Eliminar artículo', `¿Eliminar "${r.nombre}"? No se podrá si tiene stock, recetas, compras, despachos u otros registros.`, async () => { await api('DELETE', `/articulos/${r.id}`); aviso('Artículo eliminado.'); render(); }, 'Eliminar') }, cols: [
     { t: 'Código', v: r => r.codigo }, { t: 'Nombre', v: r => r.nombre }, { t: 'Categoría', v: r => r.categoria }, { t: 'Unidad', v: r => r.unidad },
     { t: 'Stock mínimo', n: 1, v: r => r.stock_minimo, h: r => fMin(r.stock_minimo) },
     { t: 'Stock central', n: 1, v: r => r.stock, h: r => `${fCant(r.stock)}${r.stock < r.stock_minimo ? ' ' + etq('Bajo mínimo', 'mal') : ''}` },
     { t: 'Precio', n: 1, v: r => r.precio, h: r => fPrecio(r.precio) },
     { t: 'Estado', v: r => r.activo ? 'Activo' : 'Inactivo', h: r => r.activo ? etq('Activo', 'bien') : etq('Inactivo') },
-    { t: '', h: () => edita ? `<div class="acciones">${accion('editar', 'Editar')}</div>` : '' }] });
+    { t: '', h: () => edita ? `<div class="acciones">${accion('editar', 'Editar')}${accion('borrar', 'Eliminar', 'peligro')}</div>` : '' }] });
 };
 
 /* ---------- Toma de inventario ---------- */
+const nombreToma = r => r.seccion ? `${r.bodega} · ${SECCIONES.find(s => s.id === r.seccion).nombre}` : r.bodega;
 Vistas.inventario = async v => {
   const filas = await api('GET', '/inventarios');
   v.innerHTML = cabecera('Toma de inventario', 'Al cerrar, cada diferencia queda registrada en el historial y ajusta el stock.', can('inventario', 2) ? '<button class="btn primario" id="n">Nueva toma</button>' : '');
   $('#n', v)?.addEventListener('click', () => formulario('Nueva toma de inventario', [
-    { k: 'bodega_id', t: 'Bodega', tipo: 'select', op: bodegasOp(), todo: 1 }, { k: 'obs', t: 'Observación', tipo: 'area', todo: 1 }], {}, async d => {
+    { k: 'bodega_id', t: 'Bodega', tipo: 'select', op: bodegasOp(), todo: 1 },
+    ...(S.usuario.tienda_id ? [] : [{ k: 'seccion', t: 'Sección de bodega central', tipo: 'select', op: SECCIONES, vacio: 'Toda la bodega', todo: 1, ayuda: 'Solo se aplica a la bodega central.' }]),
+    { k: 'obs', t: 'Observación', tipo: 'area', todo: 1 }], {}, async d => {
     const r = await api('POST', '/inventarios', d); render(); abrirInventario(r.id);
   }, 'Crear toma'));
   const c = v.appendChild(Object.assign(document.createElement('div'), { className: 'tarjeta' }));
   tabla(c, { filas, vacio: 'Aún no hay tomas de inventario.', acciones: { abrir: r => abrirInventario(r.id),
     borrar: r => confirmar('Eliminar toma', `¿Eliminar la toma #${r.id} sin aplicar ajustes?`, async () => { await api('DELETE', `/inventarios/${r.id}`); render(); }, 'Eliminar') }, cols: [
-    { t: 'N°', v: r => r.id }, { t: 'Fecha', v: r => r.fecha, h: r => fFecha(r.fecha) }, { t: 'Bodega', v: r => r.bodega }, { t: 'Responsable', v: r => r.usuario },
+    { t: 'N°', v: r => r.id }, { t: 'Fecha', v: r => r.fecha, h: r => fFecha(r.fecha) }, { t: 'Bodega', v: r => nombreToma(r) }, { t: 'Responsable', v: r => r.usuario },
     { t: 'Contados', n: 1, v: r => r.contadas, h: r => `${fNum(r.contadas)} de ${fNum(r.lineas)}` }, { t: 'Con diferencia', n: 1, v: r => r.con_diferencia, h: r => fNum(r.con_diferencia) },
     { t: 'Estado', v: r => r.estado, h: r => r.estado === 'ABIERTO' ? etq('Abierta', 'alerta') : etq('Cerrada', 'bien') },
     { t: '', h: r => `<div class="acciones">${accion('abrir', r.estado === 'ABIERTO' && can('inventario', 2) ? 'Contar' : 'Ver')}${r.estado === 'ABIERTO' && can('inventario', 2) ? accion('borrar', 'Eliminar', 'peligro') : ''}</div>` }] });
@@ -527,7 +608,7 @@ async function abrirInventario(id) {
     return `<tr data-a="${i.articulo_id}" data-s="${sis}"><td>${esc(i.codigo)}</td><td>${esc(i.nombre)}</td><td class="n">${fCant(sis)} ${esc(i.unidad)}</td>
     <td class="n">${abierto ? inputNum('c', i.conteo, 5).replace('<input', `<input aria-label="Conteo de ${esc(i.nombre)}"`) : (i.conteo === null ? '—' : fCant(i.conteo))}</td><td class="n dif">${i.diferencia ? fCant(i.diferencia) : ''}</td></tr>`;
   }).join('');
-  const m = modal(`Toma #${inv.id} · ${inv.bodega}`, `<div class="tabla-marco"><table><thead><tr><th>Código</th><th>Artículo</th><th class="n">Stock sistema</th><th class="n">Conteo físico</th><th class="n">Diferencia</th></tr></thead><tbody>${filas}</tbody></table></div>
+  const m = modal(`Toma #${inv.id} · ${nombreToma(inv)}`, `<div class="tabla-marco"><table><thead><tr><th>Código</th><th>Artículo</th><th class="n">Stock sistema</th><th class="n">Conteo físico</th><th class="n">Diferencia</th></tr></thead><tbody>${filas}</tbody></table></div>
     <p class="tenue">${abierto ? 'Los artículos sin conteo no se ajustan.' : `Cerrada el ${fFecha(inv.cerrado || '') || '—'}.`}</p><div class="error" hidden></div>
     ${abierto ? '<form><div class="modal-pie"><button type="button" class="btn g">Guardar avance</button><button class="btn primario">Cerrar y ajustar stock</button></div></form>' : ''}`, true);
   if (!abierto) return;
@@ -558,7 +639,7 @@ Vistas.historial = async v => {
   const sel = (k, t, op) => `<label>${t}<select name="${k}">${opciones(op, f[k], 'Todos')}</select></label>`;
   v.innerHTML = cabecera('Historial de entradas y salidas', 'Productos, subproductos e insumos: proveedor, tienda de destino y motivo de cada movimiento.') + `<div class="tarjeta"><form class="filtros" id="fh">
     <label>Desde<input type="date" name="desde" value="${f.desde}"></label><label>Hasta<input type="date" name="hasta" value="${f.hasta}"></label>
-    ${sel('clase', 'Clasificación', [{ id: 'PRODUCTO', nombre: 'Productos' }, { id: 'SUBPRODUCTO', nombre: 'Subproductos' }, { id: 'INSUMO', nombre: 'Insumos' }, { id: 'DESECHABLE', nombre: 'Desechables y aseo' }])}
+    ${sel('clase', 'Clasificación', [{ id: 'PRODUCTO', nombre: 'Productos' }, { id: 'SUBPRODUCTO', nombre: 'Subproductos' }, { id: 'INSUMO', nombre: 'Insumos' }, { id: 'PUNTO_VENTA', nombre: 'Insumos puntos de venta' }, { id: 'DESECHABLE', nombre: 'Desechables y aseo' }])}
     ${sel('sentido', 'Sentido', [{ id: 'entrada', nombre: 'Entradas' }, { id: 'salida', nombre: 'Salidas' }])}
     ${sel('tipo', 'Movimiento', Object.entries(TIPOS_MOV).map(([id, x]) => ({ id, nombre: x[0] })))}
     ${sel('bodega', 'Bodega', bodegasOp())}
@@ -568,7 +649,7 @@ Vistas.historial = async v => {
   const filas = await api('GET', '/movimientos' + qs(f));
   tabla($('#th', v), { filas, csv: 'historial', vacio: 'Sin movimientos con estos filtros.', cols: [
     { t: 'Fecha', v: r => r.fecha, h: r => fFecha(r.fecha) }, { t: 'Código', v: r => r.codigo }, { t: 'Artículo', v: r => r.nombre },
-    { t: 'Clasificación', v: r => claseArticulo({ tipo: r.tipo_articulo, desechable: r.desechable }) },
+    { t: 'Clasificación', v: r => claseArticulo({ tipo: r.tipo_articulo, desechable: r.desechable, punto_venta: r.punto_venta }) },
     { t: 'Movimiento', v: r => TIPOS_MOV[r.tipo]?.[0] || r.tipo, h: r => etq(TIPOS_MOV[r.tipo]?.[0] || r.tipo, TIPOS_MOV[r.tipo]?.[1]) },
     { t: 'Entrada', n: 1, v: r => r.cantidad > 0 ? r.cantidad : '', h: r => r.cantidad > 0 ? `<span class="pos">${fCant(r.cantidad)}</span>` : '' },
     { t: 'Salida', n: 1, v: r => r.cantidad < 0 ? -r.cantidad : '', h: r => r.cantidad < 0 ? `<span class="neg">${fCant(-r.cantidad)}</span>` : '' },
@@ -631,19 +712,27 @@ Vistas.mermas = async v => {
 };
 
 /* ---------- Bodegas ---------- */
-let bodegaSel = null;
+let bodegaSel = null, seccionSel = '', clasifSel = '';
 Vistas.bodegas = async v => {
   const resumen = await api('GET', '/bodegas/resumen');
   const opts = bodegasOp();
-  if (!opts.some(o => o.id === bodegaSel)) bodegaSel = opts.find(o => o.id !== 0)?.id ?? opts[0]?.id ?? null;
-  v.innerHTML = cabecera('Bodegas', 'Stock de productos terminados y de insumos desechables o de aseo en cada tienda.');
+  if (!opts.some(o => o.id === bodegaSel)) bodegaSel = opts[0]?.id ?? null;
+  v.innerHTML = cabecera('Bodegas', 'La bodega central se divide en insumos, insumos puntos de venta, desechables y productos. Cada tienda tiene su propia bodega.');
+  const central = S.usuario.tienda_id ? [] : await api('GET', '/bodegas/stock' + qs({ bodega: 0 }));
   const kp = v.appendChild(Object.assign(document.createElement('div'), { className: 'kpis' }));
-  kp.innerHTML = resumen.map(t => `<div class="kpi"><span>${esc(t.nombre)}</span><strong>${fPeso(t.valor)}</strong><small>${fNum(t.articulos)} artículos con stock · ${esc(t.comuna)}</small></div>`).join('');
+  kp.innerHTML = (S.usuario.tienda_id ? [] : SECCIONES).map(s => {
+    const f = central.filter(a => seccionDe(a) === s.id), bajo = f.filter(a => a.cantidad < a.stock_minimo).length;
+    return `<div class="kpi ${bajo ? 'alerta' : ''}"><span>${esc(s.nombre)}</span><strong>${fPeso(f.reduce((t, a) => t + a.cantidad * a.costo, 0))}</strong><small>${fNum(f.filter(a => a.cantidad > 0).length)} artículos con stock · ${fNum(bajo)} bajo mínimo</small></div>`;
+  }).join('') + resumen.map(t => `<div class="kpi"><span>${esc(t.nombre)}</span><strong>${fPeso(t.valor)}</strong><small>${fNum(t.articulos)} artículos con stock · ${esc(t.comuna)}</small></div>`).join('');
   if (bodegaSel === null) { v.insertAdjacentHTML('beforeend', '<div class="tarjeta vacio">Aún no hay tiendas.</div>'); return; }
   const c = v.appendChild(Object.assign(document.createElement('div'), { className: 'tarjeta' }));
-  const filas = await api('GET', '/bodegas/stock' + qs({ bodega: bodegaSel }));
-  c.innerHTML = `<div class="filtros"><label>Bodega<select id="sb">${opciones(opts, bodegaSel)}</select></label>${bodegaSel && can('bodegas', 2) ? '<button class="btn primario" id="sal">Registrar venta o consumo</button>' : ''}</div><div id="tb"></div>`;
+  const todas = bodegaSel === 0 ? central : await api('GET', '/bodegas/stock' + qs({ bodega: bodegaSel }));
+  const verClasif = bodegaSel === 0 && seccionSel === 'PUNTO_VENTA';
+  const filas = (bodegaSel === 0 && seccionSel ? todas.filter(a => seccionDe(a) === seccionSel) : todas).filter(a => !verClasif || !clasifSel || a.categoria === clasifSel);
+  c.innerHTML = `<div class="filtros"><label>Bodega<select id="sb">${opciones(opts, bodegaSel)}</select></label>${bodegaSel === 0 ? `<label>Sección<select id="ss">${opciones(SECCIONES, seccionSel, 'Todas las secciones')}</select></label>` : ''}${verClasif ? `<label>Clasificación<select id="sc">${opciones(S.cat.categorias.filter(x => x.punto_venta).map(x => ({ id: x.nombre, nombre: x.nombre })), clasifSel, 'Todas')}</select></label>` : ''}${bodegaSel && can('bodegas', 2) ? '<button class="btn primario" id="sal">Registrar venta o consumo</button>' : ''}</div><div id="tb"></div>`;
   $('#sb', c).addEventListener('change', e => { bodegaSel = Number(e.target.value); render(); });
+  $('#ss', c)?.addEventListener('change', e => { seccionSel = e.target.value; render(); });
+  $('#sc', c)?.addEventListener('change', e => { clasifSel = e.target.value; render(); });
   tabla($('#tb', c), { filas, csv: 'bodega', vacio: 'Sin artículos.', cols: [
     { t: 'Código', v: r => r.codigo }, { t: 'Artículo', v: r => r.nombre }, { t: 'Clasificación', v: r => claseArticulo(r) }, { t: 'Categoría', v: r => r.categoria },
     { t: 'Stock', n: 1, v: r => r.cantidad, h: r => `${fCant(r.cantidad)} ${esc(r.unidad)}${r.cantidad <= 0 ? ' ' + etq('Sin stock', 'mal') : bodegaSel === 0 && r.cantidad < r.stock_minimo ? ' ' + etq('Bajo mínimo', 'mal') : ''}` },
@@ -654,6 +743,62 @@ Vistas.bodegas = async v => {
     { k: 'fecha', t: 'Fecha', tipo: 'date', def: hoy() }, { k: 'obs', t: 'Observación' }], {}, async d => {
     await api('POST', '/bodegas/salidas', { ...d, tienda_id: bodegaSel }); aviso('Salida registrada.'); render();
   }, 'Registrar'));
+};
+
+/* ---------- Actualizar stock (solo perfil Administrador) ---------- */
+let stockBodega = 0;
+Vistas.stock = async v => {
+  const opts = bodegasOp();
+  if (!opts.some(o => o.id === stockBodega)) stockBodega = opts[0]?.id ?? 0;
+  const filas = await api('GET', '/actualizar-stock' + qs({ bodega: stockBodega }));
+  const nombreBodega = opts.find(o => o.id === stockBodega)?.nombre || '';
+  v.innerHTML = cabecera('Actualizar stock', 'Escribe el stock real de la bodega elegida. Cada cambio queda en el historial con tu usuario y el motivo.');
+  const c = v.appendChild(Object.assign(document.createElement('div'), { className: 'tarjeta' }));
+  c.innerHTML = `<div class="filtros"><label>Bodega<select id="ab">${opciones(opts, stockBodega)}</select></label>
+    ${stockBodega === 0 ? `<label>Sección<select id="as">${opciones(SECCIONES, '', 'Todas las secciones')}</select></label>` : ''}
+    <label>Buscar<input id="aq" autocomplete="off"></label></div>
+    <div class="tabla-marco"><table><thead><tr><th>Código</th><th>Artículo</th><th>Clasificación</th><th class="n">Stock actual</th><th class="n">Stock nuevo</th><th class="n">Diferencia</th></tr></thead><tbody>
+    ${filas.map(r => `<tr data-a="${r.articulo_id}" data-s="${r.cantidad}" data-sec="${seccionDe(r)}" data-t="${esc(`${r.codigo} ${r.nombre}`.toLowerCase())}"><td>${esc(r.codigo)}</td><td>${esc(r.nombre)}</td><td>${esc(claseArticulo(r))}${r.punto_venta ? ' · ' + esc(r.categoria) : ''}</td><td class="n">${fCant(r.cantidad)} ${esc(r.unidad)}</td>
+      <td class="n">${inputNum('c', '', 5).replace('<input', `<input aria-label="Stock nuevo de ${esc(r.nombre)}"`)}</td><td class="n dif"></td></tr>`).join('') || '<tr><td colspan="6" class="vacio">Sin artículos.</td></tr>'}
+    </tbody></table></div>
+    <p class="tenue">Los artículos que dejes en blanco no cambian.</p>
+    <label class="campo"><span>Motivo</span><input id="am" maxlength="200" autocomplete="off"></label><div class="error" hidden></div>
+    <div class="modal-pie"><button type="button" class="btn primario" id="ag">Guardar cambios</button></div>`;
+  const lineas = $$('tbody tr[data-a]', c);
+  const leer = () => lineas.flatMap(tr => {
+    const n = aNum($('.c', tr).value), s = Number(tr.dataset.s);
+    if (Number.isNaN(n) || (n !== null && n < 0)) throw new Error(`El stock nuevo de ${$('td:nth-child(2)', tr).textContent} no es válido.`);
+    return n === null || Math.abs(n - s) < 1e-6 ? [] : [{ articulo_id: Number(tr.dataset.a), cantidad: n, esperado: s }];
+  });
+  const pinta = tr => {
+    const n = aNum($('.c', tr).value), d = $('.dif', tr);
+    if (n === null || Number.isNaN(n)) { d.textContent = ''; d.className = 'n dif'; return; }
+    const x = n - Number(tr.dataset.s);
+    d.textContent = (x > 0 ? '+' : '') + fCant(x);
+    d.className = 'n dif ' + (x > 0 ? 'pos' : x < 0 ? 'neg' : '');
+  };
+  const filtrar = () => {
+    const q = $('#aq', c).value.trim().toLowerCase(), sec = $('#as', c)?.value || '';
+    lineas.forEach(tr => { tr.hidden = (!!sec && tr.dataset.sec !== sec) || !tr.dataset.t.includes(q); });
+  };
+  lineas.forEach(tr => tr.addEventListener('input', () => pinta(tr)));
+  $('#as', c)?.addEventListener('change', filtrar);
+  $('#aq', c).addEventListener('input', filtrar);
+  $('#ab', c).addEventListener('change', e => {
+    if (lineas.some(tr => $('.c', tr).value) && !confirm('Se perderán los cambios sin guardar. ¿Cambiar de bodega?')) { e.target.value = stockBodega; return; }
+    stockBodega = Number(e.target.value); render();
+  });
+  $('#ag', c).addEventListener('click', () => {
+    const err = $('.error', c); err.hidden = true;
+    try {
+      const items = leer(), motivo = $('#am', c).value.trim();
+      if (!items.length) throw new Error('No hay cambios de stock para guardar.');
+      if (!motivo) throw new Error('Indica el motivo de la actualización.');
+      confirmar('Actualizar stock', `Se actualizarán ${items.length} artículo(s) en ${nombreBodega}. El cambio se aplica de inmediato y queda en el historial.`, async () => {
+        await api('POST', '/actualizar-stock', { bodega_id: stockBodega, motivo, items }); aviso('Stock actualizado.'); render();
+      }, 'Actualizar');
+    } catch (x) { err.textContent = x.message; err.hidden = false; }
+  });
 };
 
 /* ---------- Recetas ---------- */
@@ -735,12 +880,24 @@ Vistas.despachos = async v => {
   const filas = await api('GET', '/despachos');
   v.innerHTML = cabecera('Despachos a tiendas', 'Cada guía descuenta de la bodega central y aumenta el stock de la bodega de la tienda.', crea ? '<button class="btn primario" id="n">Nueva guía</button>' : '');
   const c = v.appendChild(Object.assign(document.createElement('div'), { className: 'tarjeta' }));
+  const fudoEnvio = async (r, ruta, cuerpo, ok) => {
+    const x = await api('POST', `/despachos/${r.id}/fudo${ruta}`, cuerpo);
+    render();
+    if (!x.ok) throw new Error(x.error);
+    aviso(ok);
+  };
+  const nGuia = r => String(r.id).padStart(6, '0');
+  const estadoFudo = r => r.fudo_estado === 'ENVIADO' ? etq(r.estado === 'ANULADO' ? 'Gasto vigente' : `Gasto #${r.fudo_gasto_id}`, r.estado === 'ANULADO' ? 'alerta' : 'bien') : r.fudo_estado === 'ANULADO' ? etq('Gasto anulado') : ['ENVIANDO', 'REVISAR'].includes(r.fudo_estado) ? etq('Revisar', 'alerta') : r.estado === 'VIGENTE' ? etq('Sin enviar') : '—';
   tabla(c, { filas, csv: 'despachos', vacio: 'Aún no hay guías.', acciones: { ver: r => verGuia(r.id),
+    fudo: r => confirmar('Enviar a Fudo', `Se creará un gasto en la cuenta Fudo de ${r.tienda} por la guía ${nGuia(r)}.`, () => fudoEnvio(r, '', {}, 'Gasto creado en Fudo.'), 'Enviar a Fudo'),
+    fudorev: r => confirmar('Reenviar a Fudo', `No se sabe si el gasto de la guía ${nGuia(r)} llegó a Fudo. Busca el comprobante GD-${nGuia(r)} en Fudo: reenvía solo si NO está, para no duplicarlo.`, () => fudoEnvio(r, '', { confirmar_reenvio: true }, 'Gasto creado en Fudo.'), 'No está: reenviar'),
+    fudoanula: r => confirmar('Anular gasto en Fudo', `Se anulará en Fudo el gasto #${r.fudo_gasto_id} de la guía ${nGuia(r)}.`, () => fudoEnvio(r, '/anular', {}, 'Gasto anulado en Fudo.'), 'Anular gasto'),
     anular: r => confirmar('Anular guía', `Se devolverá a la bodega central lo despachado en la guía ${String(r.id).padStart(6, '0')}. Requiere que la tienda aún tenga ese stock.`, async () => { await api('POST', `/despachos/${r.id}/anular`, {}); aviso('Guía anulada.'); render(); }, 'Anular guía') }, cols: [
     { t: 'Guía', v: r => String(r.id).padStart(6, '0') }, { t: 'Fecha', v: r => r.fecha, h: r => fFecha(r.fecha) }, { t: 'Tienda', v: r => r.tienda }, { t: 'Líneas', n: 1, v: r => r.lineas },
     { t: 'Neto', n: 1, v: r => r.neto, h: r => fPeso(r.neto) }, { t: 'Total', n: 1, v: r => r.total, h: r => fPeso(r.total) }, { t: 'Transportista', v: r => r.transportista },
     { t: 'Estado', v: r => r.estado, h: r => r.estado === 'ANULADO' ? etq('Anulada', 'mal') : etq('Emitida', 'bien') },
-    { t: '', h: r => `<div class="acciones">${accion('ver', 'Ver guía')}${r.estado === 'VIGENTE' && crea ? accion('anular', 'Anular', 'peligro') : ''}</div>` }] });
+    ...(S.usuario.tienda_id ? [] : [{ t: 'Fudo', v: r => r.fudo_estado, h: estadoFudo }]),
+    { t: '', h: r => `<div class="acciones">${accion('ver', 'Ver guía')}${crea && r.estado === 'VIGENTE' && !r.fudo_estado ? accion('fudo', 'Enviar a Fudo') : ''}${crea && r.estado === 'VIGENTE' && ['ENVIANDO', 'REVISAR'].includes(r.fudo_estado) ? accion('fudorev', 'Revisar Fudo') : ''}${crea && r.estado === 'ANULADO' && r.fudo_estado === 'ENVIADO' ? accion('fudoanula', 'Anular en Fudo', 'peligro') : ''}${r.estado === 'VIGENTE' && crea ? accion('anular', 'Anular', 'peligro') : ''}</div>` }] });
   $('#n', v)?.addEventListener('click', async () => {
     const central = await api('GET', '/stock/central');
     const stock = Object.fromEntries(central.map(a => [a.articulo_id, a.cantidad]));
@@ -752,7 +909,8 @@ Vistas.despachos = async v => {
     $$('.cerrar', m.el).forEach(b => b.addEventListener('click', m.cerrar));
     let ed = null;
     const tot = () => { const n = ed ? ed.neto() : 0, i = n * S.cat.iva / 100; $('#tot', m.el).innerHTML = `<div><span>Neto</span><span>${fPeso(n)}</span></div><div><span>IVA ${fNum(S.cat.iva, 0, 2)}%</span><span>${fPeso(i)}</span></div><div class="total"><span>Total</span><span>${fPeso(n + i)}</span></div>`; };
-    ed = editorLineas($('#lin', m.el), { articulos: S.cat.articulos.filter(a => a.tipo === 'PRODUCTO' || a.desechable), stock, precio: 'Precio', alCambiar: tot });
+    ed = editorLineas($('#lin', m.el), { articulos: S.cat.articulos.filter(a => a.tipo === 'PRODUCTO' || a.desechable), stock, precio: 'Precio', alCambiar: tot,
+      grupos: [...new Set(S.cat.articulos.filter(a => a.tipo === 'PRODUCTO' || a.desechable).sort((x, y) => (x.desechable - y.desechable) || (x.punto_venta - y.punto_venta) || x.categoria.localeCompare(y.categoria)).map(grupoDespacho))].map(nombre => ({ nombre, filtro: a => grupoDespacho(a) === nombre })) });
     tot();
     const f = $('form', m.el);
     conEnvio(f, m, async () => {
@@ -767,7 +925,7 @@ async function verGuia(id) {
   const m = modal(`Guía ${num}`, `<div class="guia-cab"><div class="guia-marca"><img src="${esc(logo())}" alt=""><div><strong>Nata &amp; Schlott</strong><span class="tenue">Sistema de producción y logística</span></div></div>
     <div class="guia-num"><span>Guía de despacho interna</span><strong>N° ${num}</strong>${g.estado === 'ANULADO' ? etq('ANULADA', 'mal') : ''}</div></div>
     <div class="guia-datos"><div><b>Fecha:</b> ${fFecha(g.fecha)}</div><div><b>Origen:</b> Bodega central</div><div><b>Destino:</b> ${esc(g.tienda)}</div><div><b>Dirección:</b> ${esc(g.direccion)}</div><div><b>Comuna:</b> ${esc(g.comuna)}</div><div><b>Región:</b> ${esc(g.region)}</div><div><b>Transportista:</b> ${esc(g.transportista) || '—'}</div><div><b>Patente:</b> ${esc(g.patente) || '—'}</div><div><b>Emitida por:</b> ${esc(g.usuario)}</div></div>
-    <div class="tabla-marco"><table><thead><tr><th>Código</th><th>Descripción</th><th class="n">Cantidad</th><th>Unidad</th><th class="n">Precio</th><th class="n">Subtotal</th></tr></thead><tbody>${g.items.map(i => `<tr><td>${esc(i.codigo)}</td><td>${esc(i.nombre)}</td><td class="n">${fCant(i.cantidad)}</td><td>${esc(i.unidad)}</td><td class="n">${fPrecio(i.precio)}</td><td class="n">${fPeso(i.cantidad * i.precio)}</td></tr>`).join('')}</tbody></table></div>
+    <div class="tabla-marco"><table><thead><tr><th>Código</th><th>Descripción</th><th class="n">Cantidad</th><th>Unidad</th><th class="n">Precio</th><th class="n">Subtotal</th></tr></thead><tbody>${[...new Set(g.items.map(grupoDespacho))].map(titulo => { const its = g.items.filter(i => grupoDespacho(i) === titulo); return `<tr><td colspan="6"><b>${esc(titulo)}</b></td></tr>` + its.map(i => `<tr><td>${esc(i.codigo)}</td><td>${esc(i.nombre)}</td><td class="n">${fCant(i.cantidad)}</td><td>${esc(i.unidad)}</td><td class="n">${fPrecio(i.precio)}</td><td class="n">${fPeso(i.cantidad * i.precio)}</td></tr>`).join(''); }).join('')}</tbody></table></div>
     <div class="totales"><div><span>Neto</span><span>${fPeso(g.neto)}</span></div><div><span>IVA ${fNum(g.iva_pct, 0, 2)}%</span><span>${fPeso(g.iva)}</span></div><div class="total"><span>Total</span><span>${fPeso(g.total)}</span></div></div>
     ${g.obs ? `<p><b>Observación:</b> ${esc(g.obs)}</p>` : ''}<div class="firmas"><div>Entrega</div><div>Recibe conforme</div></div>
     <p class="legal">Documento de control interno. No reemplaza la guía de despacho electrónica exigida por el SII.</p>
@@ -925,7 +1083,7 @@ Vistas.config = async v => {
 };
 
 /* ---------- arranque y rutas ---------- */
-const PERMISO_RUTA = { compras: ['compras', 'proveedores'] };
+const PERMISO_RUTA = { compras: ['compras', 'proveedores'], fudo: ['config'] };
 let turno = 0;
 function primeraRuta() {
   for (const [, items] of NAV) for (const [m, , alt] of items) if ((alt || [m]).some(x => can(x))) return m;

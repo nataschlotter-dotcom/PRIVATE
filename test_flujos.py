@@ -5,7 +5,7 @@ import os
 import sys
 import tempfile
 import threading
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 os.environ["NS_DB"] = os.path.join(tempfile.mkdtemp(), "prueba.db")
 import app  # noqa: E402
@@ -52,7 +52,7 @@ A("POST", "/instalar", {"nombre": "Admin", "username": "admin", "password": "pru
 A("POST", "/instalar", {"nombre": "X", "username": "x", "password": "prueba-segura-1"}, 409)
 
 cat = A("GET", "/catalogos")
-cid = cat["categorias"][0]["id"]
+cid = next(x["id"] for x in cat["categorias"] if not x["punto_venta"])
 kg = next(u["id"] for u in cat["unidades"] if u["abreviatura"] == "kg")
 un = next(u["id"] for u in cat["unidades"] if u["abreviatura"] == "un")
 
@@ -154,6 +154,55 @@ assert len(aj) == 1 and abs(aj[0]["cantidad"] + 0.5) < 1e-6
 A("POST", f"/inventarios/{inv}/cerrar", {}, 409)
 A("DELETE", f"/inventarios/{inv}", esperado=409)
 
+# Insumos puntos de venta: clasificados, en su sección, despachables y fuera de recetas
+cats = {x["nombre"]: x for x in A("GET", "/categorias")}
+assert all(cats[n]["punto_venta"] == 1 for n in app.CATEGORIAS_PUNTO_VENTA) and sum(x["punto_venta"] for x in cats.values()) == 8
+cafe = A("POST", "/articulos", {"tipo": "INSUMO", "codigo": "CAF", "nombre": "Cafe", "categoria_id": cats["Café"]["id"], "unidad_id": kg, "precio": 100})["id"]
+A("POST", "/articulos", {"tipo": "PRODUCTO", "codigo": "MAL", "nombre": "Malo", "categoria_id": cats["Café"]["id"], "unidad_id": kg}, 400)
+cafe_art = next(x for x in A("GET", "/articulos") if x["id"] == cafe)
+assert cafe_art["desechable"] == 1 and cafe_art["punto_venta"] == 1
+A("POST", "/compras", {"proveedor_id": prov, "numero": "PV1", "items": [{"articulo_id": cafe, "cantidad": 5, "precio": 100}]})
+gp = A("POST", "/despachos", {"tienda_id": tienda2, "items": [{"articulo_id": cafe, "cantidad": 2}, {"articulo_id": vaso, "cantidad": 1}]})["id"]
+it = {i["articulo_id"]: i for i in A("GET", f"/despachos/{gp}")["items"]}
+assert it[cafe]["punto_venta"] == 1 and it[cafe]["categoria"] == "Café"
+casi(stock(tienda2)[cafe], 2)
+assert all(x["punto_venta"] == 1 for x in A("GET", "/movimientos?desde=2026-01-01&clase=PUNTO_VENTA")) and A("GET", "/movimientos?desde=2026-01-01&clase=PUNTO_VENTA")
+tp = A("POST", "/inventarios", {"bodega_id": 0, "seccion": "PUNTO_VENTA"})["id"]
+assert {i["articulo_id"] for i in A("GET", f"/inventarios/{tp}")["items"]} == {cafe}
+A("DELETE", f"/inventarios/{tp}")
+A("POST", f"/despachos/{gp}/anular", {})
+
+# Eliminar artículos: solo si no tienen relaciones, y sin dejar líneas sueltas en tomas
+libre = art("INSUMO", "LIBRE", un)
+tl = A("POST", "/inventarios", {"bodega_id": 0, "seccion": "INSUMOS"})["id"]
+A("DELETE", f"/articulos/{libre}")
+assert libre not in {x["id"] for x in A("GET", "/articulos")} and libre not in {i["articulo_id"] for i in A("GET", f"/inventarios/{tl}")["items"]}
+A("DELETE", f"/inventarios/{tl}")
+A("DELETE", "/articulos/999999", esperado=404)
+for relacionado in (harina, vaso, base, torta, cafe):
+    A("DELETE", f"/articulos/{relacionado}", esperado=409)
+contado = art("INSUMO", "CONTADO", un)
+tc = A("POST", "/inventarios", {"bodega_id": 0, "seccion": "INSUMOS"})["id"]
+A("PUT", f"/inventarios/{tc}", {"items": [{"articulo_id": contado, "conteo": 0}]})
+A("DELETE", f"/articulos/{contado}", esperado=409)
+A("DELETE", f"/inventarios/{tc}"); A("DELETE", f"/articulos/{contado}")
+cat_libre = A("POST", "/categorias", {"nombre": "Sin uso"})["id"]; A("DELETE", f"/categorias/{cat_libre}")
+A("DELETE", f"/categorias/{cats['Café']['id']}", esperado=409)
+
+# Toma por sección de la bodega central: cada una cuenta solo sus artículos y pueden coexistir
+A("POST", "/inventarios", {"bodega_id": 0, "seccion": "OTRA"}, 400)
+ti = A("POST", "/inventarios", {"bodega_id": 0, "seccion": "INSUMOS"})["id"]
+td = A("POST", "/inventarios", {"bodega_id": 0, "seccion": "DESECHABLES"})["id"]
+A("POST", "/inventarios", {"bodega_id": 0, "seccion": "INSUMOS"}, 409)
+A("POST", "/inventarios", {"bodega_id": 0}, 409)
+ids_i = {i["articulo_id"] for i in A("GET", f"/inventarios/{ti}")["items"]}
+assert harina in ids_i and vaso not in ids_i and torta not in ids_i
+assert {i["articulo_id"] for i in A("GET", f"/inventarios/{td}")["items"]} == {vaso}
+A("DELETE", f"/inventarios/{ti}"); A("DELETE", f"/inventarios/{td}")
+te = A("POST", "/inventarios", {"bodega_id": 0, "seccion": "ELABORADOS"})["id"]
+assert torta in {i["articulo_id"] for i in A("GET", f"/inventarios/{te}")["items"]}
+A("DELETE", f"/inventarios/{te}")
+
 # Anular guía: revierte, pero no si la tienda ya no tiene el stock
 A("POST", f"/despachos/{g}/anular", {}, 409)  # los vasos ya bajaron a 28,5 de 30
 s0 = stock(); assert abs(s0[vaso] - 70) < 1e-6 and stock(tienda)[torta] == 1  # sin cambios parciales
@@ -182,6 +231,147 @@ P("GET", "/compras", esperado=403); P("POST", "/usuarios", {}, 403); P("GET", "/
 P("GET", "/produccion"); P("GET", "/produccion/recetas")
 T("GET", "/compras", esperado=403); T("GET", "/usuarios", esperado=403); T("POST", "/despachos", {}, 403)
 T("GET", "/stock/central", esperado=403)
+# Fudo: contra un servidor simulado, sin duplicar gastos ante respuestas inciertas
+class FudoFalso(BaseHTTPRequestHandler):
+    gastos, modo, tokens = [], "ok", 0
+
+    def log_message(self, *_):
+        pass
+
+    def responder(self, status, datos):
+        b = json.dumps(datos).encode()
+        self.send_response(status); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+
+    def leer(self):
+        return json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+
+    def do_POST(self):
+        d, cls = self.leer(), FudoFalso
+        if self.path == "/auth":
+            if d.get("apiSecret") != "secreto-correcto":
+                return self.responder(401, {"errors": [{"title": "Credenciales"}]})
+            cls.tokens += 1
+            return self.responder(200, {"token": "tok", "exp": 9999999999})
+        assert self.headers["Authorization"] == "Bearer tok" and self.path == "/api/expenses"
+        if cls.modo == "rechazo":
+            return self.responder(422, {"errors": [{"detail": "Categoría inválida"}]})
+        cls.gastos.append(d)
+        if cls.modo == "caida":
+            return self.responder(500, {})
+        self.responder(201, {"data": {"id": str(len(cls.gastos)), "type": "Expense"}})
+
+    def do_PATCH(self):
+        FudoFalso.ultimo_patch = (self.path, self.leer())
+        self.responder(200, {"data": {}})
+
+    def do_GET(self):
+        n = "Categoría" if "categories" in self.path else "Proveedor"
+        self.responder(200, {"data": [{"id": "7", "attributes": {"name": n}}]})
+
+
+falso = ThreadingHTTPServer(("127.0.0.1", 0), FudoFalso)
+threading.Thread(target=falso.serve_forever, daemon=True).start()
+app.FUDO_API = f"http://127.0.0.1:{falso.server_address[1]}/api"
+app.FUDO_AUTH = f"http://127.0.0.1:{falso.server_address[1]}/auth"
+gf = A("POST", "/despachos", {"tienda_id": tienda2, "fecha": "2026-03-04", "items": [{"articulo_id": vaso, "cantidad": 2}]})["id"]
+for cli in (T, P):
+    cli("POST", f"/despachos/{gf}/fudo", {}, 403); cli("GET", "/fudo", esperado=403)
+    cli("PUT", f"/fudo/{tienda2}/credenciales", {"api_key": "k", "api_secret": "s"}, 403)
+A("POST", f"/despachos/{gf}/fudo", {}, 400)  # sin conexión
+A("POST", f"/fudo/{tienda2}/probar", {}, 400)
+A("PUT", f"/fudo/{tienda2}/credenciales", {"api_key": "clave-1234", "api_secret": "malo"})
+A("POST", f"/fudo/{tienda2}/probar", {}, 502)
+A("PUT", f"/fudo/{tienda2}/credenciales", {"api_secret": "secreto-correcto"})
+lista_f = A("GET", "/fudo")
+assert "secreto-correcto" not in json.dumps(lista_f) and "clave-1234" not in json.dumps(lista_f)
+assert next(x for x in lista_f if x["tienda_id"] == tienda2)["key_final"] == "1234"
+pr = A("POST", f"/fudo/{tienda2}/probar", {})
+assert pr["categorias"] == [{"id": "7", "nombre": "Categoría"}]
+A("POST", f"/despachos/{gf}/fudo", {}, 400)  # falta categoría
+A("PUT", f"/fudo/{tienda2}/gastos", {"categoria_id": "abc", "monto": "TOTAL"}, 400)
+A("PUT", f"/fudo/{tienda2}/gastos", {"categoria_id": "7", "categoria": "Categoría", "proveedor_id": "7", "proveedor": "Proveedor", "monto": "TOTAL"})
+FudoFalso.modo = "rechazo"
+r_f = A("POST", f"/despachos/{gf}/fudo", {})
+assert not r_f["ok"] and "Categoría inválida" in r_f["error"] and A("GET", f"/despachos/{gf}")["fudo_estado"] == ""
+FudoFalso.modo = "caida"
+assert not A("POST", f"/despachos/{gf}/fudo", {})["ok"] and len(FudoFalso.gastos) == 1
+assert A("GET", f"/despachos/{gf}")["fudo_estado"] == "REVISAR"
+A("POST", f"/despachos/{gf}/fudo", {}, 409)  # incierto: no reenvía sin confirmación
+assert len(FudoFalso.gastos) == 1
+FudoFalso.modo, FudoFalso.gastos = "ok", []
+r_f = A("POST", f"/despachos/{gf}/fudo", {"confirmar_reenvio": True})
+assert r_f["ok"] and r_f["gasto_id"] == "1"
+g_f = A("GET", f"/despachos/{gf}")
+assert g_f["fudo_estado"] == "ENVIADO" and g_f["fudo_gasto_id"] == "1" and g_f["fudo_error"] == ""
+env = FudoFalso.gastos[0]["data"]
+assert env["type"] == "Expense" and env["attributes"]["date"] == "2026-03-04" and env["attributes"]["amount"] == round(g_f["total"])
+assert env["attributes"]["receiptNumber"] == f"GD-{gf:06d}" and env["attributes"]["useInCashCount"] is False
+assert env["relationships"]["expenseCategory"]["data"]["id"] == "7" and env["relationships"]["provider"]["data"]["type"] == "Provider"
+A("POST", f"/despachos/{gf}/fudo", {"confirmar_reenvio": True}, 409)  # ya enviado
+assert len(FudoFalso.gastos) == 1
+A("POST", f"/despachos/{gf}/fudo/anular", {}, 409)  # la guía sigue vigente
+A("POST", f"/despachos/{gf}/anular", {})
+A("POST", f"/despachos/{gf}/fudo", {}, 409)  # guía anulada
+assert A("POST", f"/despachos/{gf}/fudo/anular", {})["ok"]
+assert FudoFalso.ultimo_patch[0] == "/api/expenses/1" and FudoFalso.ultimo_patch[1]["data"]["attributes"]["canceled"] is True
+assert A("GET", f"/despachos/{gf}")["fudo_estado"] == "ANULADO"
+A("POST", f"/despachos/{gf}/fudo/anular", {}, 409)
+# El respaldo descargado no incluye las credenciales
+conn = http.client.HTTPConnection("127.0.0.1", PUERTO); conn.request("GET", "/api/config/respaldo", headers={"Cookie": A.cookie}); resp = conn.getresponse().read()
+assert b"secreto-correcto" not in resp and b"clave-1234" not in resp and resp[:15] == b"SQLite format 3"
+
+# Devoluciones a proveedores: solo insumos, desde bodega central, con historial y anulación
+for cli in (T, P):
+    cli("GET", "/devoluciones", esperado=403)
+    cli("POST", "/devoluciones", {}, 403)
+dev = {"proveedor_id": prov, "motivo": "Mal estado", "documento": "NC-1"}
+s_dev, s_vaso = stock()[harina], stock()[vaso]
+costo_dev, precio_dev = (lambda a: (a["costo"], a["precio"]))(next(x for x in A("GET", "/articulos") if x["id"] == harina))
+A("POST", "/devoluciones", {**dev, "items": [{"articulo_id": torta, "cantidad": 1, "precio": 1}]}, 400)
+A("POST", "/devoluciones", {**dev, "items": [{"articulo_id": base, "cantidad": 1, "precio": 1}]}, 400)
+A("POST", "/devoluciones", {**dev, "motivo": "", "items": [{"articulo_id": harina, "cantidad": 1, "precio": 1}]}, 400)
+A("POST", "/devoluciones", {**dev, "items": [{"articulo_id": harina, "cantidad": 1, "precio": 1}, {"articulo_id": vaso, "cantidad": s_vaso + 1, "precio": 1}]}, 409)
+casi(stock()[harina], s_dev)  # sin cambios parciales
+assert not A("GET", "/devoluciones")
+dv = A("POST", "/devoluciones", {**dev, "items": [{"articulo_id": harina, "cantidad": 2, "precio": 1000}, {"articulo_id": vaso, "cantidad": 3, "precio": 50}]})["id"]
+casi(stock()[harina], s_dev - 2); casi(stock()[vaso], s_vaso - 3)
+det_dev = A("GET", f"/devoluciones/{dv}")
+casi(det_dev["neto"], 2150); assert det_dev["motivo"] == "Mal estado" and len(det_dev["items"]) == 2
+md = A("GET", "/movimientos?desde=2026-01-01&tipo=DEVOLUCION_PROVEEDOR")
+assert len(md) == 2 and all(x["proveedor"] == "Proveedor" and x["cantidad"] < 0 for x in md)
+a_dev = next(x for x in A("GET", "/articulos") if x["id"] == harina)
+casi(a_dev["costo"], costo_dev); casi(a_dev["precio"], precio_dev)
+A("DELETE", f"/articulos/{harina}", esperado=409)
+A("POST", f"/devoluciones/{dv}/anular", {})
+casi(stock()[harina], s_dev); casi(stock()[vaso], s_vaso)
+A("POST", f"/devoluciones/{dv}/anular", {}, 409)
+assert A("GET", f"/devoluciones/{dv}")["estado"] == "ANULADO"
+
+# Actualizar stock: solo el perfil Administrador, sin saldos negativos y con historial
+assert A("GET", "/estado")["usuario"]["permisos"]["stock"] == 2
+A("PUT", f"/perfiles/{perfiles['Producción']}", {"nombre": "Producción", "permisos": {"stock": 2, "produccion": 2}})
+assert "stock" not in P("GET", "/estado")["usuario"]["permisos"]
+for cli in (T, P):
+    cli("GET", "/actualizar-stock", esperado=403)
+    cli("POST", "/actualizar-stock", {"bodega_id": 0, "motivo": "x", "items": []}, 403)
+assert "stock" not in {m["id"] for m in A("GET", "/estado")["modulos"]}
+A("PUT", f"/perfiles/{perfiles['Administrador']}", {"nombre": "Otro", "permisos": {"usuarios": 2}}, 409)
+aj = art("INSUMO", "AJUSTE", un)
+A("POST", "/actualizar-stock", {"bodega_id": 0, "motivo": "", "items": [{"articulo_id": aj, "cantidad": 5, "esperado": 0}]}, 400)
+A("POST", "/actualizar-stock", {"bodega_id": 0, "motivo": "m", "items": [{"articulo_id": aj, "cantidad": -1, "esperado": 0}]}, 400)
+A("POST", "/actualizar-stock", {"bodega_id": 0, "motivo": "m", "items": [{"articulo_id": aj, "cantidad": 0, "esperado": 0}]}, 400)
+A("POST", "/actualizar-stock", {"bodega_id": tienda, "motivo": "m", "items": [{"articulo_id": harina, "cantidad": 1, "esperado": 0}]}, 400)
+s_h = stock()[harina]
+A("POST", "/actualizar-stock", {"bodega_id": 0, "motivo": "m", "items": [{"articulo_id": harina, "cantidad": s_h + 1, "esperado": s_h}, {"articulo_id": aj, "cantidad": 5, "esperado": 9}]}, 409)
+casi(stock()[harina], s_h)  # sin cambios parciales
+assert A("POST", "/actualizar-stock", {"bodega_id": 0, "motivo": "Carga inicial", "items": [{"articulo_id": aj, "cantidad": 5.5, "esperado": 0}]})["actualizados"] == 1
+casi(stock()[aj], 5.5)
+ma = A("GET", f"/movimientos?desde=2026-01-01&tipo=AJUSTE_ADMIN&articulo_id={aj}")
+assert len(ma) == 1 and ma[0]["obs"] == "Carga inicial" and abs(ma[0]["saldo"] - 5.5) < 1e-6
+A("POST", "/actualizar-stock", {"bodega_id": 0, "motivo": "Corrige", "items": [{"articulo_id": aj, "cantidad": 0, "esperado": 5.5}]})
+casi(stock()[aj], 0)
+A("POST", "/actualizar-stock", {"bodega_id": tienda, "motivo": "Local", "items": [{"articulo_id": vaso, "cantidad": stock(tienda)[vaso] + 1, "esperado": stock(tienda)[vaso]}]})
+A("POST", "/actualizar-stock", {"bodega_id": tienda, "motivo": "Local", "items": [{"articulo_id": vaso, "cantidad": stock(tienda)[vaso] - 1, "esperado": stock(tienda)[vaso]}]})
 # Usuario de tienda: solo su bodega
 T("GET", f"/bodegas/stock?bodega={tienda2}", esperado=403); T("GET", "/bodegas/stock?bodega=0", esperado=403)
 assert {x["articulo_id"] for x in T("GET", "/bodegas/stock") if x["cantidad"] > 0} == {torta, vaso}

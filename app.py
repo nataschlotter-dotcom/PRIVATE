@@ -15,6 +15,8 @@ import secrets
 import sqlite3
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from datetime import date, datetime, timedelta
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,23 +28,30 @@ STATIC = BASE / "static"
 DB_PATH = os.environ.get("NS_DB", str(BASE / "nata_schlott.db"))
 CLAVE_INSTALACION = os.environ.get("NS_CLAVE_INSTALACION", "").strip()  # protege el primer inicio cuando está en internet
 CENTRAL = 0  # bodega_id de la bodega central de producción
+SECCIONES = {"INSUMOS": "a.tipo='INSUMO' AND a.desechable=0", "PUNTO_VENTA": "c.punto_venta=1", "DESECHABLES": "a.desechable=1 AND c.punto_venta=0",
+             "ELABORADOS": "a.tipo IN ('PRODUCTO','SUBPRODUCTO')"}  # secciones de la bodega central, según la clase del artículo
+CATEGORIAS_PUNTO_VENTA = ("Café", "Chocolate", "Leches", "Té", "Agua", "Utensilios para café", "Utensilios de aseo", "Azúcar")
+FUDO_API = os.environ.get("NS_FUDO_API", "https://api.fu.do/v1alpha1")
+FUDO_AUTH = os.environ.get("NS_FUDO_AUTH", "https://auth.fu.do/api")
+FUDO_TIMEOUT = 20
 SESION_HORAS = 12
 MAX_BODY = 5 * 1024 * 1024
 MAX_LOGO = 2 * 1024 * 1024
 
 MODULOS = [
-    ("panel", "Panel de inicio"), ("compras", "Compras"), ("proveedores", "Proveedores e IVA"),
+    ("panel", "Panel de inicio"), ("compras", "Compras"), ("devoluciones", "Devoluciones a proveedores"), ("proveedores", "Proveedores e IVA"),
     ("tiendas", "Tiendas"), ("articulos", "Artículos y catálogos"), ("inventario", "Toma de inventario"),
-    ("historial", "Historial de movimientos"), ("mermas", "Mermas"), ("bodegas", "Bodegas de tiendas"),
+    ("historial", "Historial de movimientos"), ("mermas", "Mermas"), ("bodegas", "Bodegas"),
     ("recetas", "Recetas"), ("produccion", "Producción"), ("despachos", "Despachos a tiendas"),
     ("reportes", "Reportes de gestión"), ("usuarios", "Usuarios y perfiles"), ("config", "Configuración"),
 ]
 TODOS = [m for m, _ in MODULOS]
+PERFIL_ADMIN = "Administrador"  # "stock" no está en MODULOS: solo este perfil lo recibe, y no se puede asignar a otros
 PERFILES = {
-    "Administrador": {m: 2 for m in TODOS},
+    PERFIL_ADMIN: {m: 2 for m in TODOS},
     "Gerencia": {**{m: 1 for m in TODOS if m not in ("usuarios", "config")}},
     "Producción": {"panel": 1, "articulos": 1, "inventario": 2, "historial": 1, "mermas": 2, "recetas": 2, "produccion": 2},
-    "Bodega y logística": {"panel": 1, "compras": 2, "proveedores": 2, "tiendas": 1, "articulos": 2, "inventario": 2,
+    "Bodega y logística": {"panel": 1, "compras": 2, "devoluciones": 2, "proveedores": 2, "tiendas": 1, "articulos": 2, "inventario": 2,
                            "historial": 1, "mermas": 2, "bodegas": 2, "despachos": 2},
     "Tienda": {"inventario": 2, "historial": 1, "mermas": 2, "bodegas": 2, "despachos": 1},
 }
@@ -57,7 +66,7 @@ CREATE TABLE IF NOT EXISTS usuarios(id INTEGER PRIMARY KEY, username TEXT NOT NU
   activo INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS sesiones(token TEXT PRIMARY KEY, usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE, expira REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS proveedores(id INTEGER PRIMARY KEY, rut TEXT NOT NULL UNIQUE, nombre TEXT NOT NULL, activo INTEGER NOT NULL DEFAULT 1);
-CREATE TABLE IF NOT EXISTS categorias(id INTEGER PRIMARY KEY, nombre TEXT NOT NULL UNIQUE);
+CREATE TABLE IF NOT EXISTS categorias(id INTEGER PRIMARY KEY, nombre TEXT NOT NULL UNIQUE, punto_venta INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS unidades(id INTEGER PRIMARY KEY, nombre TEXT NOT NULL UNIQUE, abreviatura TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS motivos_merma(id INTEGER PRIMARY KEY, nombre TEXT NOT NULL UNIQUE);
 CREATE TABLE IF NOT EXISTS articulos(id INTEGER PRIMARY KEY, tipo TEXT NOT NULL CHECK(tipo IN ('PRODUCTO','SUBPRODUCTO','INSUMO')),
@@ -74,13 +83,22 @@ CREATE TABLE IF NOT EXISTS compras(id INTEGER PRIMARY KEY, fecha TEXT NOT NULL, 
   obs TEXT NOT NULL DEFAULT '', estado TEXT NOT NULL DEFAULT 'VIGENTE', usuario_id INTEGER REFERENCES usuarios(id));
 CREATE TABLE IF NOT EXISTS compra_items(compra_id INTEGER NOT NULL REFERENCES compras(id), articulo_id INTEGER NOT NULL REFERENCES articulos(id),
   cantidad REAL NOT NULL, precio REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS devoluciones(id INTEGER PRIMARY KEY, fecha TEXT NOT NULL, proveedor_id INTEGER NOT NULL REFERENCES proveedores(id),
+  documento TEXT NOT NULL DEFAULT '', motivo TEXT NOT NULL, iva_pct REAL NOT NULL, neto REAL NOT NULL, iva REAL NOT NULL, total REAL NOT NULL,
+  estado TEXT NOT NULL DEFAULT 'VIGENTE', usuario_id INTEGER REFERENCES usuarios(id));
+CREATE TABLE IF NOT EXISTS devolucion_items(devolucion_id INTEGER NOT NULL REFERENCES devoluciones(id), articulo_id INTEGER NOT NULL REFERENCES articulos(id),
+  cantidad REAL NOT NULL, precio REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS historial_precios(id INTEGER PRIMARY KEY, articulo_id INTEGER NOT NULL REFERENCES articulos(id),
   proveedor_id INTEGER NOT NULL REFERENCES proveedores(id), compra_id INTEGER NOT NULL REFERENCES compras(id), fecha TEXT NOT NULL, precio REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS producciones(id INTEGER PRIMARY KEY, fecha TEXT NOT NULL, articulo_id INTEGER NOT NULL REFERENCES articulos(id),
   cantidad REAL NOT NULL, costo_total REAL NOT NULL, obs TEXT NOT NULL DEFAULT '', estado TEXT NOT NULL DEFAULT 'VIGENTE', usuario_id INTEGER REFERENCES usuarios(id));
 CREATE TABLE IF NOT EXISTS despachos(id INTEGER PRIMARY KEY, fecha TEXT NOT NULL, tienda_id INTEGER NOT NULL REFERENCES tiendas(id),
   transportista TEXT NOT NULL DEFAULT '', patente TEXT NOT NULL DEFAULT '', obs TEXT NOT NULL DEFAULT '', iva_pct REAL NOT NULL,
-  neto REAL NOT NULL, iva REAL NOT NULL, total REAL NOT NULL, estado TEXT NOT NULL DEFAULT 'VIGENTE', usuario_id INTEGER REFERENCES usuarios(id));
+  neto REAL NOT NULL, iva REAL NOT NULL, total REAL NOT NULL, estado TEXT NOT NULL DEFAULT 'VIGENTE', usuario_id INTEGER REFERENCES usuarios(id),
+  fudo_estado TEXT NOT NULL DEFAULT '', fudo_gasto_id TEXT NOT NULL DEFAULT '', fudo_error TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS fudo_tiendas(tienda_id INTEGER PRIMARY KEY REFERENCES tiendas(id) ON DELETE CASCADE, api_key TEXT NOT NULL, api_secret TEXT NOT NULL,
+  categoria_id TEXT NOT NULL DEFAULT '', categoria TEXT NOT NULL DEFAULT '', proveedor_id TEXT NOT NULL DEFAULT '', proveedor TEXT NOT NULL DEFAULT '',
+  monto TEXT NOT NULL DEFAULT 'TOTAL');
 CREATE TABLE IF NOT EXISTS despacho_items(despacho_id INTEGER NOT NULL REFERENCES despachos(id), articulo_id INTEGER NOT NULL REFERENCES articulos(id),
   cantidad REAL NOT NULL, precio REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS mermas(id INTEGER PRIMARY KEY, fecha TEXT NOT NULL, articulo_id INTEGER NOT NULL REFERENCES articulos(id),
@@ -89,7 +107,7 @@ CREATE TABLE IF NOT EXISTS mermas(id INTEGER PRIMARY KEY, fecha TEXT NOT NULL, a
 CREATE TABLE IF NOT EXISTS salidas_tienda(id INTEGER PRIMARY KEY, fecha TEXT NOT NULL, tienda_id INTEGER NOT NULL REFERENCES tiendas(id),
   articulo_id INTEGER NOT NULL REFERENCES articulos(id), cantidad REAL NOT NULL, motivo TEXT NOT NULL, obs TEXT NOT NULL DEFAULT '', usuario_id INTEGER REFERENCES usuarios(id));
 CREATE TABLE IF NOT EXISTS inventarios(id INTEGER PRIMARY KEY, fecha TEXT NOT NULL, bodega_id INTEGER NOT NULL, estado TEXT NOT NULL DEFAULT 'ABIERTO',
-  obs TEXT NOT NULL DEFAULT '', usuario_id INTEGER REFERENCES usuarios(id), cerrado TEXT);
+  obs TEXT NOT NULL DEFAULT '', usuario_id INTEGER REFERENCES usuarios(id), cerrado TEXT, seccion TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS inventario_items(inventario_id INTEGER NOT NULL REFERENCES inventarios(id) ON DELETE CASCADE,
   articulo_id INTEGER NOT NULL REFERENCES articulos(id), stock_sistema REAL NOT NULL, conteo REAL, diferencia REAL,
   PRIMARY KEY(inventario_id, articulo_id));
@@ -307,6 +325,30 @@ def crear_compra(db, uid, d):
     return cid
 
 
+def crear_devolucion(db, uid, d):
+    """Saca insumos de la bodega central hacia el proveedor. No toca el costo promedio ni el historial de precios."""
+    fecha = fecha_valida(d.get("fecha"))
+    prov = entero(d.get("proveedor_id"), "el proveedor")
+    if not row(db, "SELECT id FROM proveedores WHERE id=? AND activo=1", prov):
+        raise ApiError(400, "Proveedor no válido o inactivo.")
+    motivo = txt(d.get("motivo"), "el motivo", True, 200)
+    documento = txt(d.get("documento"), "El documento", False, 40)
+    items = lineas(d.get("items"), "El precio")
+    pct = iva_actual(db)
+    neto = round(sum(i["cantidad"] * i["precio"] for i in items), 2)
+    iva = round(neto * pct / 100, 2)
+    did = db.execute("INSERT INTO devoluciones(fecha,proveedor_id,documento,motivo,iva_pct,neto,iva,total,usuario_id) VALUES(?,?,?,?,?,?,?,?,?)",
+                     (fecha, prov, documento, motivo, pct, neto, iva, round(neto + iva, 2), uid)).lastrowid
+    ref = f"Devolución #{did}" + (f" · Doc. {documento}" if documento else "")
+    for i in items:
+        a = articulo(db, i["articulo_id"])
+        if a["tipo"] != "INSUMO":
+            raise ApiError(400, f"{a['nombre']} no se devuelve a proveedores: los productos y subproductos no están permitidos.")
+        db.execute("INSERT INTO devolucion_items VALUES(?,?,?,?)", (did, a["id"], i["cantidad"], i["precio"]))
+        mover(db, a["id"], CENTRAL, -i["cantidad"], "DEVOLUCION_PROVEEDOR", uid, fecha, "DEVOLUCION", did, ref, proveedor=prov, obs=motivo)
+    return did
+
+
 def receta_de(db, art_id):
     r = row(db, "SELECT * FROM recetas WHERE articulo_id=?", art_id)
     if r:
@@ -368,7 +410,7 @@ def crear_despacho(db, uid, d):
     for i in items:
         a = articulo(db, i["articulo_id"])
         if not (a["tipo"] == "PRODUCTO" or a["desechable"]):
-            raise ApiError(400, f"{a['nombre']} no se despacha a tiendas: solo productos terminados y desechables o de aseo.")
+            raise ApiError(400, f"{a['nombre']} no se despacha a tiendas: solo productos terminados, desechables o de aseo e insumos de puntos de venta.")
         detalle.append((a, i["cantidad"]))
     neto = round(sum(c * a["precio"] for a, c in detalle), 2)
     iva = round(neto * pct / 100, 2)
@@ -417,10 +459,10 @@ def anular(db, uid, tabla, doc_tipo, doc_id):
                 db.execute("UPDATE articulos SET precio=? WHERE id=?", (p[0], aid))
 
 
-def articulos_de_bodega(db, bodega):
-    filtro = "" if bodega == CENTRAL else "AND (a.tipo='PRODUCTO' OR a.desechable=1)"
+def articulos_de_bodega(db, bodega, seccion=""):
+    filtro = f"AND {SECCIONES[seccion]}" if seccion else "" if bodega == CENTRAL else "AND (a.tipo='PRODUCTO' OR a.desechable=1)"
     return rows(db, f"""SELECT a.id articulo_id, a.codigo, a.nombre, a.tipo, a.desechable, a.stock_minimo, a.precio, a.costo,
-        c.nombre categoria, u.abreviatura unidad, COALESCE(s.cantidad,0) cantidad
+        c.punto_venta, c.nombre categoria, u.abreviatura unidad, COALESCE(s.cantidad,0) cantidad
         FROM articulos a JOIN categorias c ON c.id=a.categoria_id JOIN unidades u ON u.id=a.unidad_id
         LEFT JOIN stock s ON s.articulo_id=a.id AND s.bodega_id=?
         WHERE a.activo=1 {filtro} ORDER BY a.tipo, a.nombre""", bodega)
@@ -557,8 +599,8 @@ def catalogos(c):
         "categorias": rows(db, "SELECT * FROM categorias ORDER BY nombre"),
         "unidades": rows(db, "SELECT * FROM unidades ORDER BY nombre"),
         "motivos": rows(db, "SELECT * FROM motivos_merma ORDER BY nombre"),
-        "articulos": rows(db, "SELECT a.id,a.codigo,a.nombre,a.tipo,a.desechable,a.precio,u.abreviatura unidad FROM articulos a "
-                              "JOIN unidades u ON u.id=a.unidad_id WHERE a.activo=1 ORDER BY a.nombre"),
+        "articulos": rows(db, "SELECT a.id,a.codigo,a.nombre,a.tipo,a.desechable,a.precio,c.punto_venta,c.nombre categoria,u.abreviatura unidad FROM articulos a "
+                              "JOIN categorias c ON c.id=a.categoria_id JOIN unidades u ON u.id=a.unidad_id WHERE a.activo=1 ORDER BY a.nombre"),
     }
 
 
@@ -625,6 +667,8 @@ def perfiles_crear(c):
 
 @ruta("PUT", r"/api/perfiles/(\d+)", "usuarios", 2)
 def perfiles_editar(c, pid):
+    if scalar(c.db, "SELECT COUNT(*) FROM perfiles WHERE id=? AND nombre=?", int(pid), PERFIL_ADMIN) and str(c.body.get("nombre") or "").strip() != PERFIL_ADMIN:
+        raise ApiError(409, "El perfil Administrador no se puede renombrar.")
     c.db.execute("UPDATE perfiles SET nombre=?,permisos=? WHERE id=?",
                  (txt(c.body.get("nombre"), "El nombre", True, 60), permisos_validos(c.body.get("permisos", {})), int(pid)))
     if not quedan_admins(c.db):
@@ -707,31 +751,38 @@ def config_respaldo(c):
         copia = sqlite3.connect(ruta_copia)
         with copia:
             c.db.backup(copia)
+        with copia:  # las credenciales de Fudo no salen en el archivo descargado
+            copia.execute("UPDATE fudo_tiendas SET api_key='', api_secret=''")
+        copia.execute("VACUUM")
         copia.close()
         return Archivo(f"nata_schlott_{datetime.now():%Y%m%d_%H%M}.db", ruta_copia.read_bytes())
 
 
 # ---------------------------------------------------------------- artículos
 
-def datos_articulo(d):
+def datos_articulo(db, d):
     tipo = d.get("tipo")
     if tipo not in ("PRODUCTO", "SUBPRODUCTO", "INSUMO"):
         raise ApiError(400, "Tipo de artículo no válido.")
-    return (tipo, 1 if tipo == "INSUMO" and d.get("desechable") else 0, entero(d.get("categoria_id"), "la categoría"),
+    # Un insumo de punto de venta se comporta como desechable: se despacha a tiendas y no entra en recetas
+    punto_venta = scalar(db, "SELECT punto_venta FROM categorias WHERE id=?", entero(d.get("categoria_id"), "la categoría"))
+    if punto_venta and tipo != "INSUMO":
+        raise ApiError(400, "Esa clasificación es solo para insumos de puntos de venta.")
+    return (tipo, 1 if tipo == "INSUMO" and (d.get("desechable") or punto_venta) else 0, entero(d.get("categoria_id"), "la categoría"),
             entero(d.get("unidad_id"), "la unidad de medida"), txt(d.get("codigo"), "El código", True, 30).upper(),
             txt(d.get("nombre"), "El nombre", True, 120), num(d.get("stock_minimo", 0), "El stock mínimo"), num(d.get("precio", 0), "El precio"))
 
 
 @ruta("GET", "/api/articulos", "articulos")
 def articulos_lista(c):
-    return rows(c.db, """SELECT a.*, c.nombre categoria, u.abreviatura unidad, COALESCE(s.cantidad,0) stock
+    return rows(c.db, """SELECT a.*, c.punto_venta, c.nombre categoria, u.abreviatura unidad, COALESCE(s.cantidad,0) stock
         FROM articulos a JOIN categorias c ON c.id=a.categoria_id JOIN unidades u ON u.id=a.unidad_id
         LEFT JOIN stock s ON s.articulo_id=a.id AND s.bodega_id=0 ORDER BY a.nombre""")
 
 
 @ruta("POST", "/api/articulos", "articulos", 2)
 def articulos_crear(c):
-    v = datos_articulo(c.body)
+    v = datos_articulo(c.db, c.body)
     costo = v[7] if v[0] == "INSUMO" else 0
     return {"id": c.db.execute("INSERT INTO articulos(tipo,desechable,categoria_id,unidad_id,codigo,nombre,stock_minimo,precio,costo) VALUES(?,?,?,?,?,?,?,?,?)",
                                (*v, costo)).lastrowid}
@@ -739,14 +790,37 @@ def articulos_crear(c):
 
 @ruta("PUT", r"/api/articulos/(\d+)", "articulos", 2)
 def articulos_editar(c, i):
-    v, i = datos_articulo(c.body), int(i)
+    v, i = datos_articulo(c.db, c.body), int(i)
     a = articulo(c.db, i)
     if a["tipo"] != v[0] and scalar(c.db, "SELECT COUNT(*) FROM movimientos WHERE articulo_id=?", i):
         raise ApiError(409, "No se puede cambiar el tipo de un artículo con movimientos.")
     if v[1] and scalar(c.db, "SELECT COUNT(*) FROM receta_items WHERE articulo_id=?", i):
-        raise ApiError(409, "Este insumo está en una receta: quítalo de ella antes de marcarlo como desechable.")
+        raise ApiError(409, "Este insumo está en una receta: quítalo de ella antes de marcarlo como desechable o de punto de venta.")
     c.db.execute("UPDATE articulos SET tipo=?,desechable=?,categoria_id=?,unidad_id=?,codigo=?,nombre=?,stock_minimo=?,precio=?,activo=? WHERE id=?",
                  (*v, 1 if c.body.get("activo", True) else 0, i))
+    return {"ok": True}
+
+
+RELACIONES_ARTICULO = (("movimientos", "movimientos en el historial"), ("compra_items", "compras"), ("devolucion_items", "devoluciones a proveedores"), ("historial_precios", "historial de precios"),
+                       ("producciones", "producciones"), ("despacho_items", "guías de despacho"), ("mermas", "mermas"), ("salidas_tienda", "ventas o consumos de tienda"),
+                       ("recetas", "una receta propia"), ("receta_items", "recetas donde es ingrediente"))
+
+
+@ruta("DELETE", r"/api/articulos/(\d+)", "articulos", 2)
+def articulos_borrar(c, i):
+    i = int(i)
+    articulo(c.db, i)
+    usos = [texto for tabla, texto in RELACIONES_ARTICULO if scalar(c.db, f"SELECT COUNT(*) FROM {tabla} WHERE articulo_id=?", i)]
+    if scalar(c.db, "SELECT COUNT(*) FROM stock WHERE articulo_id=? AND cantidad<>0", i):
+        usos.append("stock en bodega")
+    if scalar(c.db, "SELECT COUNT(*) FROM inventario_items WHERE articulo_id=? AND conteo IS NOT NULL", i):
+        usos.append("tomas de inventario")
+    if usos:
+        raise ApiError(409, f"No se puede eliminar porque tiene {', '.join(usos)}. Puedes dejarlo inactivo desde Editar.")
+    # Las tomas incluyen todos los artículos: una línea sin conteo no es información que deba conservarse
+    c.db.execute("DELETE FROM inventario_items WHERE articulo_id=?", (i,))
+    c.db.execute("DELETE FROM stock WHERE articulo_id=?", (i,))
+    c.db.execute("DELETE FROM articulos WHERE id=?", (i,))
     return {"ok": True}
 
 
@@ -870,6 +944,237 @@ def compras_anular(c, i):
     return {"ok": True}
 
 
+# ---------------------------------------------------------------- integración con Fudo
+
+class FudoError(Exception):
+    """incierto=True: la solicitud pudo haber llegado a Fudo, no se sabe si creó el gasto."""
+    def __init__(self, mensaje, incierto=False):
+        super().__init__(mensaje)
+        self.mensaje, self.incierto = mensaje, incierto
+
+
+FUDO_TOKENS = {}
+
+
+def fudo_http(url, metodo="GET", cuerpo=None, token=None):
+    h = {"Accept": "application/json", "Content-Type": "application/json"}
+    if token:
+        h["Authorization"] = f"Bearer {token}"
+    pet = urllib.request.Request(url, method=metodo, headers=h, data=json.dumps(cuerpo).encode() if cuerpo is not None else None)
+    try:
+        with urllib.request.urlopen(pet, timeout=FUDO_TIMEOUT) as r:
+            return json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            raise FudoError("Fudo recibió demasiadas solicitudes. Espera un momento y vuelve a intentar.") from None
+        if e.code >= 500:
+            raise FudoError(f"Fudo tuvo un error interno ({e.code}).", True) from None
+        try:
+            err = json.loads(e.read()).get("errors") or [{}]
+            detalle = err[0].get("detail") or err[0].get("title") or ""
+        except (ValueError, AttributeError, IndexError):
+            detalle = ""
+        raise FudoError(f"Fudo rechazó la solicitud ({e.code}). {detalle}".strip(), False) from None
+    except (OSError, ValueError):
+        raise FudoError("No hubo una respuesta válida de Fudo.", True) from None
+
+
+def fudo_token(cfg, renovar=False):
+    guardado = FUDO_TOKENS.get(cfg["tienda_id"])
+    if guardado and not renovar and guardado[0] == cfg["api_key"] and guardado[2] > time.time() + 60:
+        return guardado[1]
+    try:
+        r = fudo_http(FUDO_AUTH, "POST", {"apiKey": cfg["api_key"], "apiSecret": cfg["api_secret"]})
+        token, expira = r["token"], float(r.get("exp") or time.time() + 3600)
+    except FudoError as e:
+        raise FudoError("Fudo no aceptó las credenciales de esta tienda, o no respondió. " + e.mensaje) from None  # aún no se envió ningún gasto
+    except (KeyError, TypeError, ValueError):
+        raise FudoError("Fudo respondió sin un token de acceso.") from None
+    FUDO_TOKENS[cfg["tienda_id"]] = (cfg["api_key"], token, expira)
+    return token
+
+
+def fudo_api(cfg, ruta, metodo="GET", cuerpo=None):
+    url = FUDO_API + ruta
+    try:
+        return fudo_http(url, metodo, cuerpo, fudo_token(cfg))
+    except FudoError as e:
+        if "(401)" not in e.mensaje:
+            raise
+    return fudo_http(url, metodo, cuerpo, fudo_token(cfg, renovar=True))
+
+
+def fuera_de_tx(db, fn):
+    """Las llamadas a Fudo no retienen la base: confirma lo hecho y reabre la transacción al volver."""
+    db.execute("COMMIT")
+    try:
+        return fn()
+    finally:
+        db.execute("BEGIN IMMEDIATE")
+
+
+def fudo_config(db, tienda):
+    cfg = row(db, "SELECT * FROM fudo_tiendas WHERE tienda_id=? AND api_key<>'' AND api_secret<>''", tienda)
+    if not cfg:
+        raise ApiError(400, "Esta tienda no tiene conexión con Fudo. Configúrala en Administración → Integración Fudo.")
+    return cfg
+
+
+def fudo_lista(cfg, ruta):
+    datos = fudo_api(cfg, ruta + "?page%5Bsize%5D=500").get("data") or []
+    return sorted(({"id": str(x["id"]), "nombre": x.get("attributes", {}).get("name") or str(x["id"])} for x in datos), key=lambda x: x["nombre"].lower())
+
+
+@ruta("GET", "/api/fudo", "config", 2)
+def fudo_tiendas_lista(c):
+    return rows(c.db, """SELECT t.id tienda_id, t.nombre, COALESCE(f.categoria,'') categoria, COALESCE(f.categoria_id,'') categoria_id, COALESCE(f.proveedor,'') proveedor,
+        COALESCE(f.proveedor_id,'') proveedor_id, COALESCE(f.monto,'TOTAL') monto, CASE WHEN f.api_secret<>'' THEN 1 ELSE 0 END conectada,
+        CASE WHEN f.api_key<>'' THEN substr(f.api_key,-4) ELSE '' END key_final
+        FROM tiendas t LEFT JOIN fudo_tiendas f ON f.tienda_id=t.id WHERE t.activo=1 ORDER BY t.nombre""")
+
+
+@ruta("PUT", r"/api/fudo/(\d+)/credenciales", "config", 2)
+def fudo_credenciales(c, t):
+    t = int(t)
+    if not row(c.db, "SELECT id FROM tiendas WHERE id=?", t):
+        raise ApiError(404, "Tienda no encontrada.")
+    actual = row(c.db, "SELECT * FROM fudo_tiendas WHERE tienda_id=?", t) or {}
+    clave = txt(c.body.get("api_key"), "la API Key", not actual.get("api_key"), 200) or actual.get("api_key")
+    secreto = txt(c.body.get("api_secret"), "la API Secret", not actual.get("api_secret"), 500) or actual.get("api_secret")
+    c.db.execute("INSERT INTO fudo_tiendas(tienda_id,api_key,api_secret) VALUES(?,?,?) ON CONFLICT(tienda_id) DO UPDATE SET api_key=excluded.api_key,api_secret=excluded.api_secret",
+                 (t, clave, secreto))
+    FUDO_TOKENS.pop(t, None)
+    return {"ok": True}
+
+
+@ruta("POST", r"/api/fudo/(\d+)/probar", "config", 2)
+def fudo_probar(c, t):
+    cfg = fudo_config(c.db, int(t))
+    try:
+        return fuera_de_tx(c.db, lambda: {"categorias": fudo_lista(cfg, "/expense-categories"), "proveedores": fudo_lista(cfg, "/providers")})
+    except FudoError as e:
+        raise ApiError(502, e.mensaje) from None
+
+
+@ruta("PUT", r"/api/fudo/(\d+)/gastos", "config", 2)
+def fudo_ajustes(c, t):
+    d = c.body
+    if d.get("monto") not in ("TOTAL", "NETO"):
+        raise ApiError(400, "Indica si se envía el total o el neto.")
+    fudo_config(c.db, int(t))
+    categoria_id = txt(d.get("categoria_id"), "la categoría de gasto", True, 10)
+    if not categoria_id.isdigit() or not str(d.get("proveedor_id") or "0").isdigit():
+        raise ApiError(400, "Categoría o proveedor no válidos.")
+    c.db.execute("UPDATE fudo_tiendas SET categoria_id=?,categoria=?,proveedor_id=?,proveedor=?,monto=? WHERE tienda_id=?",
+                 (categoria_id, txt(d.get("categoria"), "La categoría", False, 120), str(d.get("proveedor_id") or ""), txt(d.get("proveedor"), "El proveedor", False, 120), d["monto"], int(t)))
+    return {"ok": True}
+
+
+def fudo_gasto(g, cfg):
+    num_guia = f"GD-{g['id']:06d}"
+    relaciones = {"expenseCategory": {"data": {"id": cfg["categoria_id"], "type": "ExpenseCategory"}}}
+    if cfg["proveedor_id"]:
+        relaciones["provider"] = {"data": {"id": cfg["proveedor_id"], "type": "Provider"}}
+    return {"data": {"type": "Expense", "attributes": {
+        "amount": round(g["total"] if cfg["monto"] == "TOTAL" else g["neto"]), "date": g["fecha"][:10], "useInCashCount": False,
+        "receiptNumber": num_guia, "description": f"Guía de despacho interna N° {g['id']:06d} desde Nata & Schlott"}, "relationships": relaciones}}
+
+
+def fudo_guardar(db, gid, estado, gasto=None, error=""):
+    if gasto is None:
+        db.execute("UPDATE despachos SET fudo_estado=?,fudo_error=? WHERE id=?", (estado, error, gid))
+    else:
+        db.execute("UPDATE despachos SET fudo_estado=?,fudo_gasto_id=?,fudo_error=? WHERE id=?", (estado, gasto, error, gid))
+
+
+@ruta("POST", r"/api/despachos/(\d+)/fudo", "despachos", 2)
+def despacho_a_fudo(c, i):
+    """El estado ENVIANDO se confirma antes de llamar a Fudo: si el resultado es incierto, no se reenvía sin confirmación."""
+    c.sin_tienda()
+    gid = int(i)
+    g = row(c.db, "SELECT * FROM despachos WHERE id=?", gid)
+    if not g:
+        raise ApiError(404, "Guía no encontrada.")
+    if g["estado"] != "VIGENTE":
+        raise ApiError(409, "Una guía anulada no se envía a Fudo.")
+    if g["fudo_estado"] == "ENVIADO":
+        raise ApiError(409, "Esta guía ya está en Fudo.")
+    if g["fudo_estado"] in ("ENVIANDO", "REVISAR") and not c.body.get("confirmar_reenvio"):
+        raise ApiError(409, "No se sabe si el gasto de esta guía llegó a Fudo. Revísalo allá antes de reenviar.")
+    cfg = fudo_config(c.db, g["tienda_id"])
+    if not cfg["categoria_id"]:
+        raise ApiError(400, "Falta elegir la categoría de gasto de esta tienda en Administración → Integración Fudo.")
+    fudo_guardar(c.db, gid, "ENVIANDO")
+    cuerpo = fudo_gasto(g, cfg)
+    try:
+        r = fuera_de_tx(c.db, lambda: fudo_api(cfg, "/expenses", "POST", cuerpo))
+        gasto = str(r["data"]["id"])
+    except (KeyError, TypeError):
+        fudo_guardar(c.db, gid, "REVISAR", error="Fudo respondió sin el número del gasto.")
+        return {"ok": False, "error": "Fudo respondió sin el número del gasto. Revísalo allá antes de reenviar."}
+    except FudoError as e:
+        fudo_guardar(c.db, gid, "REVISAR" if e.incierto else "", error=e.mensaje)
+        return {"ok": False, "error": e.mensaje + (" No se sabe si el gasto llegó: revísalo en Fudo antes de reenviar." if e.incierto else "")}
+    fudo_guardar(c.db, gid, "ENVIADO", gasto)
+    return {"ok": True, "gasto_id": gasto}
+
+
+@ruta("POST", r"/api/despachos/(\d+)/fudo/anular", "despachos", 2)
+def despacho_fudo_anular(c, i):
+    c.sin_tienda()
+    gid = int(i)
+    g = row(c.db, "SELECT * FROM despachos WHERE id=?", gid)
+    if not g:
+        raise ApiError(404, "Guía no encontrada.")
+    if g["fudo_estado"] != "ENVIADO" or not g["fudo_gasto_id"]:
+        raise ApiError(409, "Esta guía no tiene un gasto vigente en Fudo.")
+    if g["estado"] != "ANULADO":
+        raise ApiError(409, "Primero anula la guía en este sistema.")
+    cfg = fudo_config(c.db, g["tienda_id"])
+    try:
+        fuera_de_tx(c.db, lambda: fudo_api(cfg, f"/expenses/{g['fudo_gasto_id']}", "PATCH", {"data": {"id": g["fudo_gasto_id"], "type": "Expense", "attributes": {"canceled": True}}}))
+    except FudoError as e:
+        fudo_guardar(c.db, gid, "ENVIADO", error=e.mensaje)
+        return {"ok": False, "error": e.mensaje}
+    fudo_guardar(c.db, gid, "ANULADO")
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- devoluciones a proveedores
+
+@ruta("GET", "/api/devoluciones", "devoluciones")
+def devoluciones_lista(c):
+    c.sin_tienda()
+    d, h = c.rango(365)
+    return rows(c.db, """SELECT de.*, p.nombre proveedor, p.rut, u.nombre usuario FROM devoluciones de JOIN proveedores p ON p.id=de.proveedor_id
+        LEFT JOIN usuarios u ON u.id=de.usuario_id WHERE de.fecha BETWEEN ? AND ? ORDER BY de.fecha DESC, de.id DESC LIMIT 500""", d, h)
+
+
+@ruta("GET", r"/api/devoluciones/(\d+)", "devoluciones")
+def devoluciones_detalle(c, i):
+    c.sin_tienda()
+    r = row(c.db, "SELECT de.*, p.nombre proveedor, p.rut, u.nombre usuario FROM devoluciones de JOIN proveedores p ON p.id=de.proveedor_id "
+                  "LEFT JOIN usuarios u ON u.id=de.usuario_id WHERE de.id=?", int(i))
+    if not r:
+        raise ApiError(404, "Devolución no encontrada.")
+    r["items"] = rows(c.db, "SELECT di.*, a.codigo, a.nombre, u.abreviatura unidad FROM devolucion_items di JOIN articulos a ON a.id=di.articulo_id "
+                            "JOIN unidades u ON u.id=a.unidad_id WHERE di.devolucion_id=?", int(i))
+    return r
+
+
+@ruta("POST", "/api/devoluciones", "devoluciones", 2)
+def devoluciones_crear(c):
+    c.sin_tienda()
+    return {"id": crear_devolucion(c.db, c.uid, c.body)}
+
+
+@ruta("POST", r"/api/devoluciones/(\d+)/anular", "devoluciones", 2)
+def devoluciones_anular(c, i):
+    c.sin_tienda()
+    anular(c.db, c.uid, "devoluciones", "DEVOLUCION", int(i))
+    return {"ok": True}
+
+
 # ---------------------------------------------------------------- despachos
 
 @ruta("GET", "/api/despachos", "despachos")
@@ -889,8 +1194,9 @@ def despachos_detalle(c, i):
                   "LEFT JOIN usuarios u ON u.id=de.usuario_id WHERE de.id=?", int(i))
     if not r or (c.user.get("tienda_id") and c.user["tienda_id"] != r["tienda_id"]):
         raise ApiError(404, "Guía no encontrada.")
-    r["items"] = rows(c.db, "SELECT di.*, a.codigo, a.nombre, u.abreviatura unidad FROM despacho_items di JOIN articulos a ON a.id=di.articulo_id "
-                            "JOIN unidades u ON u.id=a.unidad_id WHERE di.despacho_id=?", int(i))
+    r["items"] = rows(c.db, "SELECT di.*, a.codigo, a.nombre, a.desechable, ca.punto_venta, ca.nombre categoria, u.abreviatura unidad FROM despacho_items di JOIN articulos a ON a.id=di.articulo_id "
+                            "JOIN categorias ca ON ca.id=a.categoria_id JOIN unidades u ON u.id=a.unidad_id WHERE di.despacho_id=? "
+                            "ORDER BY a.desechable, ca.punto_venta, ca.nombre, a.nombre", int(i))
     return r
 
 
@@ -924,11 +1230,37 @@ def bodegas_stock(c):
     return articulos_de_bodega(c.db, c.bodega(c.q.get("bodega")))
 
 
+@ruta("GET", "/api/actualizar-stock", "stock", 2)
+def actualizar_stock_lista(c):
+    return articulos_de_bodega(c.db, c.bodega(c.q.get("bodega")))
+
+
+@ruta("POST", "/api/actualizar-stock", "stock", 2)
+def actualizar_stock(c):
+    d = c.body
+    bodega, motivo = c.bodega(d.get("bodega_id")), txt(d.get("motivo"), "el motivo", True, 200)
+    permitidos = {a["articulo_id"] for a in articulos_de_bodega(c.db, bodega)}
+    fecha, n = date.today().isoformat(), 0
+    for it in d.get("items") or []:
+        aid = entero(it.get("articulo_id"), "el artículo")
+        if aid not in permitidos:
+            raise ApiError(400, "Hay un artículo que no pertenece a esta bodega.")
+        cantidad, actual = num(it.get("cantidad"), "La cantidad"), stock_de(c.db, bodega, aid)
+        if abs(actual - num(it.get("esperado"), "El stock esperado")) > 1e-6:
+            raise ApiError(409, f"El stock de {articulo(c.db, aid)['nombre']} cambió mientras editabas. Recarga la página y revísalo.")
+        if abs(cantidad - actual) > 1e-6:
+            mover(c.db, aid, bodega, round(cantidad - actual, 5), "AJUSTE_ADMIN", c.uid, fecha, ref="Actualización de stock", obs=motivo)
+            n += 1
+    if not n:
+        raise ApiError(400, "No hay cambios de stock para guardar.")
+    return {"actualizados": n}
+
+
 @ruta("GET", "/api/stock/central")
 def stock_central(c):
     """Stock disponible en bodega central, para quienes operan compras, producción, despachos o mermas."""
     p = c.user["permisos"]
-    if c.user.get("tienda_id") or not any(p.get(m) for m in ("despachos", "mermas", "produccion", "compras", "inventario", "articulos")):
+    if c.user.get("tienda_id") or not any(p.get(m) for m in ("despachos", "mermas", "produccion", "compras", "devoluciones", "inventario", "articulos")):
         raise ApiError(403, "No tienes acceso a la bodega central.")
     return articulos_de_bodega(c.db, CENTRAL)
 
@@ -1012,11 +1344,14 @@ def inventarios_detalle(c, i):
 @ruta("POST", "/api/inventarios", "inventario", 2)
 def inventarios_crear(c):
     bodega = c.bodega(c.body.get("bodega_id"))
-    if row(c.db, "SELECT id FROM inventarios WHERE bodega_id=? AND estado='ABIERTO'", bodega):
+    seccion = (c.body.get("seccion") or "") if bodega == CENTRAL else ""
+    if seccion and seccion not in SECCIONES:
+        raise ApiError(400, "Sección de bodega no válida.")
+    if row(c.db, "SELECT id FROM inventarios WHERE bodega_id=? AND estado='ABIERTO' AND (seccion=? OR seccion='' OR ?='')", bodega, seccion, seccion):
         raise ApiError(409, "Esta bodega ya tiene una toma de inventario abierta.")
-    iid = c.db.execute("INSERT INTO inventarios(fecha,bodega_id,obs,usuario_id) VALUES(?,?,?,?)",
-                       (fecha_valida(c.body.get("fecha")), bodega, txt(c.body.get("obs"), "La observación", False, 500), c.uid)).lastrowid
-    for a in articulos_de_bodega(c.db, bodega):
+    iid = c.db.execute("INSERT INTO inventarios(fecha,bodega_id,seccion,obs,usuario_id) VALUES(?,?,?,?,?)",
+                       (fecha_valida(c.body.get("fecha")), bodega, seccion, txt(c.body.get("obs"), "La observación", False, 500), c.uid)).lastrowid
+    for a in articulos_de_bodega(c.db, bodega, seccion):
         c.db.execute("INSERT INTO inventario_items(inventario_id,articulo_id,stock_sistema) VALUES(?,?,?)", (iid, a["articulo_id"], a["cantidad"]))
     return {"id": iid}
 
@@ -1079,7 +1414,9 @@ def movimientos(c):
         if c.q.get(campo):
             w.append(f"{col}=?"); a.append(c.q[campo])
     if c.q.get("clase") == "DESECHABLE":
-        w.append("ar.desechable=1")
+        w.append("ar.desechable=1 AND ca.punto_venta=0")
+    elif c.q.get("clase") == "PUNTO_VENTA":
+        w.append("ca.punto_venta=1")
     elif c.q.get("clase") == "INSUMO":
         w.append("ar.tipo='INSUMO' AND ar.desechable=0")
     elif c.q.get("clase"):
@@ -1088,9 +1425,9 @@ def movimientos(c):
         w.append("m.cantidad>0")
     elif c.q.get("sentido") == "salida":
         w.append("m.cantidad<0")
-    return rows(c.db, f"""SELECT m.*, ar.codigo, ar.nombre, ar.tipo tipo_articulo, ar.desechable, un.abreviatura unidad,
+    return rows(c.db, f"""SELECT m.*, ar.codigo, ar.nombre, ar.tipo tipo_articulo, ar.desechable, ca.punto_venta, un.abreviatura unidad,
         COALESCE(b.nombre,'Bodega central') bodega, p.nombre proveedor, t.nombre tienda_destino, mo.nombre motivo, u.nombre usuario
-        FROM movimientos m JOIN articulos ar ON ar.id=m.articulo_id JOIN unidades un ON un.id=ar.unidad_id
+        FROM movimientos m JOIN articulos ar ON ar.id=m.articulo_id JOIN categorias ca ON ca.id=ar.categoria_id JOIN unidades un ON un.id=ar.unidad_id
         LEFT JOIN tiendas b ON b.id=m.bodega_id LEFT JOIN proveedores p ON p.id=m.proveedor_id LEFT JOIN tiendas t ON t.id=m.tienda_destino_id
         LEFT JOIN motivos_merma mo ON mo.id=m.motivo_id LEFT JOIN usuarios u ON u.id=m.usuario_id
         WHERE {' AND '.join(w)} ORDER BY m.fecha DESC, m.id DESC LIMIT 1000""", *a)
@@ -1263,6 +1600,14 @@ def reporte_cobertura(c):
 
 def sembrar(db):
     db.executescript(SCHEMA)
+    if "seccion" not in [col[1] for col in db.execute("PRAGMA table_info(inventarios)")]:  # bases creadas antes de las secciones
+        db.execute("ALTER TABLE inventarios ADD COLUMN seccion TEXT NOT NULL DEFAULT ''")
+    columnas_despacho = [col[1] for col in db.execute("PRAGMA table_info(despachos)")]
+    for col in ("fudo_estado", "fudo_gasto_id", "fudo_error"):  # bases creadas antes de la integración con Fudo
+        if col not in columnas_despacho:
+            db.execute(f"ALTER TABLE despachos ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+    if "punto_venta" not in [col[1] for col in db.execute("PRAGMA table_info(categorias)")]:  # bases creadas antes de este grupo
+        db.execute("ALTER TABLE categorias ADD COLUMN punto_venta INTEGER NOT NULL DEFAULT 0")
     db.execute("INSERT OR IGNORE INTO config VALUES('iva','19')")
     for nombre, permisos in PERFILES.items():
         db.execute("INSERT OR IGNORE INTO perfiles(nombre,permisos) VALUES(?,?)", (nombre, json.dumps(permisos)))
@@ -1275,6 +1620,16 @@ def sembrar(db):
         for n in ("Vencimiento", "Producto quemado o mal horneado", "Error de receta", "Quiebre o daño en traslado", "Caída o manipulación",
                   "Contaminación", "Falla de refrigeración", "Devolución de tienda", "Otro"):
             db.execute("INSERT INTO motivos_merma(nombre) VALUES(?)", (n,))
+    if not scalar(db, "SELECT COUNT(*) FROM config WHERE clave='permisos_devoluciones'"):  # los perfiles de bases anteriores no traen este módulo
+        for p in rows(db, "SELECT * FROM perfiles WHERE nombre IN (?,?,?)", PERFIL_ADMIN, "Bodega y logística", "Gerencia"):
+            permisos = json.loads(p["permisos"])
+            permisos.setdefault("devoluciones", PERFILES[p["nombre"]]["devoluciones"])
+            db.execute("UPDATE perfiles SET permisos=? WHERE id=?", (json.dumps(permisos), p["id"]))
+        db.execute("INSERT INTO config VALUES('permisos_devoluciones','1')")
+    if not scalar(db, "SELECT COUNT(*) FROM config WHERE clave='categorias_punto_venta'"):  # una sola vez, para respetar lo que se elimine después
+        for n in CATEGORIAS_PUNTO_VENTA:
+            db.execute("INSERT INTO categorias(nombre,punto_venta) VALUES(?,1) ON CONFLICT(nombre) DO UPDATE SET punto_venta=1", (n,))
+        db.execute("INSERT INTO config VALUES('categorias_punto_venta','1')")
 
 
 def cargar_demo(db, uid):
@@ -1375,6 +1730,8 @@ def usuario_de_cookie(db, handler):
         WHERE s.token=? AND s.expira>? AND u.activo=1""", token, time.time())
     if u:
         u["permisos"] = json.loads(u["permisos"])
+        if u["perfil"] == PERFIL_ADMIN and not u["tienda_id"]:
+            u["permisos"]["stock"] = 2
         u["_token"] = token
     return u
 
