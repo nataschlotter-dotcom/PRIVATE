@@ -80,15 +80,34 @@ def codigo_de(i):
     return next(x["codigo"] for x in A("GET", "/articulos") if x["id"] == i)
 
 
-assert [codigo_de(x) for x in (harina, vaso, base, torta)] == ["IN0001", "IND0001", "SP0001", "P0001"]
+assert [codigo_de(x) for x in (harina, vaso, base, torta)] == ["IN0001", "IDA0001", "SP0001", "P0001"]
 cat_pv = next(x["id"] for x in cat["categorias"] if x["punto_venta"])
 ipv = A("POST", "/articulos", {"tipo": "INSUMO", "nombre": "PV", "categoria_id": cat_pv, "unidad_id": un})
 assert ipv["codigo"] == "IPV0001"
 A("PUT", f"/articulos/{ipv['id']}", {"tipo": "INSUMO", "codigo": "OTRO", "nombre": "PV2", "categoria_id": cat_pv, "unidad_id": un})
 assert codigo_de(ipv["id"]) == "IPV0001"  # editar conserva el código
 A("DELETE", f"/articulos/{ipv['id']}")
+# Cada pestaña crea en su grupo: la categoría no puede moverlo a otro
+cat_comun = next(x["id"] for x in cat["categorias"] if not x["punto_venta"])
+base_art = {"tipo": "INSUMO", "nombre": "G", "unidad_id": un}
+A("POST", "/articulos", {**base_art, "desechable": True, "punto_venta": False, "categoria_id": cat_pv}, 400)  # pestaña Desechables
+A("POST", "/articulos", {**base_art, "desechable": True, "punto_venta": True, "categoria_id": cat_comun}, 400)  # pestaña Puntos de venta
+A("POST", "/articulos", {**base_art, "desechable": False, "punto_venta": False, "categoria_id": cat_pv}, 400)  # pestaña Insumos
+g_ida = A("POST", "/articulos", {**base_art, "desechable": True, "punto_venta": False, "categoria_id": cat_comun})
+g_ipv = A("POST", "/articulos", {**base_art, "desechable": True, "punto_venta": True, "categoria_id": cat_pv})
+assert g_ida["codigo"].startswith("IDA") and g_ipv["codigo"].startswith("IPV")
+por_id = {x["id"]: x for x in A("GET", "/articulos")}
+assert por_id[g_ida["id"]]["desechable"] == 1 and not por_id[g_ida["id"]]["punto_venta"] and por_id[g_ipv["id"]]["punto_venta"] == 1
+A("PUT", f"/articulos/{g_ida['id']}", {**base_art, "desechable": True, "punto_venta": False, "categoria_id": cat_pv}, 400)  # tampoco al editar
+A("DELETE", f"/articulos/{g_ida['id']}"); A("DELETE", f"/articulos/{g_ipv['id']}")
 in2 = art("INSUMO", "X", un)
-assert codigo_de(in2) == "IN0002"  # IND e IPV no cuentan para IN
+assert codigo_de(in2) == "IN0002"  # IDA e IPV no cuentan para IN
+c_ind = app.conectar()  # los códigos IND de bases anteriores pasan a IDA, una sola vez
+c_ind.execute("UPDATE articulos SET codigo='IND0001' WHERE id=?", (vaso,))
+c_ind.execute("DELETE FROM config WHERE clave='codigos_ida'")
+app.sembrar(c_ind)
+c_ind.close()
+assert codigo_de(vaso) == "IDA0001"
 c_cod = app.conectar()
 c_cod.execute("UPDATE articulos SET codigo='IN0099' WHERE id=?", (in2,))  # códigos previos: se sigue desde el mayor
 c_cod.close()
@@ -252,6 +271,47 @@ P("GET", "/compras", esperado=403); P("POST", "/usuarios", {}, 403); P("GET", "/
 P("GET", "/produccion"); P("GET", "/produccion/recetas")
 T("GET", "/compras", esperado=403); T("GET", "/usuarios", esperado=403); T("POST", "/despachos", {}, 403)
 T("GET", "/stock/central", esperado=403)
+# Desechables: devolución de tienda a central y consumo en la central
+ida = art("INSUMO", "IDA", un, precio=10, desechable=True)
+assert codigo_de(ida).startswith("IDA")
+A("POST", "/compras", {"tipo_documento": "FACTURA", "proveedor_id": prov, "items": [{"articulo_id": ida, "cantidad": 20, "precio": 10}]})
+gi = A("POST", "/despachos", {"tienda_id": tienda, "items": [{"articulo_id": ida, "cantidad": 8}]})["id"]
+casi(stock()[ida], 12); casi(stock(tienda)[ida], 8)
+dev_t = {"tipo": "DEVOLUCION_TIENDA", "tienda_id": tienda, "motivo": "Sobrante"}
+for cli in (T, P):
+    cli("POST", "/salidas-internas", {**dev_t, "items": [{"articulo_id": ida, "cantidad": 1}]}, 403)
+P("GET", "/salidas-internas?tipo=DEVOLUCION_TIENDA", esperado=403)
+T("GET", "/salidas-internas?tipo=CONSUMO_CENTRAL", esperado=403)
+A("POST", "/salidas-internas", {**dev_t, "motivo": "", "items": [{"articulo_id": ida, "cantidad": 1}]}, 400)
+A("POST", "/salidas-internas", {**dev_t, "tienda_id": 0, "items": [{"articulo_id": ida, "cantidad": 1}]}, 400)
+A("POST", "/salidas-internas", {**dev_t, "tipo": "OTRO", "items": [{"articulo_id": ida, "cantidad": 1}]}, 400)
+for no_vale in (torta, harina, cafe):
+    A("POST", "/salidas-internas", {**dev_t, "items": [{"articulo_id": no_vale, "cantidad": 1}]}, 400)
+A("POST", "/salidas-internas", {**dev_t, "items": [{"articulo_id": ida, "cantidad": 9}]}, 409)  # más de lo que tiene la tienda
+casi(stock(tienda)[ida], 8); casi(stock()[ida], 12)
+assert not A("GET", "/salidas-internas?tipo=DEVOLUCION_TIENDA")
+di = A("POST", "/salidas-internas", {**dev_t, "fecha": "2026-05-05", "items": [{"articulo_id": ida, "cantidad": 3}]})["id"]
+casi(stock(tienda)[ida], 5); casi(stock()[ida], 15)
+det_di = A("GET", f"/salidas-internas/{di}")
+assert det_di["origen"] == "T1" and det_di["items"][0]["cantidad"] == 3 and det_di["items"][0]["codigo"].startswith("IDA")
+assert {x["tipo"] for x in A("GET", f"/movimientos?desde=2026-01-01&articulo_id={ida}&tipo=DEVOLUCION_TIENDA")} == {"DEVOLUCION_TIENDA"}
+assert A("GET", f"/movimientos?desde=2026-01-01&articulo_id={ida}&tipo=RECEPCION_CENTRAL")[0]["obs"] == "Sobrante"
+assert [x["id"] for x in T("GET", "/salidas-internas?tipo=DEVOLUCION_TIENDA&desde=2026-01-01")] == [di]  # la tienda ve la suya
+T("POST", f"/salidas-internas/{di}/anular", {}, 403)
+A("POST", "/salidas-internas", {"tipo": "CONSUMO_CENTRAL", "motivo": "Exceso", "items": [{"articulo_id": ida, "cantidad": 99}]}, 409)
+ci = A("POST", "/salidas-internas", {"tipo": "CONSUMO_CENTRAL", "motivo": "Limpieza", "items": [{"articulo_id": ida, "cantidad": 15}]})["id"]
+casi(stock()[ida], 0)
+A("POST", f"/salidas-internas/{di}/anular", {}, 409)  # la central ya no tiene ese stock
+casi(stock(tienda)[ida], 5)
+A("POST", f"/salidas-internas/{ci}/anular", {})
+casi(stock()[ida], 15)
+A("POST", f"/salidas-internas/{ci}/anular", {}, 409)
+A("POST", f"/salidas-internas/{di}/anular", {})
+casi(stock(tienda)[ida], 8); casi(stock()[ida], 12)
+A("DELETE", f"/articulos/{ida}", esperado=409)
+assert {x["articulo_id"] for x in A("GET", f"/salidas-internas/stock?bodega={tienda}")} >= {ida, vaso}
+assert torta not in {x["articulo_id"] for x in A("GET", f"/salidas-internas/stock?bodega={tienda}")}
+
 # Compras: factura o boleta es obligatorio
 s_doc = stock()[harina]
 A("POST", "/compras", {"proveedor_id": prov, "items": [{"articulo_id": harina, "cantidad": 1, "precio": 1}]}, 400)
@@ -405,7 +465,7 @@ A("POST", "/actualizar-stock", {"bodega_id": tienda, "motivo": "Local", "items":
 A("POST", "/actualizar-stock", {"bodega_id": tienda, "motivo": "Local", "items": [{"articulo_id": vaso, "cantidad": stock(tienda)[vaso] - 1, "esperado": stock(tienda)[vaso]}]})
 # Usuario de tienda: solo su bodega
 T("GET", f"/bodegas/stock?bodega={tienda2}", esperado=403); T("GET", "/bodegas/stock?bodega=0", esperado=403)
-assert {x["articulo_id"] for x in T("GET", "/bodegas/stock") if x["cantidad"] > 0} == {torta, vaso}
+assert {x["articulo_id"] for x in T("GET", "/bodegas/stock") if x["cantidad"] > 0} == {torta, vaso, ida}
 assert all(x["id"] == tienda for x in T("GET", "/bodegas/resumen"))
 assert all(x["bodega_id"] == tienda for x in T("GET", "/movimientos?desde=2026-01-01"))
 T("GET", f"/movimientos?bodega={tienda2}", esperado=403)

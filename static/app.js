@@ -8,6 +8,7 @@ const TIPOS_MOV = {
   COMPRA: ['Compra', 'bien'], PRODUCCION: ['Producción', 'bien'], CONSUMO_PRODUCCION: ['Consumo en producción', ''], DESPACHO: ['Despacho', ''],
   RECEPCION_TIENDA: ['Recepción en tienda', 'bien'], MERMA: ['Merma', 'mal'], INVENTARIO: ['Toma de inventario', 'dorada'], VENTA: ['Venta', ''],
   CONSUMO_INTERNO: ['Consumo interno', ''], ANULACION: ['Anulación', 'alerta'], AJUSTE_ADMIN: ['Actualización de stock', 'dorada'], DEVOLUCION_PROVEEDOR: ['Devolución a proveedor', 'alerta'],
+  DEVOLUCION_TIENDA: ['Devolución de tienda', 'alerta'], RECEPCION_CENTRAL: ['Recepción en central', 'bien'], CONSUMO_CENTRAL: ['Consumo interno central', ''],
 };
 const NAV = [
   ['', [['panel', 'Panel de inicio']]],
@@ -632,7 +633,7 @@ let tabArt = 'PRODUCTO';
 Vistas.articulos = async v => {
   const tabs = [['PRODUCTO', 'Productos'], ['SUBPRODUCTO', 'Subproductos'], ['INSUMO', 'Insumos'], ['PUNTO_VENTA', 'Insumos puntos de venta'], ['DESECHABLE', 'Desechables y aseo'], ['categorias', 'Categorías'], ['unidades', 'Unidades de medida']];
   const edita = can('articulos', 2), esArt = !['categorias', 'unidades'].includes(tabArt);
-  const notas = { PRODUCTO: 'Artículos terminados. El precio es el de venta, neto.', SUBPRODUCTO: 'Preparaciones que forman parte de un producto. Se fabrican con receta.', INSUMO: 'Ingredientes comprados a proveedores que forman parte de una receta. El precio se actualiza con la última compra.', PUNTO_VENTA: 'Comprados a proveedores y despachados a tiendas, clasificados en café, chocolate, leches, té, agua, utensilios para café, utensilios de aseo y azúcar. No forman parte de una receta.', DESECHABLE: 'Comprados a proveedores, no forman parte de una receta y se despachan a tiendas: vasos, bombillas, sachets, limpiavidrios.' };
+  const notas = { PRODUCTO: 'Artículos terminados. El precio es el de venta, neto.', SUBPRODUCTO: 'Preparaciones que forman parte de un producto. Se fabrican con receta.', INSUMO: 'Ingredientes comprados a proveedores que forman parte de una receta. El precio se actualiza con la última compra.', PUNTO_VENTA: 'Comprados a proveedores y despachados a tiendas, clasificados en café, chocolate, leches, té, agua, utensilios para café, utensilios de aseo y azúcar. No forman parte de una receta.', DESECHABLE: 'Comprados a proveedores, no forman parte de una receta y se despachan a tiendas: vasos, bombillas, sachets, limpiavidrios. Se clasifican en categorías como Aseo o Envases y desechables.' };
   v.innerHTML = cabecera('Productos, subproductos e insumos', notas[tabArt] || 'Tablas maestras', edita ? `<button class="btn primario" id="n">${esArt ? 'Nuevo artículo' : tabArt === 'categorias' ? 'Nueva categoría' : 'Nueva unidad'}</button>` : '');
   v.append(pestanas(tabs, tabArt, k => { tabArt = k; render(); }));
   const c = v.appendChild(Object.assign(document.createElement('div'), { className: 'tarjeta' }));
@@ -651,7 +652,8 @@ Vistas.articulos = async v => {
   const form = r => {
     const despachable = tabArt === 'DESECHABLE' || tabArt === 'PUNTO_VENTA';
     const inicial = r || { tipo: despachable ? 'INSUMO' : tabArt, desechable: despachable };
-    const categorias = tabArt === 'PUNTO_VENTA' && !r ? S.cat.categorias.filter(x => x.punto_venta) : despachable ? S.cat.categorias : S.cat.categorias.filter(x => !x.punto_venta);
+    const esPuntoVenta = tabArt === 'PUNTO_VENTA';
+    const categorias = S.cat.categorias.filter(x => !!x.punto_venta === esPuntoVenta);
     formulario(r ? `Editar artículo ${r.codigo}` : 'Nuevo artículo', [
       { k: 'nombre', t: 'Nombre', todo: 1, ayuda: r ? '' : 'El código se asigna automáticamente al guardar.' },
       { k: 'categoria_id', t: 'Clasificación o categoría', tipo: 'select', op: categorias, vacio: 'Selecciona…' },
@@ -660,7 +662,7 @@ Vistas.articulos = async v => {
       { k: 'precio', t: inicial.tipo === 'INSUMO' ? 'Precio de compra neto' : inicial.tipo === 'PRODUCTO' ? 'Precio de venta neto' : 'Precio', tipo: 'num', dec: 2, ayuda: 'Con separador de miles.' },
       ...(r ? [{ k: 'activo', t: 'Artículo activo', tipo: 'check', todo: 1 }] : [])], inicial,
     async d => {
-      const x = await api(r ? 'PUT' : 'POST', '/articulos' + (r ? '/' + r.id : ''), { ...d, tipo: inicial.tipo, desechable: inicial.desechable });
+      const x = await api(r ? 'PUT' : 'POST', '/articulos' + (r ? '/' + r.id : ''), { ...d, tipo: inicial.tipo, desechable: inicial.desechable, punto_venta: esPuntoVenta });
       aviso(x.codigo ? `Artículo creado con el código ${x.codigo}.` : 'Artículo guardado.'); render();
     });
   };
@@ -969,10 +971,65 @@ Vistas.produccion = async v => {
 };
 
 /* ---------- Despachos ---------- */
+let tabDespachos = 'guias';
+const SALIDAS = {
+  DEVOLUCION_TIENDA: { tab: 'Devoluciones de tiendas', titulo: 'Devoluciones de tiendas', nota: 'Desechables y aseo que una tienda devuelve: baja el stock de la tienda y sube el de la bodega central.', nuevo: 'Nueva devolución', doc: 'Devolución de tienda', hecho: 'Devolución registrada: el stock volvió a la bodega central.' },
+  CONSUMO_CENTRAL: { tab: 'Consumo en central', titulo: 'Consumo en bodega central', nota: 'Desechables y aseo usados en la bodega central o en producción: baja el stock de la central.', nuevo: 'Registrar consumo', doc: 'Consumo interno', hecho: 'Consumo registrado: el stock de la bodega central disminuyó.' },
+};
+const tabsDespachos = () => pestanas([['guias', 'Guías a tiendas'], ...Object.entries(SALIDAS).filter(([k]) => k === 'DEVOLUCION_TIENDA' || !S.usuario.tienda_id).map(([k, x]) => [k, x.tab])], tabDespachos, k => { tabDespachos = k; render(); });
+async function vistaSalidas(v, tipo) {
+  const cfg = SALIDAS[tipo], crea = can('despachos', 2), filas = await api('GET', '/salidas-internas' + qs({ tipo }));
+  const anula = crea && !S.usuario.tienda_id, esDev = tipo === 'DEVOLUCION_TIENDA';
+  v.innerHTML = cabecera(cfg.titulo, cfg.nota, crea ? `<button class="btn primario" id="n">${esc(cfg.nuevo)}</button>` : '');
+  v.append(tabsDespachos());
+  const c = v.appendChild(Object.assign(document.createElement('div'), { className: 'tarjeta' }));
+  tabla(c, { filas, csv: tipo.toLowerCase(), vacio: 'Aún no hay registros.', acciones: { ver: r => verSalida(r.id),
+    anular: r => confirmar(`Anular ${cfg.doc.toLowerCase()}`, esDev ? `Los artículos del documento #${r.id} volverán a la tienda. Requiere que la bodega central aún tenga ese stock.` : `Los artículos del documento #${r.id} volverán a la bodega central.`, async () => { await api('POST', `/salidas-internas/${r.id}/anular`, {}); aviso('Documento anulado.'); render(); }, 'Anular') }, cols: [
+    { t: 'N°', v: r => r.id }, { t: 'Fecha', v: r => r.fecha, h: r => fFecha(r.fecha) }, ...(esDev ? [{ t: 'Tienda', v: r => r.origen }] : []), { t: 'Motivo', v: r => r.motivo }, { t: 'Líneas', n: 1, v: r => r.lineas },
+    { t: 'Valor a costo', n: 1, v: r => r.valor, h: r => fPeso(r.valor) }, { t: 'Registrado por', v: r => r.usuario },
+    { t: 'Estado', v: r => r.estado, h: r => r.estado === 'ANULADO' ? etq('Anulado', 'mal') : etq('Vigente', 'bien') },
+    { t: '', h: r => `<div class="acciones">${accion('ver', 'Ver')}${r.estado === 'VIGENTE' && anula ? accion('anular', 'Anular', 'peligro') : ''}</div>` }] });
+  $('#n', v)?.addEventListener('click', () => {
+    const tiendas = bodegasOp(false);
+    const m = modal(cfg.nuevo, `<form novalidate><div class="campos">${esDev ? `<label class="campo"><span>Tienda que devuelve</span><select name="tienda_id">${opciones(tiendas, S.usuario.tienda_id || '', S.usuario.tienda_id ? undefined : 'Selecciona…')}</select></label>` : ''}
+      <label class="campo"><span>Fecha</span><input type="date" name="fecha" value="${hoy()}"></label><label class="campo todo"><span>Motivo</span><input name="motivo" maxlength="200"></label></div>
+      <h3 style="font-size:14px;margin:14px 0 6px">Desechables y aseo</h3><div id="lin"></div><div class="error" hidden></div>
+      <div class="modal-pie"><button type="button" class="btn cerrar">Cancelar</button><button class="btn primario">${esc(cfg.nuevo)}</button></div></form>`, true);
+    $$('.cerrar', m.el).forEach(b => b.addEventListener('click', m.cerrar));
+    const f = $('form', m.el);
+    let ed = null;
+    const cargar = async () => {
+      const bodega = esDev ? f.tienda_id.value : 0;
+      ed = null; $('#lin', m.el).innerHTML = '<p class="tenue">Elige la tienda para ver su stock.</p>';
+      if (bodega === '') return;
+      const st = await api('GET', '/salidas-internas/stock' + qs({ bodega }));
+      ed = editorLineas($('#lin', m.el), { articulos: S.cat.articulos.filter(a => a.desechable && !a.punto_venta), stock: Object.fromEntries(st.map(a => [a.articulo_id, a.cantidad])) });
+    };
+    if (esDev) f.tienda_id.addEventListener('change', () => cargar().catch(x => aviso(x.message, 1)));
+    cargar().catch(x => aviso(x.message, 1));
+    conEnvio(f, m, async () => {
+      if (!ed) throw new Error('Selecciona la tienda que devuelve.');
+      const r = await api('POST', '/salidas-internas', { tipo, tienda_id: esDev ? f.tienda_id.value : null, fecha: f.fecha.value, motivo: f.motivo.value, items: ed.leer() });
+      aviso(cfg.hecho); render(); verSalida(r.id);
+    });
+  });
+}
+async function verSalida(id) {
+  const s = await api('GET', `/salidas-internas/${id}`), cfg = SALIDAS[s.tipo], num = String(s.id).padStart(6, '0'), esDev = s.tipo === 'DEVOLUCION_TIENDA';
+  const m = modal(`${cfg.doc} ${num}`, `<div class="guia-cab"><div class="guia-marca"><img src="${esc(logo())}" alt=""><div><strong>Nata &amp; Schlott</strong><span class="tenue">Sistema de producción y logística</span></div></div>
+    <div class="guia-num"><span>${esc(cfg.doc)}</span><strong>N° ${num}</strong>${s.estado === 'ANULADO' ? etq('ANULADO', 'mal') : ''}</div></div>
+    <div class="guia-datos"><div><b>Fecha:</b> ${fFecha(s.fecha)}</div><div><b>Origen:</b> ${esc(s.origen)}</div><div><b>Destino:</b> ${esDev ? 'Bodega central' : 'Consumo interno'}</div><div><b>Motivo:</b> ${esc(s.motivo)}</div><div><b>Registrado por:</b> ${esc(s.usuario)}</div></div>
+    <div class="tabla-marco"><table><thead><tr><th>Código</th><th>Descripción</th><th class="n">Cantidad</th><th>Unidad</th><th class="n">Costo</th><th class="n">Subtotal</th></tr></thead><tbody>${s.items.map(i => `<tr><td>${esc(i.codigo)}</td><td>${esc(i.nombre)}</td><td class="n">${fCant(i.cantidad)}</td><td>${esc(i.unidad)}</td><td class="n">${fPrecio(i.costo_unit)}</td><td class="n">${fPeso(i.cantidad * i.costo_unit)}</td></tr>`).join('')}</tbody></table></div>
+    <div class="firmas"><div>Entrega</div><div>Recibe conforme</div></div><p class="legal">Documento de control interno.</p>
+    <div class="modal-pie no-imprimir"><button type="button" class="btn primario imprimir">Imprimir</button></div>`, true);
+  $('.imprimir', m.el).addEventListener('click', () => print());
+}
 Vistas.despachos = async v => {
+  if (SALIDAS[tabDespachos]) return vistaSalidas(v, tabDespachos);
   const crea = can('despachos', 2) && !S.usuario.tienda_id;
   const filas = await api('GET', '/despachos');
   v.innerHTML = cabecera('Despachos a tiendas', 'Cada guía descuenta de la bodega central y aumenta el stock de la bodega de la tienda.', crea ? '<button class="btn primario" id="n">Nueva guía</button>' : '');
+  v.append(tabsDespachos());
   const c = v.appendChild(Object.assign(document.createElement('div'), { className: 'tarjeta' }));
   const fudoEnvio = async (r, ruta, cuerpo, ok) => {
     const x = await api('POST', `/despachos/${r.id}/fudo${ruta}`, cuerpo);

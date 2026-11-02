@@ -96,6 +96,10 @@ CREATE TABLE IF NOT EXISTS despachos(id INTEGER PRIMARY KEY, fecha TEXT NOT NULL
   transportista TEXT NOT NULL DEFAULT '', patente TEXT NOT NULL DEFAULT '', obs TEXT NOT NULL DEFAULT '', iva_pct REAL NOT NULL,
   neto REAL NOT NULL, iva REAL NOT NULL, total REAL NOT NULL, estado TEXT NOT NULL DEFAULT 'VIGENTE', usuario_id INTEGER REFERENCES usuarios(id),
   fudo_estado TEXT NOT NULL DEFAULT '', fudo_gasto_id TEXT NOT NULL DEFAULT '', fudo_error TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS salidas_internas(id INTEGER PRIMARY KEY, tipo TEXT NOT NULL CHECK(tipo IN ('DEVOLUCION_TIENDA','CONSUMO_CENTRAL')), fecha TEXT NOT NULL,
+  tienda_id INTEGER REFERENCES tiendas(id), motivo TEXT NOT NULL, estado TEXT NOT NULL DEFAULT 'VIGENTE', usuario_id INTEGER REFERENCES usuarios(id));
+CREATE TABLE IF NOT EXISTS salida_interna_items(salida_id INTEGER NOT NULL REFERENCES salidas_internas(id), articulo_id INTEGER NOT NULL REFERENCES articulos(id),
+  cantidad REAL NOT NULL, costo_unit REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS fudo_tiendas(tienda_id INTEGER PRIMARY KEY REFERENCES tiendas(id) ON DELETE CASCADE, api_key TEXT NOT NULL, api_secret TEXT NOT NULL,
   categoria_id TEXT NOT NULL DEFAULT '', categoria TEXT NOT NULL DEFAULT '', proveedor_id TEXT NOT NULL DEFAULT '', proveedor TEXT NOT NULL DEFAULT '',
   monto TEXT NOT NULL DEFAULT 'TOTAL');
@@ -765,7 +769,7 @@ def config_respaldo(c):
 
 def siguiente_codigo(db, tipo, desechable, punto_venta):
     """Correlativo por clasificación. Se ejecuta dentro de la transacción, así dos usuarios no obtienen el mismo."""
-    prefijo = {"PRODUCTO": "P", "SUBPRODUCTO": "SP"}.get(tipo) or ("IPV" if punto_venta else "IND" if desechable else "IN")
+    prefijo = {"PRODUCTO": "P", "SUBPRODUCTO": "SP"}.get(tipo) or ("IPV" if punto_venta else "IDA" if desechable else "IN")
     usados = [int(m.group(1)) for r in rows(db, "SELECT codigo FROM articulos WHERE codigo LIKE ?", prefijo + "%")
               if (m := re.fullmatch(prefijo + r"(\d+)", r["codigo"], re.I))]
     return f"{prefijo}{max(usados, default=0) + 1:04d}"
@@ -780,6 +784,8 @@ def datos_articulo(db, d, codigo=None):
     punto_venta = scalar(db, "SELECT punto_venta FROM categorias WHERE id=?", entero(d.get("categoria_id"), "la categoría"))
     if punto_venta and tipo != "INSUMO":
         raise ApiError(400, "Esa clasificación es solo para insumos de puntos de venta.")
+    if "punto_venta" in d and bool(d["punto_venta"]) != bool(punto_venta):  # la pestaña define el grupo: una categoría no puede cambiarlo
+        raise ApiError(400, "Esa clasificación no pertenece a este grupo de artículos.")
     desechable = 1 if tipo == "INSUMO" and (d.get("desechable") or punto_venta) else 0
     return (tipo, desechable, entero(d.get("categoria_id"), "la categoría"),
             entero(d.get("unidad_id"), "la unidad de medida"), codigo or siguiente_codigo(db, tipo, desechable, punto_venta),
@@ -815,7 +821,7 @@ def articulos_editar(c, i):
     return {"ok": True}
 
 
-RELACIONES_ARTICULO = (("movimientos", "movimientos en el historial"), ("compra_items", "compras"), ("devolucion_items", "devoluciones a proveedores"), ("historial_precios", "historial de precios"),
+RELACIONES_ARTICULO = (("movimientos", "movimientos en el historial"), ("compra_items", "compras"), ("devolucion_items", "devoluciones a proveedores"), ("salida_interna_items", "devoluciones de tiendas o consumos internos"), ("historial_precios", "historial de precios"),
                        ("producciones", "producciones"), ("despacho_items", "guías de despacho"), ("mermas", "mermas"), ("salidas_tienda", "ventas o consumos de tienda"),
                        ("recetas", "una receta propia"), ("receta_items", "recetas donde es ingrediente"))
 
@@ -955,6 +961,89 @@ def compras_crear(c):
 @ruta("POST", r"/api/compras/(\d+)/anular", "compras", 2)
 def compras_anular(c, i):
     anular(c.db, c.uid, "compras", "COMPRA", int(i))
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- desechables: devolución de tienda y consumo en la central
+
+TIPOS_SALIDA_INTERNA = ("DEVOLUCION_TIENDA", "CONSUMO_CENTRAL")
+
+
+@ruta("GET", "/api/salidas-internas/stock", "despachos", 2)
+def salidas_internas_stock(c):
+    return articulos_de_bodega(c.db, c.bodega(c.q.get("bodega")), "DESECHABLES")
+
+
+@ruta("GET", "/api/salidas-internas", "despachos")
+def salidas_internas_lista(c):
+    d, h = c.rango(365)
+    tipo = c.q.get("tipo")
+    if tipo not in TIPOS_SALIDA_INTERNA:
+        raise ApiError(400, "Tipo de documento no válido.")
+    propia = c.user.get("tienda_id")
+    if propia and tipo == "CONSUMO_CENTRAL":
+        c.sin_tienda()
+    return rows(c.db, f"""SELECT s.*, COALESCE(t.nombre,'Bodega central') origen, u.nombre usuario,
+        (SELECT COUNT(*) FROM salida_interna_items i WHERE i.salida_id=s.id) lineas,
+        (SELECT SUM(i.cantidad*i.costo_unit) FROM salida_interna_items i WHERE i.salida_id=s.id) valor
+        FROM salidas_internas s LEFT JOIN tiendas t ON t.id=s.tienda_id LEFT JOIN usuarios u ON u.id=s.usuario_id
+        WHERE s.tipo=? AND s.fecha BETWEEN ? AND ? {'AND s.tienda_id=' + str(int(propia)) if propia else ''}
+        ORDER BY s.fecha DESC, s.id DESC LIMIT 500""", tipo, d, h)
+
+
+def salida_interna_de(c, i):
+    r = row(c.db, """SELECT s.*, COALESCE(t.nombre,'Bodega central') origen, t.direccion, t.comuna, u.nombre usuario FROM salidas_internas s
+        LEFT JOIN tiendas t ON t.id=s.tienda_id LEFT JOIN usuarios u ON u.id=s.usuario_id WHERE s.id=?""", int(i))
+    propia = c.user.get("tienda_id")
+    if not r or (propia and r["tienda_id"] != propia):
+        raise ApiError(404, "Documento no encontrado.")
+    return r
+
+
+@ruta("GET", r"/api/salidas-internas/(\d+)", "despachos")
+def salidas_internas_detalle(c, i):
+    r = salida_interna_de(c, i)
+    r["items"] = rows(c.db, "SELECT si.*, a.codigo, a.nombre, u.abreviatura unidad FROM salida_interna_items si JOIN articulos a ON a.id=si.articulo_id "
+                            "JOIN unidades u ON u.id=a.unidad_id WHERE si.salida_id=? ORDER BY a.nombre", int(i))
+    return r
+
+
+@ruta("POST", "/api/salidas-internas", "despachos", 2)
+def salidas_internas_crear(c):
+    d = c.body
+    tipo = d.get("tipo")
+    if tipo not in TIPOS_SALIDA_INTERNA:
+        raise ApiError(400, "Tipo de documento no válido.")
+    tienda = None
+    if tipo == "DEVOLUCION_TIENDA":
+        tienda = c.bodega(entero(d.get("tienda_id"), "la tienda"))
+        if tienda == CENTRAL:
+            raise ApiError(400, "Selecciona la tienda que devuelve.")
+    else:
+        c.sin_tienda()
+    fecha = fecha_valida(d.get("fecha"))
+    motivo = txt(d.get("motivo"), "el motivo", True, 200)
+    items = lineas(d.get("items"))
+    sid = c.db.execute("INSERT INTO salidas_internas(tipo,fecha,tienda_id,motivo,usuario_id) VALUES(?,?,?,?,?)", (tipo, fecha, tienda, motivo, c.uid)).lastrowid
+    ref = f"{'Devolución de tienda' if tienda else 'Consumo interno central'} #{sid}"
+    for i in items:
+        a = articulo(c.db, i["articulo_id"])
+        if not a["desechable"] or scalar(c.db, "SELECT punto_venta FROM categorias WHERE id=?", a["categoria_id"]):
+            raise ApiError(400, f"{a['nombre']} no corresponde: aquí solo se registran desechables y aseo.")
+        c.db.execute("INSERT INTO salida_interna_items VALUES(?,?,?,?)", (sid, a["id"], i["cantidad"], costo_de(a)))
+        if tienda:
+            mover(c.db, a["id"], tienda, -i["cantidad"], "DEVOLUCION_TIENDA", c.uid, fecha, "SALIDA_INTERNA", sid, ref, obs=motivo)
+            mover(c.db, a["id"], CENTRAL, i["cantidad"], "RECEPCION_CENTRAL", c.uid, fecha, "SALIDA_INTERNA", sid, ref, obs=motivo)
+        else:
+            mover(c.db, a["id"], CENTRAL, -i["cantidad"], "CONSUMO_CENTRAL", c.uid, fecha, "SALIDA_INTERNA", sid, ref, obs=motivo)
+    return {"id": sid}
+
+
+@ruta("POST", r"/api/salidas-internas/(\d+)/anular", "despachos", 2)
+def salidas_internas_anular(c, i):
+    salida_interna_de(c, i)
+    c.sin_tienda()
+    anular(c.db, c.uid, "salidas_internas", "SALIDA_INTERNA", int(i))
     return {"ok": True}
 
 
@@ -1599,7 +1688,7 @@ def reporte_cobertura(c):
     dias = max((date.fromisoformat(h) - date.fromisoformat(d)).days + 1, 1)
     out = rows(c.db, """SELECT a.id, a.codigo, a.nombre, a.tipo, a.desechable, a.stock_minimo, a.costo, u.abreviatura unidad, COALESCE(s.cantidad,0) stock,
         COALESCE((SELECT -SUM(m.cantidad) FROM movimientos m WHERE m.articulo_id=a.id AND m.bodega_id=0 AND m.cantidad<0
-          AND m.tipo IN ('CONSUMO_PRODUCCION','DESPACHO','MERMA') AND substr(m.fecha,1,10) BETWEEN ? AND ?),0) salidas
+          AND m.tipo IN ('CONSUMO_PRODUCCION','DESPACHO','MERMA','CONSUMO_CENTRAL') AND substr(m.fecha,1,10) BETWEEN ? AND ?),0) salidas
         FROM articulos a JOIN unidades u ON u.id=a.unidad_id LEFT JOIN stock s ON s.articulo_id=a.id AND s.bodega_id=0 WHERE a.activo=1 ORDER BY a.nombre""", d, h)
     for r in out:
         r["consumo_diario"] = r["salidas"] / dias
@@ -1636,6 +1725,9 @@ def sembrar(db):
         for n in ("Vencimiento", "Producto quemado o mal horneado", "Error de receta", "Quiebre o daño en traslado", "Caída o manipulación",
                   "Contaminación", "Falla de refrigeración", "Devolución de tienda", "Otro"):
             db.execute("INSERT INTO motivos_merma(nombre) VALUES(?)", (n,))
+    if not scalar(db, "SELECT COUNT(*) FROM config WHERE clave='codigos_ida'"):  # el prefijo de desechables y aseo fue IND
+        db.execute("UPDATE articulos SET codigo='IDA'||substr(codigo,4) WHERE desechable=1 AND codigo GLOB 'IND[0-9][0-9][0-9][0-9]*'")
+        db.execute("INSERT INTO config VALUES('codigos_ida','1')")
     if not scalar(db, "SELECT COUNT(*) FROM config WHERE clave='permisos_devoluciones'"):  # los perfiles de bases anteriores no traen este módulo
         for p in rows(db, "SELECT * FROM perfiles WHERE nombre IN (?,?,?)", PERFIL_ADMIN, "Bodega y logística", "Gerencia"):
             permisos = json.loads(p["permisos"])
