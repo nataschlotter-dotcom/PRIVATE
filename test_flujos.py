@@ -75,21 +75,42 @@ vaso = art("INSUMO", "VAS", un, precio=50, desechable=True)
 base = art("SUBPRODUCTO", "BAS")
 torta = art("PRODUCTO", "TOR", un, precio=20000)
 
+# Códigos: correlativo por clasificación; lo enviado por el cliente se ignora
+def codigo_de(i):
+    return next(x["codigo"] for x in A("GET", "/articulos") if x["id"] == i)
+
+
+assert [codigo_de(x) for x in (harina, vaso, base, torta)] == ["IN0001", "IND0001", "SP0001", "P0001"]
+cat_pv = next(x["id"] for x in cat["categorias"] if x["punto_venta"])
+ipv = A("POST", "/articulos", {"tipo": "INSUMO", "nombre": "PV", "categoria_id": cat_pv, "unidad_id": un})
+assert ipv["codigo"] == "IPV0001"
+A("PUT", f"/articulos/{ipv['id']}", {"tipo": "INSUMO", "codigo": "OTRO", "nombre": "PV2", "categoria_id": cat_pv, "unidad_id": un})
+assert codigo_de(ipv["id"]) == "IPV0001"  # editar conserva el código
+A("DELETE", f"/articulos/{ipv['id']}")
+in2 = art("INSUMO", "X", un)
+assert codigo_de(in2) == "IN0002"  # IND e IPV no cuentan para IN
+c_cod = app.conectar()
+c_cod.execute("UPDATE articulos SET codigo='IN0099' WHERE id=?", (in2,))  # códigos previos: se sigue desde el mayor
+c_cod.close()
+in3 = art("INSUMO", "Y", un)
+assert codigo_de(in3) == "IN0100"
+A("DELETE", f"/articulos/{in2}"); A("DELETE", f"/articulos/{in3}")
+
 
 def stock(bodega=0):
     return {r["articulo_id"]: r["cantidad"] for r in A("GET", f"/bodegas/stock?bodega={bodega}")}
 
 
 # Compra: stock, IVA, precio y CPP
-c1 = A("POST", "/compras", {"proveedor_id": prov, "fecha": "2026-01-10", "items": [{"articulo_id": harina, "cantidad": 10, "precio": 1000}, {"articulo_id": vaso, "cantidad": 100, "precio": 50}]})["id"]
+c1 = A("POST", "/compras", {"tipo_documento": "FACTURA", "proveedor_id": prov, "fecha": "2026-01-10", "items": [{"articulo_id": harina, "cantidad": 10, "precio": 1000}, {"articulo_id": vaso, "cantidad": 100, "precio": 50}]})["id"]
 d = A("GET", f"/compras/{c1}")
 casi(d["neto"], 15000); casi(d["iva"], 2850); casi(d["total"], 17850)
-A("POST", "/compras", {"proveedor_id": prov, "fecha": "2026-01-20", "items": [{"articulo_id": harina, "cantidad": 10, "precio": 1200}]})
+A("POST", "/compras", {"tipo_documento": "FACTURA", "proveedor_id": prov, "fecha": "2026-01-20", "items": [{"articulo_id": harina, "cantidad": 10, "precio": 1200}]})
 a = next(x for x in A("GET", "/articulos") if x["id"] == harina)
 casi(a["precio"], 1200); casi(a["costo"], 1100); casi(a["stock"], 20); casi(a["stock_minimo"], 1234.56789)
-A("POST", "/compras", {"proveedor_id": prov, "items": [{"articulo_id": torta, "cantidad": 1, "precio": 1}]}, 400)  # solo insumos
-A("POST", "/compras", {"proveedor_id": prov, "items": [{"articulo_id": harina, "cantidad": -1, "precio": 1}]}, 400)
-A("POST", "/compras", {"proveedor_id": prov, "items": []}, 400)
+A("POST", "/compras", {"tipo_documento": "FACTURA", "proveedor_id": prov, "items": [{"articulo_id": torta, "cantidad": 1, "precio": 1}]}, 400)  # solo insumos
+A("POST", "/compras", {"tipo_documento": "FACTURA", "proveedor_id": prov, "items": [{"articulo_id": harina, "cantidad": -1, "precio": 1}]}, 400)
+A("POST", "/compras", {"tipo_documento": "FACTURA", "proveedor_id": prov, "items": []}, 400)
 
 # Recetas: desechable y producto no pueden ser ingrediente; sin ciclos
 A("PUT", f"/recetas/{base}", {"rendimiento": 1, "items": [{"articulo_id": vaso, "cantidad": 1}]}, 400)
@@ -161,7 +182,7 @@ cafe = A("POST", "/articulos", {"tipo": "INSUMO", "codigo": "CAF", "nombre": "Ca
 A("POST", "/articulos", {"tipo": "PRODUCTO", "codigo": "MAL", "nombre": "Malo", "categoria_id": cats["Café"]["id"], "unidad_id": kg}, 400)
 cafe_art = next(x for x in A("GET", "/articulos") if x["id"] == cafe)
 assert cafe_art["desechable"] == 1 and cafe_art["punto_venta"] == 1
-A("POST", "/compras", {"proveedor_id": prov, "numero": "PV1", "items": [{"articulo_id": cafe, "cantidad": 5, "precio": 100}]})
+A("POST", "/compras", {"tipo_documento": "FACTURA", "proveedor_id": prov, "numero": "PV1", "items": [{"articulo_id": cafe, "cantidad": 5, "precio": 100}]})
 gp = A("POST", "/despachos", {"tienda_id": tienda2, "items": [{"articulo_id": cafe, "cantidad": 2}, {"articulo_id": vaso, "cantidad": 1}]})["id"]
 it = {i["articulo_id"]: i for i in A("GET", f"/despachos/{gp}")["items"]}
 assert it[cafe]["punto_venta"] == 1 and it[cafe]["categoria"] == "Café"
@@ -211,7 +232,7 @@ A("POST", f"/despachos/{g2}/anular", {})
 casi(stock()[vaso], 70); casi(stock(tienda2)[vaso], 0)
 
 # Anular compra revierte stock y precio
-c3 = A("POST", "/compras", {"proveedor_id": prov, "fecha": "2026-02-01", "items": [{"articulo_id": harina, "cantidad": 5, "precio": 2000}]})["id"]
+c3 = A("POST", "/compras", {"tipo_documento": "FACTURA", "proveedor_id": prov, "fecha": "2026-02-01", "items": [{"articulo_id": harina, "cantidad": 5, "precio": 2000}]})["id"]
 assert next(x for x in A("GET", "/articulos") if x["id"] == harina)["precio"] == 2000
 A("POST", f"/compras/{c3}/anular", {})
 a = next(x for x in A("GET", "/articulos") if x["id"] == harina)
@@ -231,6 +252,16 @@ P("GET", "/compras", esperado=403); P("POST", "/usuarios", {}, 403); P("GET", "/
 P("GET", "/produccion"); P("GET", "/produccion/recetas")
 T("GET", "/compras", esperado=403); T("GET", "/usuarios", esperado=403); T("POST", "/despachos", {}, 403)
 T("GET", "/stock/central", esperado=403)
+# Compras: factura o boleta es obligatorio
+s_doc = stock()[harina]
+A("POST", "/compras", {"proveedor_id": prov, "items": [{"articulo_id": harina, "cantidad": 1, "precio": 1}]}, 400)
+A("POST", "/compras", {"tipo_documento": "GUIA", "proveedor_id": prov, "items": [{"articulo_id": harina, "cantidad": 1, "precio": 1}]}, 400)
+cb = A("POST", "/compras", {"tipo_documento": "BOLETA", "documento": "55", "proveedor_id": prov, "items": [{"articulo_id": harina, "cantidad": 1, "precio": 1200}]})["id"]
+assert A("GET", f"/compras/{cb}")["tipo_documento"] == "BOLETA" and any(x["tipo_documento"] == "BOLETA" for x in A("GET", "/compras"))
+assert any(x["referencia"] == f"Compra #{cb} · Boleta 55" for x in A("GET", "/movimientos?desde=2026-01-01&tipo=COMPRA"))
+A("POST", f"/compras/{cb}/anular", {})
+casi(stock()[harina], s_doc)
+
 # Fudo: contra un servidor simulado, sin duplicar gastos ante respuestas inciertas
 class FudoFalso(BaseHTTPRequestHandler):
     gastos, modo, tokens = [], "ok", 0

@@ -133,7 +133,14 @@ tfoot td { font-weight: 600; border-top: 2px solid var(--borde); border-bottom: 
 .totales .total { font-weight: 700; border-top: 1px solid var(--borde); margin-top: 3px; padding-top: 5px; }
 .lineas td { padding: 4px; border: 0; }
 .lineas select { min-width: 190px; }
+.lineas input.busca { min-width: 240px; }
 .lineas input.num { min-width: 90px; }
+.combo-lista { position: fixed; z-index: 30; background: #fff; border: 1px solid #b9bcc0; border-radius: 6px; box-shadow: 0 6px 20px rgba(0,0,0,.25); overflow-y: auto; color: var(--tinta); }
+.combo-grupo { position: sticky; top: 0; background: var(--suave); padding: 5px 10px; font-size: 12.5px; font-weight: 700; color: var(--tinta-2); }
+.combo-op { padding: 8px 10px; cursor: pointer; border-top: 1px solid var(--borde); }
+.combo-op small { display: block; color: var(--tinta-2); font-size: 12.5px; }
+.combo-op:hover, .combo-op.activo { background: var(--celeste-claro); }
+.combo-vacio { padding: 12px 10px; color: var(--tinta-2); }
 
 #toasts { position: fixed; bottom: 16px; right: 16px; display: grid; gap: 8px; z-index: 40; }
 .toast { background: var(--marca); color: #fff; padding: 10px 14px; border-radius: 6px; max-width: 360px; box-shadow: 0 4px 14px rgba(0,0,0,.25); }

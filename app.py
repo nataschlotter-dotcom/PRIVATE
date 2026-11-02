@@ -80,7 +80,7 @@ CREATE TABLE IF NOT EXISTS receta_items(receta_id INTEGER NOT NULL REFERENCES re
   articulo_id INTEGER NOT NULL REFERENCES articulos(id), cantidad REAL NOT NULL, PRIMARY KEY(receta_id, articulo_id));
 CREATE TABLE IF NOT EXISTS compras(id INTEGER PRIMARY KEY, fecha TEXT NOT NULL, proveedor_id INTEGER NOT NULL REFERENCES proveedores(id),
   documento TEXT NOT NULL DEFAULT '', iva_pct REAL NOT NULL, neto REAL NOT NULL, iva REAL NOT NULL, total REAL NOT NULL,
-  obs TEXT NOT NULL DEFAULT '', estado TEXT NOT NULL DEFAULT 'VIGENTE', usuario_id INTEGER REFERENCES usuarios(id));
+  obs TEXT NOT NULL DEFAULT '', estado TEXT NOT NULL DEFAULT 'VIGENTE', usuario_id INTEGER REFERENCES usuarios(id), tipo_documento TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS compra_items(compra_id INTEGER NOT NULL REFERENCES compras(id), articulo_id INTEGER NOT NULL REFERENCES articulos(id),
   cantidad REAL NOT NULL, precio REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS devoluciones(id INTEGER PRIMARY KEY, fecha TEXT NOT NULL, proveedor_id INTEGER NOT NULL REFERENCES proveedores(id),
@@ -298,6 +298,9 @@ def lineas(items, nombre_precio=None):
 
 def crear_compra(db, uid, d):
     fecha = fecha_valida(d.get("fecha"))
+    tipo_doc = d.get("tipo_documento")
+    if tipo_doc not in ("FACTURA", "BOLETA"):
+        raise ApiError(400, "Indica si el documento es factura o boleta.")
     prov = entero(d.get("proveedor_id"), "el proveedor")
     proveedor = row(db, "SELECT * FROM proveedores WHERE id=? AND activo=1", prov)
     if not proveedor:
@@ -306,11 +309,11 @@ def crear_compra(db, uid, d):
     pct = iva_actual(db)
     neto = round(sum(i["cantidad"] * i["precio"] for i in items), 2)
     iva = round(neto * pct / 100, 2)
-    cur = db.execute("INSERT INTO compras(fecha,proveedor_id,documento,iva_pct,neto,iva,total,obs,usuario_id) VALUES(?,?,?,?,?,?,?,?,?)",
-                     (fecha, prov, txt(d.get("documento"), "El documento", False, 40), pct, neto, iva, round(neto + iva, 2),
+    cur = db.execute("INSERT INTO compras(fecha,proveedor_id,tipo_documento,documento,iva_pct,neto,iva,total,obs,usuario_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                     (fecha, prov, tipo_doc, txt(d.get("documento"), "El documento", False, 40), pct, neto, iva, round(neto + iva, 2),
                       txt(d.get("obs"), "La observación", False, 500), uid))
     cid = cur.lastrowid
-    ref = f"Compra #{cid}" + (f" · Doc. {d.get('documento')}" if d.get("documento") else "")
+    ref = f"Compra #{cid} · {tipo_doc.capitalize()}" + (f" {d.get('documento')}" if d.get("documento") else "")
     for i in items:
         a = articulo(db, i["articulo_id"])
         if a["tipo"] != "INSUMO":
@@ -760,7 +763,16 @@ def config_respaldo(c):
 
 # ---------------------------------------------------------------- artículos
 
-def datos_articulo(db, d):
+def siguiente_codigo(db, tipo, desechable, punto_venta):
+    """Correlativo por clasificación. Se ejecuta dentro de la transacción, así dos usuarios no obtienen el mismo."""
+    prefijo = {"PRODUCTO": "P", "SUBPRODUCTO": "SP"}.get(tipo) or ("IPV" if punto_venta else "IND" if desechable else "IN")
+    usados = [int(m.group(1)) for r in rows(db, "SELECT codigo FROM articulos WHERE codigo LIKE ?", prefijo + "%")
+              if (m := re.fullmatch(prefijo + r"(\d+)", r["codigo"], re.I))]
+    return f"{prefijo}{max(usados, default=0) + 1:04d}"
+
+
+def datos_articulo(db, d, codigo=None):
+    """Sin codigo, se asigna el siguiente correlativo. Al editar se conserva el que ya tiene."""
     tipo = d.get("tipo")
     if tipo not in ("PRODUCTO", "SUBPRODUCTO", "INSUMO"):
         raise ApiError(400, "Tipo de artículo no válido.")
@@ -768,8 +780,9 @@ def datos_articulo(db, d):
     punto_venta = scalar(db, "SELECT punto_venta FROM categorias WHERE id=?", entero(d.get("categoria_id"), "la categoría"))
     if punto_venta and tipo != "INSUMO":
         raise ApiError(400, "Esa clasificación es solo para insumos de puntos de venta.")
-    return (tipo, 1 if tipo == "INSUMO" and (d.get("desechable") or punto_venta) else 0, entero(d.get("categoria_id"), "la categoría"),
-            entero(d.get("unidad_id"), "la unidad de medida"), txt(d.get("codigo"), "El código", True, 30).upper(),
+    desechable = 1 if tipo == "INSUMO" and (d.get("desechable") or punto_venta) else 0
+    return (tipo, desechable, entero(d.get("categoria_id"), "la categoría"),
+            entero(d.get("unidad_id"), "la unidad de medida"), codigo or siguiente_codigo(db, tipo, desechable, punto_venta),
             txt(d.get("nombre"), "El nombre", True, 120), num(d.get("stock_minimo", 0), "El stock mínimo"), num(d.get("precio", 0), "El precio"))
 
 
@@ -785,13 +798,14 @@ def articulos_crear(c):
     v = datos_articulo(c.db, c.body)
     costo = v[7] if v[0] == "INSUMO" else 0
     return {"id": c.db.execute("INSERT INTO articulos(tipo,desechable,categoria_id,unidad_id,codigo,nombre,stock_minimo,precio,costo) VALUES(?,?,?,?,?,?,?,?,?)",
-                               (*v, costo)).lastrowid}
+                               (*v, costo)).lastrowid, "codigo": v[4]}
 
 
 @ruta("PUT", r"/api/articulos/(\d+)", "articulos", 2)
 def articulos_editar(c, i):
-    v, i = datos_articulo(c.db, c.body), int(i)
+    i = int(i)
     a = articulo(c.db, i)
+    v = datos_articulo(c.db, c.body, a["codigo"])
     if a["tipo"] != v[0] and scalar(c.db, "SELECT COUNT(*) FROM movimientos WHERE articulo_id=?", i):
         raise ApiError(409, "No se puede cambiar el tipo de un artículo con movimientos.")
     if v[1] and scalar(c.db, "SELECT COUNT(*) FROM receta_items WHERE articulo_id=?", i):
@@ -1602,6 +1616,8 @@ def sembrar(db):
     db.executescript(SCHEMA)
     if "seccion" not in [col[1] for col in db.execute("PRAGMA table_info(inventarios)")]:  # bases creadas antes de las secciones
         db.execute("ALTER TABLE inventarios ADD COLUMN seccion TEXT NOT NULL DEFAULT ''")
+    if "tipo_documento" not in [col[1] for col in db.execute("PRAGMA table_info(compras)")]:  # las compras anteriores quedan sin tipo: no se sabe cuál era
+        db.execute("ALTER TABLE compras ADD COLUMN tipo_documento TEXT NOT NULL DEFAULT ''")
     columnas_despacho = [col[1] for col in db.execute("PRAGMA table_info(despachos)")]
     for col in ("fudo_estado", "fudo_gasto_id", "fudo_error"):  # bases creadas antes de la integración con Fudo
         if col not in columnas_despacho:
@@ -1648,7 +1664,7 @@ def cargar_demo(db, uid):
 
     def art(tipo, cod, nombre, categoria, unidad, minimo, precio, desechable=0):
         return db.execute("INSERT INTO articulos(tipo,desechable,categoria_id,unidad_id,codigo,nombre,stock_minimo,precio,costo) VALUES(?,?,?,?,?,?,?,?,?)",
-                          (tipo, desechable, cat[categoria], uni[unidad], cod, nombre, minimo, precio, precio if tipo == "INSUMO" else 0)).lastrowid
+                          (tipo, desechable, cat[categoria], uni[unidad], siguiente_codigo(db, tipo, desechable, 0), nombre, minimo, precio, precio if tipo == "INSUMO" else 0)).lastrowid
 
     ins = {  # código: (id, proveedor, precio base, cantidad por compra)
         "harina": (art("INSUMO", "INS-001", "Harina sin polvos", "Harinas y cereales", "kg", 25, 950), 0, 950, 40),
@@ -1696,7 +1712,7 @@ def cargar_demo(db, uid):
             precio = round(base * alza * rnd.uniform(.985, 1.03)) if base >= 100 else round(base * alza * rnd.uniform(.985, 1.03), 1)
             por_prov.setdefault(p, []).append({"articulo_id": aid, "cantidad": round(cant * rnd.uniform(.85, 1.15)), "precio": precio})
         for p, items in por_prov.items():
-            crear_compra(db, uid, {"fecha": f, "proveedor_id": provs[p], "documento": f"F-{10000 + semana * 10 + p}", "items": items})
+            crear_compra(db, uid, {"fecha": f, "proveedor_id": provs[p], "tipo_documento": "FACTURA", "documento": f"F-{10000 + semana * 10 + p}", "items": items})
         for a, c in ((bizcocho, 8), (ganache, 7)):
             crear_produccion(db, uid, {"fecha": f, "articulo_id": a, "cantidad": c})
         for a, c in ((torta, 4), (brownie, 72), (alfajor, 90)):

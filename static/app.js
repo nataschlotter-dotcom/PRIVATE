@@ -213,11 +213,71 @@ function confirmar(titulo, texto, fn, btn = 'Confirmar') {
 function editorLineas(caja, cfg) {
   const opcion = a => `<option value="${a.id}">${esc(a.codigo)} · ${esc(a.nombre)}</option>`;
   const opts = cfg.grupos ? cfg.grupos.map(g => `<optgroup label="${esc(g.nombre)}">${cfg.articulos.filter(g.filtro).map(opcion).join('')}</optgroup>`).join('') : cfg.articulos.map(opcion).join('');
-  caja.innerHTML = `<div class="tabla-marco"><table class="lineas"><thead><tr><th>Artículo</th><th class="n">Cantidad</th><th>Unidad</th>
+  const categorias = [...new Set(cfg.articulos.map(a => a.categoria))].sort((x, y) => x.localeCompare(y)).map(x => ({ id: x, nombre: x }));
+  caja.innerHTML = `<div class="filtros"><label>Filtrar artículos por categoría<select class="cat-filtro">${opciones(categorias, '', 'Todas las categorías')}</select></label></div>
+    <div class="tabla-marco"><table class="lineas"><thead><tr><th>Artículo</th><th class="n">Cantidad</th><th>Unidad</th>
     ${cfg.stock ? '<th class="n">Disponible</th>' : ''}${cfg.precio ? `<th class="n">${esc(cfg.precio)}</th><th class="n">Subtotal</th>` : ''}<th></th></tr></thead><tbody></tbody></table></div>
-    <button type="button" class="btn mini agregar" style="margin-top:6px">+ Agregar línea</button>`;
-  const cuerpo = $('tbody', caja);
+    <button type="button" class="btn mini agregar" style="margin-top:6px">+ Agregar línea</button><div class="combo-lista" role="listbox" hidden></div>`;
+  const cuerpo = $('tbody', caja), lista = $('.combo-lista', caja), catFiltro = $('.cat-filtro', caja);
   const por = id => cfg.articulos.find(a => String(a.id) === String(id));
+  const etiqueta = a => `${a.codigo} · ${a.nombre}`;
+  const normal = s => String(s).normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+  const grupoDe = a => cfg.grupos?.find(g => g.filtro(a))?.nombre ?? a.categoria;
+  const ordenGrupo = a => cfg.grupos ? cfg.grupos.findIndex(g => g.filtro(a)) : 0;
+  let abierto = null, activo = -1;
+  const colocar = () => {
+    if (!abierto) return;
+    const r = $('.busca', abierto).getBoundingClientRect(), alto = window.visualViewport?.height ?? innerHeight;
+    const abajo = alto - r.bottom - 8, arriba = r.top - 8, usarArriba = abajo < 170 && arriba > abajo;
+    lista.style.left = `${Math.max(8, Math.min(r.left, innerWidth - Math.max(r.width, 300) - 8))}px`;
+    lista.style.width = `${Math.min(Math.max(r.width, 300), innerWidth - 16)}px`;
+    lista.style.maxHeight = `${Math.max(usarArriba ? arriba : abajo, 120)}px`;
+    lista.style.top = usarArriba ? 'auto' : `${r.bottom + 2}px`;
+    lista.style.bottom = usarArriba ? `${innerHeight - r.top + 2}px` : 'auto';
+  };
+  function cerrarLista() {
+    if (!abierto) return;
+    $('.busca', abierto).setAttribute('aria-expanded', 'false');
+    abierto = null; activo = -1; lista.hidden = true;
+    removeEventListener('scroll', colocar, true); removeEventListener('resize', colocar);
+  }
+  function pintarLista(tr) {
+    const entrada = $('.busca', tr), sel = por($('select', tr).value);
+    const texto = sel && entrada.value === etiqueta(sel) ? '' : normal(entrada.value.trim());
+    const usados = new Set($$('select', cuerpo).filter(s => s !== $('select', tr)).map(s => s.value));
+    const disponibles = cfg.articulos.filter(a => !usados.has(String(a.id)) && (!catFiltro.value || a.categoria === catFiltro.value));
+    const coincide = campos => a => texto.split(/\s+/).every(p => normal(campos(a)).includes(p));
+    const porNombre = disponibles.filter(coincide(a => `${a.codigo} ${a.nombre}`));  // la categoría solo cuenta si el nombre no coincide
+    const hallados = (porNombre.length ? porNombre : disponibles.filter(coincide(a => a.categoria)))
+      .sort((x, y) => (ordenGrupo(x) - ordenGrupo(y)) || grupoDe(x).localeCompare(grupoDe(y)) || x.nombre.localeCompare(y.nombre));
+    let previo = null;
+    lista.innerHTML = hallados.map(a => {
+      const cab = grupoDe(a) !== previo ? `<div class="combo-grupo">${esc(grupoDe(a))}</div>` : '';
+      previo = grupoDe(a);
+      return `${cab}<div class="combo-op" role="option" data-id="${a.id}"><span>${esc(etiqueta(a))}</span><small>${esc(a.categoria)}${cfg.stock ? ` · Disponible: ${fCant(cfg.stock[a.id] || 0)} ${esc(a.unidad)}` : ` · ${esc(a.unidad)}`}</small></div>`;
+    }).join('') || '<div class="combo-vacio">Sin coincidencias. Revisa el texto o la categoría.</div>';
+    activo = texto && hallados.length ? 0 : -1;
+    marcarActivo();
+  }
+  function marcarActivo() {
+    $$('.combo-op', lista).forEach((o, i) => { o.classList.toggle('activo', i === activo); if (i === activo) o.scrollIntoView({ block: 'nearest' }); });
+  }
+  function abrirLista(tr) {
+    if (abierto !== tr) cerrarLista();
+    if (!abierto) { addEventListener('scroll', colocar, true); addEventListener('resize', colocar); }
+    abierto = tr; lista.hidden = false;
+    $('.busca', tr).setAttribute('aria-expanded', 'true');
+    pintarLista(tr); colocar();
+  }
+  function elegir(tr, id) {
+    const s = $('select', tr);
+    s.value = id; s.dispatchEvent(new Event('change'));
+    $('.busca', tr).value = etiqueta(por(id));
+    cerrarLista();
+    $('.q', tr).focus();
+  }
+  lista.addEventListener('mousedown', e => e.preventDefault());
+  lista.addEventListener('click', e => { const o = e.target.closest('.combo-op'); if (o && abierto) elegir(abierto, o.dataset.id); });
   function refrescar(tr) {
     const a = por($('select', tr).value);
     $('.u', tr).textContent = a?.unidad || '';
@@ -227,13 +287,40 @@ function editorLineas(caja, cfg) {
   }
   function agregar(v = {}) {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td><select aria-label="Artículo"><option value="">Selecciona…</option>${opts}</select></td>
+    tr.innerHTML = `<td><input class="busca" type="text" role="combobox" aria-expanded="false" aria-autocomplete="list" aria-label="Buscar artículo" placeholder="Escribe parte del nombre o código…" autocomplete="off"><select aria-hidden="true" tabindex="-1" hidden><option value="">Selecciona…</option>${opts}</select></td>
       <td class="n">${inputNum('q', v.cantidad ?? '', 5).replace('<input', '<input aria-label="Cantidad"')}</td><td class="u tenue"></td>
       ${cfg.stock ? '<td class="n d tenue"></td>' : ''}
       ${cfg.precio ? `<td class="n">${cfg.editaPrecio ? inputNum('p', v.precio ?? '', 2).replace('<input', '<input aria-label="Precio"') : '<span class="pf"></span>'}</td><td class="n s"></td>` : ''}
       <td><button type="button" class="btn mini peligro quitar" aria-label="Quitar línea">×</button></td>`;
     cuerpo.append(tr);
-    if (v.articulo_id) $('select', tr).value = v.articulo_id;
+    if (v.articulo_id) { $('select', tr).value = v.articulo_id; $('.busca', tr).value = por(v.articulo_id) ? etiqueta(por(v.articulo_id)) : ''; }
+    const entrada = $('.busca', tr);
+    entrada.addEventListener('focus', () => { entrada.select(); abrirLista(tr); });
+    entrada.addEventListener('click', () => abrirLista(tr));
+    entrada.addEventListener('input', () => {
+      const s = $('select', tr);
+      if (s.value) { s.value = ''; s.dispatchEvent(new Event('change')); }
+      abrirLista(tr);
+    });
+    entrada.addEventListener('blur', () => {
+      if (abierto === tr) cerrarLista();
+      const a = por($('select', tr).value);
+      entrada.value = a ? etiqueta(a) : '';  // un texto sin elegir no queda como si fuera un artículo
+    });
+    entrada.addEventListener('keydown', e => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        const op = $$('.combo-op', lista)[activo];
+        if (abierto === tr && op) elegir(tr, op.dataset.id);
+      } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (abierto !== tr) abrirLista(tr);
+        const n = $$('.combo-op', lista).length;
+        if (n) { activo = e.key === 'ArrowDown' ? (activo + 1) % n : (activo <= 0 ? n : activo) - 1; marcarActivo(); }
+      } else if (e.key === 'Escape' && abierto === tr) {
+        e.stopPropagation(); cerrarLista();
+      }
+    });
     const alSelect = () => {
       const a = por($('select', tr).value);
       if (cfg.precio && cfg.editaPrecio && a && !$('.p', tr).value) $('.p', tr).value = fNum(a.precio, 0, 2);
@@ -245,7 +332,13 @@ function editorLineas(caja, cfg) {
     $('.quitar', tr).addEventListener('click', () => { tr.remove(); cfg.alCambiar?.(); });
     alSelect();
   }
-  $('.agregar', caja).addEventListener('click', () => agregar());
+  catFiltro.addEventListener('change', () => {
+    const fila = $$('tr', cuerpo).find(tr => !$('select', tr).value);
+    if (!fila) return;
+    $('.busca', fila).focus();
+    abrirLista(fila);
+  });
+  $('.agregar', caja).addEventListener('click', () => { agregar(); $('.busca', cuerpo.lastElementChild).focus(); });
   (cfg.valores?.length ? cfg.valores : [{}]).forEach(agregar);
   return {
     leer: () => $$('tr', cuerpo).filter(tr => $('select', tr).value || $('.q', tr).value).map(tr => {
@@ -390,7 +483,7 @@ Vistas.compras = async v => {
       ver: async r => verCompra(r.id),
       anular: r => confirmar('Anular compra', `Se revertirá el stock de la compra #${r.id}. Solo es posible si el stock aún está disponible.`, async () => { await api('POST', `/compras/${r.id}/anular`, {}); aviso('Compra anulada.'); render(); }, 'Anular compra'),
     }, cols: [
-      { t: 'N°', v: r => r.id }, { t: 'Fecha', v: r => r.fecha, h: r => fFecha(r.fecha) }, { t: 'Proveedor', v: r => r.proveedor }, { t: 'RUT', v: r => r.rut }, { t: 'Documento', v: r => r.documento },
+      { t: 'N°', v: r => r.id }, { t: 'Fecha', v: r => r.fecha, h: r => fFecha(r.fecha) }, { t: 'Proveedor', v: r => r.proveedor }, { t: 'RUT', v: r => r.rut }, { t: 'Tipo', v: r => TIPOS_DOC[r.tipo_documento] || '—' }, { t: 'Documento', v: r => r.documento },
       { t: 'Neto', n: 1, v: r => r.neto, h: r => fPeso(r.neto) }, { t: 'IVA', n: 1, v: r => r.iva, h: r => fPeso(r.iva) }, { t: 'Total', n: 1, v: r => r.total, h: r => fPeso(r.total) },
       { t: 'Estado', v: r => r.estado, h: r => r.estado === 'ANULADO' ? etq('Anulada', 'mal') : etq('Vigente', 'bien') },
       { t: '', h: r => `<div class="acciones">${accion('ver', 'Ver')}${r.estado !== 'ANULADO' && can('compras', 2) ? accion('anular', 'Anular', 'peligro') : ''}</div>` }] });
@@ -416,10 +509,11 @@ Vistas.compras = async v => {
     });
   }
 };
+const TIPOS_DOC = { FACTURA: 'Factura', BOLETA: 'Boleta' };
 function nuevaCompra() {
   const activos = S.cat.proveedores.filter(p => p.activo);
   const m = modal('Registrar compra', `<form novalidate><div class="campos"><label class="campo"><span>Proveedor</span><select name="proveedor_id">${opciones(activos, '', 'Selecciona…')}</select></label>
-    <label class="campo"><span>Fecha</span><input type="date" name="fecha" value="${hoy()}"></label><label class="campo"><span>N° de documento</span><input name="documento"></label></div>
+    <label class="campo"><span>Fecha</span><input type="date" name="fecha" value="${hoy()}"></label><label class="campo"><span>Tipo de documento</span><select name="tipo_documento">${opciones(Object.entries(TIPOS_DOC).map(([id, nombre]) => ({ id, nombre })), '', 'Selecciona…')}</select></label><label class="campo"><span>N° de documento</span><input name="documento"></label></div>
     <h3 style="font-size:14px;margin:14px 0 6px">Detalle</h3><div id="lin"></div><div class="totales" id="tot"></div><div class="error" hidden></div>
     <div class="modal-pie"><button type="button" class="btn cerrar">Cancelar</button><button class="btn primario">Registrar compra</button></div></form>`, true);
   $$('.cerrar', m.el).forEach(b => b.addEventListener('click', m.cerrar));
@@ -432,13 +526,13 @@ function nuevaCompra() {
   totales();
   conEnvio($('form', m.el), m, async () => {
     const f = $('form', m.el);
-    await api('POST', '/compras', { proveedor_id: f.proveedor_id.value, fecha: f.fecha.value, documento: f.documento.value, items: ed.leer() });
+    await api('POST', '/compras', { proveedor_id: f.proveedor_id.value, fecha: f.fecha.value, tipo_documento: f.tipo_documento.value, documento: f.documento.value, items: ed.leer() });
     aviso('Compra registrada: el stock aumentó.'); render();
   });
 }
 async function verCompra(id) {
   const c = await api('GET', `/compras/${id}`);
-  const m = modal(`Compra #${c.id}`, `<div class="guia-datos"><div><b>Proveedor:</b> ${esc(c.proveedor)}</div><div><b>RUT:</b> ${esc(c.rut)}</div><div><b>Fecha:</b> ${fFecha(c.fecha)}</div><div><b>Documento:</b> ${esc(c.documento) || '—'}</div><div><b>Registrada por:</b> ${esc(c.usuario)}</div></div>
+  const m = modal(`Compra #${c.id}`, `<div class="guia-datos"><div><b>Proveedor:</b> ${esc(c.proveedor)}</div><div><b>RUT:</b> ${esc(c.rut)}</div><div><b>Fecha:</b> ${fFecha(c.fecha)}</div><div><b>Tipo de documento:</b> ${esc(TIPOS_DOC[c.tipo_documento]) || '—'}</div><div><b>Documento:</b> ${esc(c.documento) || '—'}</div><div><b>Registrada por:</b> ${esc(c.usuario)}</div></div>
     <div class="tabla-marco"><table><thead><tr><th>Código</th><th>Insumo</th><th class="n">Cantidad</th><th class="n">Precio neto</th><th class="n">Subtotal</th></tr></thead><tbody>${c.items.map(i => `<tr><td>${esc(i.codigo)}</td><td>${esc(i.nombre)}</td><td class="n">${fCant(i.cantidad)} ${esc(i.unidad)}</td><td class="n">${fPrecio(i.precio)}</td><td class="n">${fPeso(i.cantidad * i.precio)}</td></tr>`).join('')}</tbody></table></div>
     <div class="totales"><div><span>Neto</span><span>${fPeso(c.neto)}</span></div><div><span>IVA ${fNum(c.iva_pct, 0, 2)}%</span><span>${fPeso(c.iva)}</span></div><div class="total"><span>Total</span><span>${fPeso(c.total)}</span></div></div>`, true);
   return m;
@@ -558,16 +652,16 @@ Vistas.articulos = async v => {
     const despachable = tabArt === 'DESECHABLE' || tabArt === 'PUNTO_VENTA';
     const inicial = r || { tipo: despachable ? 'INSUMO' : tabArt, desechable: despachable };
     const categorias = tabArt === 'PUNTO_VENTA' && !r ? S.cat.categorias.filter(x => x.punto_venta) : despachable ? S.cat.categorias : S.cat.categorias.filter(x => !x.punto_venta);
-    formulario(r ? 'Editar artículo' : 'Nuevo artículo', [
-      { k: 'codigo', t: 'Código' }, { k: 'nombre', t: 'Nombre' },
+    formulario(r ? `Editar artículo ${r.codigo}` : 'Nuevo artículo', [
+      { k: 'nombre', t: 'Nombre', todo: 1, ayuda: r ? '' : 'El código se asigna automáticamente al guardar.' },
       { k: 'categoria_id', t: 'Clasificación o categoría', tipo: 'select', op: categorias, vacio: 'Selecciona…' },
       { k: 'unidad_id', t: 'Unidad de medida', tipo: 'select', op: S.cat.unidades, vacio: 'Selecciona…' },
       { k: 'stock_minimo', t: 'Stock mínimo', tipo: 'num', dec: 5, min: 5, ayuda: 'Se muestra con miles y 5 decimales.' },
       { k: 'precio', t: inicial.tipo === 'INSUMO' ? 'Precio de compra neto' : inicial.tipo === 'PRODUCTO' ? 'Precio de venta neto' : 'Precio', tipo: 'num', dec: 2, ayuda: 'Con separador de miles.' },
       ...(r ? [{ k: 'activo', t: 'Artículo activo', tipo: 'check', todo: 1 }] : [])], inicial,
     async d => {
-      await api(r ? 'PUT' : 'POST', '/articulos' + (r ? '/' + r.id : ''), { ...d, tipo: inicial.tipo, desechable: inicial.desechable });
-      aviso('Artículo guardado.'); render();
+      const x = await api(r ? 'PUT' : 'POST', '/articulos' + (r ? '/' + r.id : ''), { ...d, tipo: inicial.tipo, desechable: inicial.desechable });
+      aviso(x.codigo ? `Artículo creado con el código ${x.codigo}.` : 'Artículo guardado.'); render();
     });
   };
   $('#n', v)?.addEventListener('click', () => form());
