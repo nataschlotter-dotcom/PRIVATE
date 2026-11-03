@@ -217,10 +217,12 @@ function editorLineas(caja, cfg) {
   const categorias = [...new Set(cfg.articulos.map(a => a.categoria))].sort((x, y) => x.localeCompare(y)).map(x => ({ id: x, nombre: x }));
   caja.innerHTML = `<div class="filtros"><label>Filtrar artículos por categoría<select class="cat-filtro">${opciones(categorias, '', 'Todas las categorías')}</select></label></div>
     <div class="tabla-marco"><table class="lineas"><thead><tr><th>Artículo</th><th class="n">Cantidad</th><th>Unidad</th>
-    ${cfg.stock ? '<th class="n">Disponible</th>' : ''}${cfg.precio ? `<th class="n">${esc(cfg.precio)}</th><th class="n">Subtotal</th>` : ''}<th></th></tr></thead><tbody></tbody></table></div>
+    ${cfg.stock ? '<th class="n">Disponible</th>' : ''}${cfg.precio ? `<th class="n">${esc(cfg.precio)}</th><th class="n">${esc(cfg.subtotal || 'Subtotal')}</th>` : ''}<th></th></tr></thead><tbody></tbody></table></div>
     <button type="button" class="btn mini agregar" style="margin-top:6px">+ Agregar línea</button><div class="combo-lista" role="listbox" hidden></div>`;
   const cuerpo = $('tbody', caja), lista = $('.combo-lista', caja), catFiltro = $('.cat-filtro', caja);
   const por = id => cfg.articulos.find(a => String(a.id) === String(id));
+  const precioDe = a => !a ? 0 : cfg.precioDe ? cfg.precioDe(a) : a.precio || 0;
+  const fSub = cfg.fSubtotal || fPeso;
   const etiqueta = a => `${a.codigo} · ${a.nombre}`;
   const normal = s => String(s).normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
   const grupoDe = a => cfg.grupos?.find(g => g.filtro(a))?.nombre ?? a.categoria;
@@ -283,7 +285,7 @@ function editorLineas(caja, cfg) {
     const a = por($('select', tr).value);
     $('.u', tr).textContent = a?.unidad || '';
     if (cfg.stock) $('.d', tr).textContent = a ? fCant(cfg.stock[a.id] || 0) : '';
-    if (cfg.precio) $('.s', tr).textContent = fPeso((aNum($('.q', tr).value) || 0) * (cfg.editaPrecio ? aNum($('.p', tr).value) || 0 : a?.precio || 0));
+    if (cfg.precio) $('.s', tr).textContent = fSub((aNum($('.q', tr).value) || 0) * (cfg.editaPrecio ? aNum($('.p', tr).value) || 0 : precioDe(a)));
     cfg.alCambiar?.();
   }
   function agregar(v = {}) {
@@ -325,7 +327,7 @@ function editorLineas(caja, cfg) {
     const alSelect = () => {
       const a = por($('select', tr).value);
       if (cfg.precio && cfg.editaPrecio && a && !$('.p', tr).value) $('.p', tr).value = fNum(a.precio, 0, 2);
-      if (cfg.precio && !cfg.editaPrecio) $('.pf', tr).textContent = a ? fPrecio(a.precio) : '';
+      if (cfg.precio && !cfg.editaPrecio) $('.pf', tr).textContent = a ? fPrecio(precioDe(a)) + (cfg.porUnidad ? ` / ${a.unidad}` : '') : '';
       refrescar(tr);
     };
     $('select', tr).addEventListener('change', alSelect);
@@ -349,7 +351,7 @@ function editorLineas(caja, cfg) {
     }),
     neto: () => $$('tr', cuerpo).reduce((s, tr) => {
       const a = por($('select', tr).value);
-      return s + (aNum($('.q', tr).value) || 0) * (cfg.editaPrecio ? aNum($('.p', tr).value) || 0 : a?.precio || 0);
+      return s + (aNum($('.q', tr).value) || 0) * (cfg.editaPrecio ? aNum($('.p', tr).value) || 0 : precioDe(a));
     }, 0),
   };
 }
@@ -910,7 +912,7 @@ Vistas.recetas = async v => {
   const c = v.appendChild(Object.assign(document.createElement('div'), { className: 'tarjeta' }));
   const edita = can('recetas', 2);
   tabla(c, { filas, csv: 'recetas', vacio: 'Primero crea productos o subproductos.', acciones: {
-    editar: r => editarReceta(r), ver: r => verReceta(r),
+    editar: r => editarReceta(r, filas), ver: r => verReceta(r),
     borrar: r => confirmar('Eliminar receta', `¿Eliminar la receta de ${r.nombre}? Las producciones anteriores se conservan.`, async () => { await api('DELETE', `/recetas/${r.articulo_id}`); render(); }, 'Eliminar') }, cols: [
     { t: 'Código', v: r => r.codigo }, { t: 'Artículo', v: r => r.nombre }, { t: 'Tipo', v: r => claseArticulo(r) },
     { t: 'Rendimiento', n: 1, v: r => r.rendimiento || 0, h: r => r.tiene_receta ? `${fCant(r.rendimiento)} ${esc(r.unidad)}` : '' },
@@ -924,14 +926,24 @@ function verReceta(r) {
     <div class="tabla-marco"><table><thead><tr><th>Ingrediente</th><th class="n">Cantidad</th><th class="n">Costo</th><th class="n">Stock central</th></tr></thead><tbody>${r.items.map(i => `<tr><td>${esc(i.nombre)}</td><td class="n">${fCant(i.cantidad)} ${esc(i.unidad)}</td><td class="n">${fPeso(i.cantidad * i.costo_unit)}</td><td class="n">${fCant(i.stock)} ${esc(i.unidad)}</td></tr>`).join('')}</tbody></table></div>
     ${r.instrucciones ? `<h3 style="font-size:14px;margin:14px 0 4px">Preparación</h3><p style="white-space:pre-line;margin:0">${esc(r.instrucciones)}</p>` : ''}`, true);
 }
-function editarReceta(r) {
+function editarReceta(r, recetas) {
   const m = modal(`Receta: ${r.nombre}`, `<form novalidate><div class="campos"><label class="campo"><span>Rendimiento (${esc(r.unidad)})</span>${inputNum('', r.rendimiento ?? 1, 5).replace('<input', '<input name="rendimiento"')}<small>Cantidad de ${esc(r.nombre)} que resulta de estas cantidades.</small></label></div>
-    <h3 style="font-size:14px;margin:14px 0 6px">Ingredientes</h3><div id="lin"></div>
+    <h3 style="font-size:14px;margin:14px 0 6px">Ingredientes</h3><p class="tenue" style="margin:0 0 6px">Escribe la cantidad en la unidad del ingrediente: por ejemplo, 0,250 kg para 250 g. El costo se calcula con el último precio del insumo.</p><div id="lin"></div><div class="totales" id="tot"></div>
     <label class="campo" style="margin-top:12px"><span>Preparación</span><textarea name="instrucciones" rows="4">${esc(r.instrucciones || '')}</textarea></label><div class="error" hidden></div>
     <div class="modal-pie"><button type="button" class="btn cerrar">Cancelar</button><button class="btn primario">Guardar receta</button></div></form>`, true);
   $$('.cerrar', m.el).forEach(b => b.addEventListener('click', m.cerrar));
-  const ed = editorLineas($('#lin', m.el), { articulos: S.cat.articulos.filter(a => a.id !== r.articulo_id && (a.tipo === 'SUBPRODUCTO' || (a.tipo === 'INSUMO' && !a.desechable))), valores: r.items });
   const f = $('form', m.el);
+  const costoSub = Object.fromEntries((recetas || []).map(x => [x.articulo_id, x.costo_unit || 0]));
+  let ed = null;
+  const totales = () => {
+    const total = ed ? ed.neto() : 0, rend = aNum(f.rendimiento.value) || 0;
+    $('#tot', m.el).innerHTML = `<div><span>Costo de los ingredientes</span><span>${fPrecio(total)}</span></div><div class="total"><span>Costo por ${esc(r.unidad)}</span><span>${rend > 0 ? fPrecio(total / rend) : '—'}</span></div>`;
+  };
+  ed = editorLineas($('#lin', m.el), { articulos: S.cat.articulos.filter(a => a.id !== r.articulo_id && (a.tipo === 'SUBPRODUCTO' || (a.tipo === 'INSUMO' && !a.desechable))), valores: r.items,
+    precio: 'Precio', subtotal: 'Costo', porUnidad: true, fSubtotal: fPrecio, alCambiar: totales,
+    precioDe: a => a.tipo === 'SUBPRODUCTO' ? costoSub[a.id] || 0 : a.precio || 0 });
+  f.rendimiento.addEventListener('input', totales);
+  totales();
   conEnvio(f, m, async () => {
     await api('PUT', `/recetas/${r.articulo_id}`, { rendimiento: aNum(f.rendimiento.value), instrucciones: f.instrucciones.value, items: ed.leer() });
     aviso('Receta guardada.'); render();
@@ -1136,7 +1148,7 @@ const REP = {
   },
   async margenes(z, tarjeta) {
     const d = await api('GET', '/reportes/margenes');
-    tarjeta(`<h2>Margen sobre el precio de venta</h2><p class="nota">Costo según receta y costos promedio actuales. Considera el precio del producto como neto de IVA.</p>${barras(d.filas, r => r.nombre, r => Math.max(r.margen_pct, 0), fPct)}`);
+    tarjeta(`<h2>Margen sobre el precio de venta</h2><p class="nota">Costo según receta y el último precio de cada insumo. Considera el precio del producto como neto de IVA.</p>${barras(d.filas, r => r.nombre, r => Math.max(r.margen_pct, 0), fPct)}`);
     tabla(tarjeta(), { filas: d.filas, csv: 'margenes', vacio: 'Sin productos con receta.', cols: [
       { t: 'Código', v: r => r.codigo }, { t: 'Producto', v: r => r.nombre }, { t: 'Precio', n: 1, v: r => r.precio, h: r => fPrecio(r.precio) }, { t: 'Costo receta', n: 1, v: r => r.costo, h: r => fPrecio(r.costo) },
       { t: 'Margen', n: 1, v: r => r.margen, h: r => fPrecio(r.margen) }, { t: 'Margen %', n: 1, v: r => r.margen_pct, h: r => r.margen_pct < 30 ? `${fPct(r.margen_pct)} ${etq('Bajo', 'alerta')}` : fPct(r.margen_pct) }] });

@@ -367,13 +367,15 @@ def receta_de(db, art_id):
 
 
 def costo_teorico(db, art_id, memo=None):
-    """Costo unitario según receta vigente, resolviendo subproductos recursivamente."""
+    """Costo unitario según receta vigente, resolviendo subproductos recursivamente.
+    Los insumos se valorizan a su último precio (el de la última compra o el editado a mano), no al costo promedio."""
     memo = {} if memo is None else memo
     if art_id in memo:
         return memo[art_id]
     r = receta_de(db, art_id)
     if not r:
-        memo[art_id] = costo_de(articulo(db, art_id))
+        a = articulo(db, art_id)
+        memo[art_id] = (a["precio"] or a["costo"] or 0) if a["tipo"] == "INSUMO" else costo_de(a)
     else:
         memo[art_id] = sum(i["cantidad"] * costo_teorico(db, i["articulo_id"], memo) for i in r["items"]) / r["rendimiento"]
     return memo[art_id]

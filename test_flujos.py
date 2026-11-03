@@ -185,8 +185,21 @@ p1 = A("POST", "/produccion", {"articulo_id": base, "cantidad": 4})["id"]
 s = stock(); casi(s[harina], 18); casi(s[base], 4)
 A("POST", "/produccion", {"articulo_id": torta, "cantidad": 2})
 s = stock(); casi(s[base], 3); casi(s[torta], 2)
-rec = next(r for r in A("GET", "/recetas") if r["articulo_id"] == torta)
-casi(rec["costo_unit"], 275)  # 0,5 base × (1 kg harina a 1.100 / 2 bases)
+costo_receta = lambda: next(r for r in A("GET", "/recetas") if r["articulo_id"] == torta)["costo_unit"]
+casi(costo_receta(), 300)  # 0,5 base × (1 kg harina al último precio, 1.200 / 2 bases)
+# El costo de receta sigue el último precio del insumo: editado a mano o por compra
+h_art = next(x for x in A("GET", "/articulos") if x["id"] == harina)
+costo_prom = h_art["costo"]
+editar_h = {k: h_art[k] for k in ("tipo", "desechable", "categoria_id", "unidad_id", "nombre", "stock_minimo")}
+A("PUT", f"/articulos/{harina}", {**editar_h, "precio": 2000})
+casi(costo_receta(), 500)
+cp = A("POST", "/compras", {"tipo_documento": "FACTURA", "proveedor_id": prov, "items": [{"articulo_id": harina, "cantidad": 1, "precio": 1600}]})["id"]
+casi(costo_receta(), 400)
+assert next(x for x in A("GET", "/articulos") if x["id"] == harina)["precio"] == 1600
+A("POST", f"/compras/{cp}/anular", {})
+casi(costo_receta(), 300)  # al anular vuelve al precio de la compra anterior
+A("PUT", f"/articulos/{harina}", {**editar_h, "precio": 1200})
+c_h = app.conectar(); c_h.execute("UPDATE articulos SET costo=? WHERE id=?", (costo_prom, harina)); c_h.close()  # deja el costo promedio como estaba
 A("POST", f"/produccion/{p1}/anular", {}, 409)  # la base ya se consumió: dejaría stock negativo
 s = stock(); casi(s[harina], 18); casi(s[base], 3)
 
