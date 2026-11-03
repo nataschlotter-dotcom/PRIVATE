@@ -52,7 +52,9 @@ A("POST", "/instalar", {"nombre": "Admin", "username": "admin", "password": "pru
 A("POST", "/instalar", {"nombre": "X", "username": "x", "password": "prueba-segura-1"}, 409)
 
 cat = A("GET", "/catalogos")
-cid = next(x["id"] for x in cat["categorias"] if not x["punto_venta"])
+cid = next(x["id"] for x in cat["categorias"] if not x["punto_venta"] and not x["de_productos"])
+cid_prod = next(x["id"] for x in cat["categorias"] if x["de_productos"])
+assert {x["nombre"] for x in cat["categorias"] if x["de_productos"]} == set(app.CATEGORIAS_PRODUCTOS)
 kg = next(u["id"] for u in cat["unidades"] if u["abreviatura"] == "kg")
 un = next(u["id"] for u in cat["unidades"] if u["abreviatura"] == "un")
 
@@ -66,7 +68,7 @@ tienda2 = A("POST", "/tiendas", {"nombre": "T2", "direccion": "D", "comuna": "C"
 
 
 def art(tipo, cod, u=kg, minimo=0, precio=0, desechable=False):
-    return A("POST", "/articulos", {"tipo": tipo, "codigo": cod, "nombre": cod, "categoria_id": cid, "unidad_id": u,
+    return A("POST", "/articulos", {"tipo": tipo, "codigo": cod, "nombre": cod, "categoria_id": cid if tipo == "INSUMO" else cid_prod, "unidad_id": u,
                                     "stock_minimo": minimo, "precio": precio, "desechable": desechable})["id"]
 
 
@@ -88,7 +90,42 @@ A("PUT", f"/articulos/{ipv['id']}", {"tipo": "INSUMO", "codigo": "OTRO", "nombre
 assert codigo_de(ipv["id"]) == "IPV0001"  # editar conserva el código
 A("DELETE", f"/articulos/{ipv['id']}")
 # Cada pestaña crea en su grupo: la categoría no puede moverlo a otro
-cat_comun = next(x["id"] for x in cat["categorias"] if not x["punto_venta"])
+cat_comun = cid
+# Tipo de categoría: productos o no productos, y clasificación de bases anteriores
+A("POST", "/articulos", {"tipo": "PRODUCTO", "nombre": "M", "unidad_id": un, "categoria_id": cid}, 400)
+A("POST", "/articulos", {"tipo": "SUBPRODUCTO", "nombre": "M", "unidad_id": un, "categoria_id": cid}, 400)
+A("POST", "/articulos", {"tipo": "INSUMO", "nombre": "M", "unidad_id": un, "categoria_id": cid_prod}, 400)
+c_nueva = A("POST", "/categorias", {"nombre": "Queques", "de_productos": "1"})["id"]
+c_ins = A("POST", "/categorias", {"nombre": "Frutas", "de_productos": "0"})["id"]
+por_cat = {x["id"]: x for x in A("GET", "/categorias")}
+assert por_cat[c_nueva]["de_productos"] == 1 and por_cat[c_ins]["de_productos"] == 0
+A("PUT", f"/categorias/{cat_pv}", {"nombre": por_cat[cat_pv]["nombre"], "de_productos": "1"}, 409)
+p_nuevo = A("POST", "/articulos", {"tipo": "PRODUCTO", "nombre": "Queque", "unidad_id": un, "categoria_id": c_nueva})["id"]
+i_mix = A("POST", "/articulos", {"tipo": "INSUMO", "nombre": "Mix", "unidad_id": un, "categoria_id": c_ins})["id"]
+p_mix = A("POST", "/articulos", {"tipo": "PRODUCTO", "nombre": "Mix2", "unidad_id": un, "categoria_id": c_nueva})["id"]
+A("PUT", f"/categorias/{c_nueva}", {"nombre": "Queques", "de_productos": "0"}, 409)  # tiene artículos
+A("PUT", f"/categorias/{c_nueva}", {"nombre": "Queques 2", "de_productos": "1"})
+assert {x["id"]: x["nombre"] for x in A("GET", "/categorias")}[c_nueva] == "Queques 2"
+c_vacia = A("POST", "/categorias", {"nombre": "Vacia", "de_productos": "0"})["id"]
+A("PUT", f"/categorias/{c_vacia}", {"nombre": "Vacia", "de_productos": "1"})  # sin artículos se puede cambiar
+assert {x["id"]: x["de_productos"] for x in A("GET", "/categorias")}[c_vacia] == 1
+A("DELETE", f"/categorias/{c_vacia}")
+c_m = app.conectar()  # simula una base anterior: categoría usada por producto e insumo, y otra solo por producto
+c_m.execute("UPDATE articulos SET categoria_id=? WHERE id=?", (c_ins, p_mix))
+c_m.execute("UPDATE categorias SET de_productos=0 WHERE id=?", (c_nueva,))
+c_m.execute("DELETE FROM config WHERE clave='categorias_productos'")
+app.sembrar(c_m); app.sembrar(c_m)
+por_cat = {x["id"]: x for x in A("GET", "/categorias")}
+assert por_cat[c_nueva]["de_productos"] == 1 and por_cat[c_ins]["de_productos"] == 0
+nueva_mix = next(x for x in por_cat.values() if x["nombre"] == "Frutas (productos)")
+assert nueva_mix["de_productos"] == 1 and sum(x["nombre"] == "Frutas (productos)" for x in por_cat.values()) == 1
+art_mix = {x["id"]: x for x in A("GET", "/articulos")}
+assert art_mix[p_mix]["categoria"] == "Frutas (productos)" and art_mix[i_mix]["categoria"] == "Frutas"
+for x in (p_nuevo, i_mix, p_mix):
+    A("DELETE", f"/articulos/{x}")
+for x in (c_nueva, c_ins, nueva_mix["id"]):
+    A("DELETE", f"/categorias/{x}")
+c_m.close()
 base_art = {"tipo": "INSUMO", "nombre": "G", "unidad_id": un}
 A("POST", "/articulos", {**base_art, "desechable": True, "punto_venta": False, "categoria_id": cat_pv}, 400)  # pestaña Desechables
 A("POST", "/articulos", {**base_art, "desechable": True, "punto_venta": True, "categoria_id": cat_comun}, 400)  # pestaña Puntos de venta
@@ -226,7 +263,7 @@ tc = A("POST", "/inventarios", {"bodega_id": 0, "seccion": "INSUMOS"})["id"]
 A("PUT", f"/inventarios/{tc}", {"items": [{"articulo_id": contado, "conteo": 0}]})
 A("DELETE", f"/articulos/{contado}", esperado=409)
 A("DELETE", f"/inventarios/{tc}"); A("DELETE", f"/articulos/{contado}")
-cat_libre = A("POST", "/categorias", {"nombre": "Sin uso"})["id"]; A("DELETE", f"/categorias/{cat_libre}")
+cat_libre = A("POST", "/categorias", {"nombre": "Sin uso", "de_productos": "0"})["id"]; A("DELETE", f"/categorias/{cat_libre}")
 A("DELETE", f"/categorias/{cats['Café']['id']}", esperado=409)
 
 # Toma por sección de la bodega central: cada una cuenta solo sus artículos y pueden coexistir

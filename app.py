@@ -30,6 +30,7 @@ CLAVE_INSTALACION = os.environ.get("NS_CLAVE_INSTALACION", "").strip()  # proteg
 CENTRAL = 0  # bodega_id de la bodega central de producción
 SECCIONES = {"INSUMOS": "a.tipo='INSUMO' AND a.desechable=0", "PUNTO_VENTA": "c.punto_venta=1", "DESECHABLES": "a.desechable=1 AND c.punto_venta=0",
              "ELABORADOS": "a.tipo IN ('PRODUCTO','SUBPRODUCTO')"}  # secciones de la bodega central, según la clase del artículo
+CATEGORIAS_PRODUCTOS = ("Tortas", "Pastelería individual", "Galletas y alfajores", "Bases y rellenos")
 CATEGORIAS_PUNTO_VENTA = ("Café", "Chocolate", "Leches", "Té", "Agua", "Utensilios para café", "Utensilios de aseo", "Azúcar")
 FUDO_API = os.environ.get("NS_FUDO_API", "https://api.fu.do/v1alpha1")
 FUDO_AUTH = os.environ.get("NS_FUDO_AUTH", "https://auth.fu.do/api")
@@ -66,7 +67,7 @@ CREATE TABLE IF NOT EXISTS usuarios(id INTEGER PRIMARY KEY, username TEXT NOT NU
   activo INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS sesiones(token TEXT PRIMARY KEY, usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE, expira REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS proveedores(id INTEGER PRIMARY KEY, rut TEXT NOT NULL UNIQUE, nombre TEXT NOT NULL, activo INTEGER NOT NULL DEFAULT 1);
-CREATE TABLE IF NOT EXISTS categorias(id INTEGER PRIMARY KEY, nombre TEXT NOT NULL UNIQUE, punto_venta INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS categorias(id INTEGER PRIMARY KEY, nombre TEXT NOT NULL UNIQUE, punto_venta INTEGER NOT NULL DEFAULT 0, de_productos INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS unidades(id INTEGER PRIMARY KEY, nombre TEXT NOT NULL UNIQUE, abreviatura TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS motivos_merma(id INTEGER PRIMARY KEY, nombre TEXT NOT NULL UNIQUE);
 CREATE TABLE IF NOT EXISTS articulos(id INTEGER PRIMARY KEY, tipo TEXT NOT NULL CHECK(tipo IN ('PRODUCTO','SUBPRODUCTO','INSUMO')),
@@ -691,7 +692,7 @@ def perfiles_borrar(c, pid):
 
 # ---------------------------------------------------------------- maestros
 
-def crud_simple(tabla, modulo, campos):
+def crud_simple(tabla, modulo, campos, validar_edicion=None):
     ruta_base = f"/api/{tabla}"
 
     def limpiar(body):
@@ -709,6 +710,8 @@ def crud_simple(tabla, modulo, campos):
 
     @ruta("PUT", ruta_base + r"/(\d+)", modulo, 2)
     def editar(c, i):
+        if validar_edicion:
+            validar_edicion(c, int(i), dict(zip((k for k, _ in campos), limpiar(c.body))))
         ks = ",".join(f"{k}=?" for k, _ in campos)
         c.db.execute(f"UPDATE {tabla} SET {ks} WHERE id=?", [*limpiar(c.body), int(i)])
         if "activo" in c.body:
@@ -723,7 +726,17 @@ def crud_simple(tabla, modulo, campos):
 
 nombre_campo = lambda v: txt(v, "El nombre", True, 120)
 crud_simple("proveedores", "proveedores", [("nombre", nombre_campo), ("rut", normalizar_rut)])
-crud_simple("categorias", "articulos", [("nombre", nombre_campo)])
+def validar_tipo_categoria(c, i, v):
+    cat = row(c.db, "SELECT * FROM categorias WHERE id=?", i)
+    if not cat or cat["de_productos"] == v["de_productos"]:
+        return
+    if cat["punto_venta"]:
+        raise ApiError(409, "Las categorías de puntos de venta son siempre de no productos.")
+    if scalar(c.db, "SELECT COUNT(*) FROM articulos WHERE categoria_id=?", i):
+        raise ApiError(409, "Esta categoría tiene artículos: cámbialos de categoría antes de cambiar su tipo.")
+
+
+crud_simple("categorias", "articulos", [("nombre", nombre_campo), ("de_productos", lambda v: 1 if v in (True, 1, "1") else 0)], validar_tipo_categoria)
 crud_simple("unidades", "articulos", [("nombre", nombre_campo), ("abreviatura", lambda v: txt(v, "La abreviatura", True, 12))])
 crud_simple("motivos_merma", "mermas", [("nombre", nombre_campo)])
 crud_simple("tiendas", "tiendas", [("nombre", nombre_campo), ("direccion", lambda v: txt(v, "La dirección", True, 200)),
@@ -782,8 +795,8 @@ def datos_articulo(db, d, codigo=None):
         raise ApiError(400, "Tipo de artículo no válido.")
     # Un insumo de punto de venta se comporta como desechable: se despacha a tiendas y no entra en recetas
     punto_venta = scalar(db, "SELECT punto_venta FROM categorias WHERE id=?", entero(d.get("categoria_id"), "la categoría"))
-    if punto_venta and tipo != "INSUMO":
-        raise ApiError(400, "Esa clasificación es solo para insumos de puntos de venta.")
+    if bool(scalar(db, "SELECT de_productos FROM categorias WHERE id=?", entero(d.get("categoria_id"), "la categoría"))) != (tipo != "INSUMO"):
+        raise ApiError(400, "Usa una categoría de productos para productos y subproductos, y una de no productos para los demás artículos.")
     if "punto_venta" in d and bool(d["punto_venta"]) != bool(punto_venta):  # la pestaña define el grupo: una categoría no puede cambiarlo
         raise ApiError(400, "Esa clasificación no pertenece a este grupo de artículos.")
     desechable = 1 if tipo == "INSUMO" and (d.get("desechable") or punto_venta) else 0
@@ -1734,6 +1747,18 @@ def sembrar(db):
             permisos.setdefault("devoluciones", PERFILES[p["nombre"]]["devoluciones"])
             db.execute("UPDATE perfiles SET permisos=? WHERE id=?", (json.dumps(permisos), p["id"]))
         db.execute("INSERT INTO config VALUES('permisos_devoluciones','1')")
+    if "de_productos" not in [col[1] for col in db.execute("PRAGMA table_info(categorias)")]:
+        db.execute("ALTER TABLE categorias ADD COLUMN de_productos INTEGER NOT NULL DEFAULT 0")
+    if not scalar(db, "SELECT COUNT(*) FROM config WHERE clave='categorias_productos'"):  # una sola vez: clasifica las categorías existentes
+        db.execute(f"""UPDATE categorias SET de_productos=1 WHERE nombre IN ({','.join('?' * len(CATEGORIAS_PRODUCTOS))})
+            AND id NOT IN (SELECT categoria_id FROM articulos WHERE tipo='INSUMO')""", CATEGORIAS_PRODUCTOS)
+        for cat_id, nombre in db.execute("SELECT DISTINCT k.id,k.nombre FROM categorias k JOIN articulos a ON a.categoria_id=k.id WHERE a.tipo<>'INSUMO' AND k.de_productos=0").fetchall():
+            if scalar(db, "SELECT COUNT(*) FROM articulos WHERE categoria_id=? AND tipo='INSUMO'", cat_id):  # la usan ambos: los productos pasan a una categoría propia
+                nueva = db.execute("INSERT INTO categorias(nombre,de_productos) VALUES(?,1)", (f"{nombre} (productos)",)).lastrowid
+                db.execute("UPDATE articulos SET categoria_id=? WHERE categoria_id=? AND tipo<>'INSUMO'", (nueva, cat_id))
+            else:
+                db.execute("UPDATE categorias SET de_productos=1 WHERE id=?", (cat_id,))
+        db.execute("INSERT INTO config VALUES('categorias_productos','1')")
     if not scalar(db, "SELECT COUNT(*) FROM config WHERE clave='categorias_punto_venta'"):  # una sola vez, para respetar lo que se elimine después
         for n in CATEGORIAS_PUNTO_VENTA:
             db.execute("INSERT INTO categorias(nombre,punto_venta) VALUES(?,1) ON CONFLICT(nombre) DO UPDATE SET punto_venta=1", (n,))

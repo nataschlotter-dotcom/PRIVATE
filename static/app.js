@@ -629,7 +629,7 @@ Vistas.tiendas = async v => {
 };
 
 /* ---------- Artículos ---------- */
-let tabArt = 'PRODUCTO';
+let tabArt = 'PRODUCTO', filtroCat = '';
 Vistas.articulos = async v => {
   const tabs = [['PRODUCTO', 'Productos'], ['SUBPRODUCTO', 'Subproductos'], ['INSUMO', 'Insumos'], ['PUNTO_VENTA', 'Insumos puntos de venta'], ['DESECHABLE', 'Desechables y aseo'], ['categorias', 'Categorías'], ['unidades', 'Unidades de medida']];
   const edita = can('articulos', 2), esArt = !['categorias', 'unidades'].includes(tabArt);
@@ -638,13 +638,19 @@ Vistas.articulos = async v => {
   v.append(pestanas(tabs, tabArt, k => { tabArt = k; render(); }));
   const c = v.appendChild(Object.assign(document.createElement('div'), { className: 'tarjeta' }));
   if (!esArt) {
-    const campos = tabArt === 'categorias' ? [{ k: 'nombre', t: 'Nombre', todo: 1 }] : [{ k: 'nombre', t: 'Nombre' }, { k: 'abreviatura', t: 'Abreviatura', ayuda: 'Ejemplo: kg' }];
+    const tiposCat = [{ id: 1, nombre: 'Productos' }, { id: 0, nombre: 'No productos' }];
+    const campos = tabArt === 'categorias' ? [{ k: 'nombre', t: 'Nombre', todo: 1 }, { k: 'de_productos', t: 'Tipo de categoría', tipo: 'select', op: tiposCat, def: 0, todo: 1, ayuda: 'Productos: para productos y subproductos. No productos: para insumos, desechables y aseo.' }] : [{ k: 'nombre', t: 'Nombre' }, { k: 'abreviatura', t: 'Abreviatura', ayuda: 'Ejemplo: kg' }];
     const titulo = tabArt === 'categorias' ? 'categoría' : 'unidad';
     const form = r => formulario((r ? 'Editar ' : 'Nueva ') + titulo, campos, r, async d => { await api(r ? 'PUT' : 'POST', `/${tabArt}` + (r ? '/' + r.id : ''), d); aviso('Guardado.'); render(); });
     $('#n', v)?.addEventListener('click', () => form());
-    tabla(c, { filas: await api('GET', '/' + tabArt), acciones: { editar: form,
+    const lista = await api('GET', '/' + tabArt);
+    if (tabArt === 'categorias') {
+      c.insertAdjacentHTML('beforeend', `<div class="filtros"><label>Ver<select id="fc">${opciones(tiposCat, filtroCat, 'Todas las categorías')}</select></label></div><div id="tc"></div>`);
+      $('#fc', c).addEventListener('change', e => { filtroCat = e.target.value; render(); });
+    }
+    tabla($('#tc', c) || c, { filas: tabArt === 'categorias' && filtroCat !== '' ? lista.filter(x => String(x.de_productos) === filtroCat) : lista, acciones: { editar: form,
       borrar: r => confirmar('Eliminar', `¿Eliminar "${r.nombre}"? No se podrá si algún artículo la usa.`, async () => { await api('DELETE', `/${tabArt}/${r.id}`); aviso('Eliminado.'); render(); }, 'Eliminar') },
-    cols: [...campos.map(f => ({ t: f.t, v: r => r[f.k] })), { t: '', h: () => edita ? `<div class="acciones">${accion('editar', 'Editar')}${accion('borrar', 'Eliminar', 'peligro')}</div>` : '' }] });
+    cols: [...(tabArt === 'categorias' ? [{ t: 'Nombre', v: r => r.nombre }, { t: 'Tipo de categoría', v: r => r.de_productos ? 'Productos' : r.punto_venta ? 'No productos · puntos de venta' : 'No productos' }] : campos.map(f => ({ t: f.t, v: r => r[f.k] }))), { t: '', h: () => edita ? `<div class="acciones">${accion('editar', 'Editar')}${accion('borrar', 'Eliminar', 'peligro')}</div>` : '' }] });
     return;
   }
   const todos = await api('GET', '/articulos');
@@ -653,7 +659,7 @@ Vistas.articulos = async v => {
     const despachable = tabArt === 'DESECHABLE' || tabArt === 'PUNTO_VENTA';
     const inicial = r || { tipo: despachable ? 'INSUMO' : tabArt, desechable: despachable };
     const esPuntoVenta = tabArt === 'PUNTO_VENTA';
-    const categorias = S.cat.categorias.filter(x => !!x.punto_venta === esPuntoVenta);
+    const categorias = S.cat.categorias.filter(x => inicial.tipo === 'INSUMO' ? !x.de_productos && !!x.punto_venta === esPuntoVenta : !!x.de_productos);
     formulario(r ? `Editar artículo ${r.codigo}` : 'Nuevo artículo', [
       { k: 'nombre', t: 'Nombre', todo: 1, ayuda: r ? '' : 'El código se asigna automáticamente al guardar.' },
       { k: 'categoria_id', t: 'Clasificación o categoría', tipo: 'select', op: categorias, vacio: 'Selecciona…' },
