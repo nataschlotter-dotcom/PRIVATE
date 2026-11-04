@@ -111,6 +111,8 @@ CREATE TABLE IF NOT EXISTS mermas(id INTEGER PRIMARY KEY, fecha TEXT NOT NULL, a
   obs TEXT NOT NULL DEFAULT '', estado TEXT NOT NULL DEFAULT 'VIGENTE', usuario_id INTEGER REFERENCES usuarios(id));
 CREATE TABLE IF NOT EXISTS salidas_tienda(id INTEGER PRIMARY KEY, fecha TEXT NOT NULL, tienda_id INTEGER NOT NULL REFERENCES tiendas(id),
   articulo_id INTEGER NOT NULL REFERENCES articulos(id), cantidad REAL NOT NULL, motivo TEXT NOT NULL, obs TEXT NOT NULL DEFAULT '', usuario_id INTEGER REFERENCES usuarios(id));
+CREATE TABLE IF NOT EXISTS pos_consumos(id INTEGER PRIMARY KEY, referencia TEXT NOT NULL UNIQUE, tienda_id INTEGER NOT NULL REFERENCES tiendas(id),
+  fecha TEXT NOT NULL, detalle TEXT NOT NULL DEFAULT '', estado TEXT NOT NULL DEFAULT 'VIGENTE', creado TEXT NOT NULL, anulado TEXT);
 CREATE TABLE IF NOT EXISTS inventarios(id INTEGER PRIMARY KEY, fecha TEXT NOT NULL, bodega_id INTEGER NOT NULL, estado TEXT NOT NULL DEFAULT 'ABIERTO',
   obs TEXT NOT NULL DEFAULT '', usuario_id INTEGER REFERENCES usuarios(id), cerrado TEXT, seccion TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS inventario_items(inventario_id INTEGER NOT NULL REFERENCES inventarios(id) ON DELETE CASCADE,
@@ -491,8 +493,8 @@ def ruta(metodo, patron, modulo=None, nivel=1, publica=False):
 
 
 class Ctx:
-    def __init__(self, db, user, body, q):
-        self.db, self.user, self.body, self.q = db, user, body, q
+    def __init__(self, db, user, body, q, headers=None):
+        self.db, self.user, self.body, self.q, self.headers = db, user, body, q, headers or {}
 
     @property
     def uid(self):
@@ -766,6 +768,42 @@ def config_logo(c):
     return {"ok": True}
 
 
+def pos_token_guardado(db):
+    """(origen, hash sha256) de la clave del POS: la variable NS_POS_TOKEN manda sobre la generada en Configuración."""
+    env = os.environ.get("NS_POS_TOKEN", "").strip()
+    if env:
+        return "variable", hashlib.sha256(env.encode()).hexdigest()
+    h = scalar(db, "SELECT valor FROM config WHERE clave='pos_token_hash'")
+    return ("configuracion", h) if h else (None, None)
+
+
+@ruta("GET", "/api/config/pos", "config", 2)
+def config_pos(c):
+    c.sin_tienda()
+    origen, _ = pos_token_guardado(c.db)
+    ultimo = row(c.db, "SELECT creado FROM pos_consumos ORDER BY id DESC LIMIT 1")
+    return {"configurado": bool(origen), "origen": origen, "consumos": scalar(c.db, "SELECT COUNT(*) FROM pos_consumos"),
+            "ultimo": ultimo["creado"] if ultimo else None}
+
+
+@ruta("POST", "/api/config/pos/token", "config", 2)
+def config_pos_token(c):
+    """Genera una clave nueva (reemplaza la anterior). Solo se muestra esta vez: se guarda únicamente su huella."""
+    c.sin_tienda()
+    if os.environ.get("NS_POS_TOKEN", "").strip():
+        raise ApiError(409, "La clave del POS está definida en el servidor (variable NS_POS_TOKEN); cámbiala ahí.")
+    token = secrets.token_urlsafe(32)
+    c.db.execute("INSERT OR REPLACE INTO config VALUES('pos_token_hash',?)", (hashlib.sha256(token.encode()).hexdigest(),))
+    return {"token": token}
+
+
+@ruta("DELETE", "/api/config/pos/token", "config", 2)
+def config_pos_quitar(c):
+    c.sin_tienda()
+    c.db.execute("DELETE FROM config WHERE clave='pos_token_hash'")
+    return {"ok": True}
+
+
 @ruta("GET", "/api/config/respaldo", "config", 2)
 def config_respaldo(c):
     with tempfile.TemporaryDirectory() as carpeta:
@@ -935,6 +973,22 @@ def produccion_lista(c):
     return rows(c.db, """SELECT p.*, a.codigo, a.nombre, a.tipo, un.abreviatura unidad, u.nombre usuario FROM producciones p
         JOIN articulos a ON a.id=p.articulo_id JOIN unidades un ON un.id=a.unidad_id LEFT JOIN usuarios u ON u.id=p.usuario_id
         WHERE p.fecha BETWEEN ? AND ? ORDER BY p.fecha DESC, p.id DESC LIMIT 500""", d, h)
+
+
+@ruta("GET", "/api/produccion/impresion", "produccion")
+def produccion_impresion(c):
+    """Producciones vigentes del rango, con los ingredientes que realmente descontó cada una."""
+    d, h = c.rango(0)
+    if d > h:
+        raise ApiError(400, "La fecha desde no puede ser posterior a la fecha hasta.")
+    ordenes = rows(c.db, """SELECT p.*, a.codigo, a.nombre, a.tipo, un.abreviatura unidad, u.nombre usuario FROM producciones p
+        JOIN articulos a ON a.id=p.articulo_id JOIN unidades un ON un.id=a.unidad_id LEFT JOIN usuarios u ON u.id=p.usuario_id
+        WHERE p.estado='VIGENTE' AND p.fecha BETWEEN ? AND ? ORDER BY p.fecha, p.id""", d, h)
+    for o in ordenes:
+        o["items"] = rows(c.db, """SELECT a.codigo, a.nombre, un.abreviatura unidad, -m.cantidad cantidad, m.costo_unit FROM movimientos m
+            JOIN articulos a ON a.id=m.articulo_id JOIN unidades un ON un.id=a.unidad_id
+            WHERE m.doc_tipo='PRODUCCION' AND m.doc_id=? AND m.tipo='CONSUMO_PRODUCCION' ORDER BY a.nombre""", o["id"])
+    return {"desde": d, "hasta": h, "ordenes": ordenes}
 
 
 @ruta("POST", "/api/produccion", "produccion", 2)
@@ -1404,6 +1458,91 @@ def salida_tienda(c):
                        (fecha, tienda, a["id"], cant, motivo, obs, c.uid)).lastrowid
     mover(c.db, a["id"], tienda, -cant, motivo, c.uid, fecha, "SALIDA", sid, f"Salida #{sid}", obs=obs)
     return {"id": sid}
+
+
+# ---------------------------------------------------------------- POS (servidor a servidor, con clave X-POS-Token)
+
+def pos_autorizar(c):
+    origen, guardado = pos_token_guardado(c.db)
+    if not origen:
+        raise ApiError(503, "La conexión con el POS no está activada. Genera la clave en Configuración.")
+    recibido = (c.headers.get("X-POS-Token") or "").strip()
+    if not recibido or not hmac.compare_digest(hashlib.sha256(recibido.encode()).hexdigest(), guardado):
+        raise ApiError(401, "Clave del POS inválida.")
+
+
+def pos_referencia(v):
+    ref = txt(v, "La referencia", True, 60)
+    if not re.match(r"^[A-Za-z0-9._:-]+$", ref):
+        raise ApiError(400, "La referencia solo admite letras, números, punto, guion y dos puntos.")
+    return ref
+
+
+@ruta("GET", "/api/pos/ping", publica=True)
+def pos_ping(c):
+    pos_autorizar(c)
+    return {"ok": True}
+
+
+@ruta("GET", "/api/pos/tiendas", publica=True)
+def pos_tiendas(c):
+    pos_autorizar(c)
+    return [{"id": t["id"], "nombre": t["nombre"], "activa": bool(t["activo"])} for t in rows(c.db, "SELECT id,nombre,activo FROM tiendas ORDER BY nombre")]
+
+
+@ruta("GET", "/api/pos/articulos", publica=True)
+def pos_articulos(c):
+    """Lo que se maneja con stock en tienda: productos e insumos de punto de venta / desechables."""
+    pos_autorizar(c)
+    return rows(c.db, """SELECT a.id, a.codigo, a.nombre, a.tipo, u.abreviatura unidad FROM articulos a JOIN unidades u ON u.id=a.unidad_id
+        WHERE a.activo=1 AND (a.tipo='PRODUCTO' OR a.desechable=1) ORDER BY a.nombre""")
+
+
+@ruta("POST", "/api/pos/consumos", publica=True)
+def pos_consumo(c):
+    """Descuenta del stock de la tienda lo que consumió una venta del POS. Idempotente por referencia; todo o nada."""
+    pos_autorizar(c)
+    d = c.body
+    ref = pos_referencia(d.get("referencia"))
+    previo = row(c.db, "SELECT id, estado FROM pos_consumos WHERE referencia=?", ref)
+    if previo:
+        return {"ok": True, "id": previo["id"], "estado": previo["estado"], "repetido": True}
+    tid = entero(d.get("tienda_id"), "la tienda")
+    tienda = row(c.db, "SELECT id, nombre FROM tiendas WHERE id=?", tid)
+    if not tienda:
+        raise ApiError(404, "Tienda no encontrada.")
+    fecha = fecha_valida(d.get("fecha"))
+    detalle = txt(d.get("detalle"), "El detalle", False, 200)
+    items = d.get("items")
+    if not isinstance(items, list) or not items:
+        raise ApiError(400, "La venta no trae artículos para descontar.")
+    cantidades = {}
+    for i in items:
+        if not isinstance(i, dict):
+            raise ApiError(400, "Detalle inválido.")
+        aid = entero(i.get("articulo_id"), "el artículo en cada línea")
+        cantidades[aid] = round(cantidades.get(aid, 0) + num(i.get("cantidad"), "La cantidad", 0, True), 5)
+    for aid in cantidades:
+        if not row(c.db, "SELECT id FROM articulos WHERE id=? AND activo=1", aid):
+            raise ApiError(404, f"Artículo {aid} no encontrado o inactivo.")
+    cid = c.db.execute("INSERT INTO pos_consumos(referencia,tienda_id,fecha,detalle,creado) VALUES(?,?,?,?,?)",
+                       (ref, tid, fecha, detalle, f"{datetime.now():%Y-%m-%d %H:%M:%S}")).lastrowid
+    for aid, cant in cantidades.items():
+        mover(c.db, aid, tid, -cant, "VENTA", None, fecha, "POS", cid, f"POS {ref}", obs=detalle)
+    return {"ok": True, "id": cid}
+
+
+@ruta("POST", "/api/pos/consumos/anular", publica=True)
+def pos_consumo_anular(c):
+    pos_autorizar(c)
+    ref = pos_referencia(c.body.get("referencia"))
+    cons = row(c.db, "SELECT id, estado FROM pos_consumos WHERE referencia=?", ref)
+    if not cons:
+        raise ApiError(404, "No existe un consumo del POS con esa referencia.")
+    if cons["estado"] != "ANULADO":
+        anular(c.db, None, "pos_consumos", "POS", cons["id"])
+        c.db.execute("UPDATE pos_consumos SET anulado=? WHERE id=?", (f"{datetime.now():%Y-%m-%d %H:%M:%S}", cons["id"]))
+    return {"ok": True, "id": cons["id"]}
 
 
 @ruta("GET", "/api/mermas", "mermas")
@@ -1955,7 +2094,7 @@ class Handler(BaseHTTPRequestHandler):
                     db.execute("BEGIN IMMEDIATE")
                     en_tx = True
                 q = {k: v[0] for k, v in parse_qs(url.query).items()}
-                resultado = fn(Ctx(db, user, body, q), *coincide.groups())
+                resultado = fn(Ctx(db, user, body, q, self.headers), *coincide.groups())
                 if en_tx:
                     db.execute("COMMIT")
                     en_tx = False

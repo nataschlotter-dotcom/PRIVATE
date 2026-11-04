@@ -200,6 +200,11 @@ A("POST", f"/compras/{cp}/anular", {})
 casi(costo_receta(), 300)  # al anular vuelve al precio de la compra anterior
 A("PUT", f"/articulos/{harina}", {**editar_h, "precio": 1200})
 c_h = app.conectar(); c_h.execute("UPDATE articulos SET costo=? WHERE id=?", (costo_prom, harina)); c_h.close()  # deja el costo promedio como estaba
+imp = A("GET", "/produccion/impresion?desde=2000-01-01&hasta=2100-01-01")
+o_base = next(o for o in imp["ordenes"] if o["id"] == p1)
+assert o_base["nombre"] == "BAS" and [(i["nombre"], i["cantidad"]) for i in o_base["items"]] == [("HAR", 2)]
+assert len(A("GET", "/produccion/impresion?desde=2000-01-01&hasta=2000-01-02")["ordenes"]) == 0
+A("GET", "/produccion/impresion?desde=2026-02-01&hasta=2026-01-01", esperado=400)
 A("POST", f"/produccion/{p1}/anular", {}, 409)  # la base ya se consumió: dejaría stock negativo
 s = stock(); casi(s[harina], 18); casi(s[base], 3)
 
@@ -538,6 +543,65 @@ A("PUT", "/config/iva", {"iva": 500}, 400)
 A("PUT", "/config/logo", {"logo": "javascript:alert(1)"}, 400)
 A("PUT", "/config/logo", {"logo": "data:image/png;base64,AAAA"})
 assert A("GET", "/estado")["logo"].startswith("data:image/png")
+
+# Conexión con el POS: clave, idempotencia, todo o nada y anulación
+def P(metodo, ruta, cuerpo=None, esperado=200, token=None):
+    cx = http.client.HTTPConnection("127.0.0.1", PUERTO)
+    h = {"Content-Type": "application/json"} if cuerpo is not None else {}
+    if token is not None:
+        h["X-POS-Token"] = token
+    cx.request(metodo, "/api" + ruta, json.dumps(cuerpo) if cuerpo is not None else None, h)
+    r = cx.getresponse()
+    txt = r.read().decode()
+    assert r.status == esperado, f"POS {metodo} {ruta}: {r.status} {txt[:300]} (esperado {esperado})"
+    return json.loads(txt)
+
+
+P("GET", "/pos/ping", token="x", esperado=503)  # sin clave configurada
+assert A("GET", "/config/pos")["configurado"] is False
+clave = A("POST", "/config/pos/token", {})["token"]
+assert A("GET", "/config/pos")["configurado"] is True
+c = app.conectar()
+assert clave not in str(c.execute("SELECT valor FROM config WHERE clave='pos_token_hash'").fetchone())  # solo la huella
+c.close()
+P("GET", "/pos/ping", esperado=401)
+P("GET", "/pos/ping", token="mala", esperado=401)
+assert P("GET", "/pos/ping", token=clave)["ok"] is True
+assert tienda in [t["id"] for t in P("GET", "/pos/tiendas", token=clave)]
+arts_pos = {x["id"]: x for x in P("GET", "/pos/articulos", token=clave)}
+assert vaso in arts_pos and harina not in arts_pos
+st = stock(tienda)
+con_stock = next(aid for aid, q in st.items() if q >= 2 and aid in arts_pos)
+otro = next((aid for aid in arts_pos if aid != con_stock), None)
+venta = {"referencia": "POS-test-1", "tienda_id": tienda, "fecha": "2026-11-04", "detalle": "Venta POS N° 1",
+         "items": [{"articulo_id": con_stock, "cantidad": 0.5}, {"articulo_id": con_stock, "cantidad": 0.5}]}
+r1 = P("POST", "/pos/consumos", venta, token=clave)
+casi(stock(tienda)[con_stock], st[con_stock] - 1)
+assert P("POST", "/pos/consumos", venta, token=clave)["id"] == r1["id"]  # repetido: no descuenta de nuevo
+casi(stock(tienda)[con_stock], st[con_stock] - 1)
+# Stock insuficiente: nada se descuenta (todo o nada)
+P("POST", "/pos/consumos", {**venta, "referencia": "POS-test-2", "items": [{"articulo_id": con_stock, "cantidad": 0.5}, {"articulo_id": con_stock if otro is None else otro, "cantidad": 99999}]}, token=clave, esperado=409)
+casi(stock(tienda)[con_stock], st[con_stock] - 1)
+P("POST", "/pos/consumos/anular", {"referencia": "POS-test-2"}, token=clave, esperado=404)
+P("POST", "/pos/consumos", {**venta, "referencia": "POS-test-3", "tienda_id": 999999}, token=clave, esperado=404)
+P("POST", "/pos/consumos", {**venta, "referencia": "POS-test-3", "items": [{"articulo_id": 999999, "cantidad": 1}]}, token=clave, esperado=404)
+P("POST", "/pos/consumos", {**venta, "referencia": "POS-test-3", "items": [{"articulo_id": con_stock, "cantidad": 0}]}, token=clave, esperado=400)
+P("POST", "/pos/consumos", {**venta, "referencia": "con espacios"}, token=clave, esperado=400)
+P("POST", "/pos/consumos", {**venta, "referencia": "POS-test-3"}, token="mala", esperado=401)
+P("POST", "/pos/consumos/anular", {"referencia": "POS-test-1"}, token=clave)
+casi(stock(tienda)[con_stock], st[con_stock])
+P("POST", "/pos/consumos/anular", {"referencia": "POS-test-1"}, token=clave)  # ya anulado: 200 sin devolver dos veces
+casi(stock(tienda)[con_stock], st[con_stock])
+assert A("GET", "/config/pos")["consumos"] == 1
+clave2 = A("POST", "/config/pos/token", {})["token"]
+P("GET", "/pos/ping", token=clave, esperado=401)  # la clave anterior deja de servir
+P("GET", "/pos/ping", token=clave2)
+A("DELETE", "/config/pos/token")
+P("GET", "/pos/ping", token=clave2, esperado=503)
+os.environ["NS_POS_TOKEN"] = "clave-de-servidor"
+P("GET", "/pos/ping", token="clave-de-servidor")
+A("POST", "/config/pos/token", {}, 409)  # definida en el servidor
+del os.environ["NS_POS_TOKEN"]
 
 # Coherencia: el stock siempre es igual a la suma del historial
 c = app.conectar()

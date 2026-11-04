@@ -939,7 +939,10 @@ function editarReceta(r, recetas) {
     const total = ed ? ed.neto() : 0, rend = aNum(f.rendimiento.value) || 0;
     $('#tot', m.el).innerHTML = `<div><span>Costo de los ingredientes</span><span>${fPrecio(total)}</span></div><div class="total"><span>Costo por ${esc(r.unidad)}</span><span>${rend > 0 ? fPrecio(total / rend) : '—'}</span></div>`;
   };
-  ed = editorLineas($('#lin', m.el), { articulos: S.cat.articulos.filter(a => a.id !== r.articulo_id && (a.tipo === 'SUBPRODUCTO' || (a.tipo === 'INSUMO' && !a.desechable))), valores: r.items,
+  const ingredientes = S.cat.articulos.filter(a => a.id !== r.articulo_id && (a.tipo === 'SUBPRODUCTO' || (a.tipo === 'INSUMO' && !a.desechable)));
+  const grupos = [{ nombre: 'Subproductos (rellenos y bases)', filtro: a => a.tipo === 'SUBPRODUCTO' },
+    ...[...new Set(ingredientes.filter(a => a.tipo === 'INSUMO').map(a => a.categoria))].sort((x, y) => x.localeCompare(y)).map(cat => ({ nombre: `Insumos · ${cat}`, filtro: a => a.tipo === 'INSUMO' && a.categoria === cat }))];
+  ed = editorLineas($('#lin', m.el), { articulos: ingredientes, valores: r.items, grupos,
     precio: 'Precio', subtotal: 'Costo', porUnidad: true, fSubtotal: fPrecio, alCambiar: totales,
     precioDe: a => a.tipo === 'SUBPRODUCTO' ? costoSub[a.id] || 0 : a.precio || 0 });
   f.rendimiento.addEventListener('input', totales);
@@ -951,9 +954,29 @@ function editarReceta(r, recetas) {
 }
 
 /* ---------- Producción ---------- */
+function imprimirProduccion(d) {
+  const resumen = {};
+  d.ordenes.forEach(o => { const k = o.codigo; resumen[k] = resumen[k] || { codigo: o.codigo, nombre: o.nombre, unidad: o.unidad, cantidad: 0, costo: 0, ordenes: 0 }; resumen[k].cantidad += o.cantidad; resumen[k].costo += o.costo_total; resumen[k].ordenes += 1; });
+  const periodo = d.desde === d.hasta ? fFecha(d.desde) : `${fFecha(d.desde)} al ${fFecha(d.hasta)}`;
+  const orden = o => `<div class="orden"><h3>Orden N° ${String(o.id).padStart(6, '0')} · ${esc(o.codigo)} ${esc(o.nombre)}</h3>
+    <div class="guia-datos"><div><b>Fecha:</b> ${fFecha(o.fecha)}</div><div><b>Cantidad:</b> ${fCant(o.cantidad)} ${esc(o.unidad)}</div><div><b>Costo total:</b> ${fPeso(o.costo_total)}</div><div><b>Registrada por:</b> ${esc(o.usuario) || '—'}</div>${o.obs ? `<div><b>Observación:</b> ${esc(o.obs)}</div>` : ''}</div>
+    <div class="tabla-marco"><table><thead><tr><th>Código</th><th>Ingrediente</th><th class="n">Cantidad usada</th><th class="n">Costo</th></tr></thead><tbody>${o.items.map(i => `<tr><td>${esc(i.codigo)}</td><td>${esc(i.nombre)}</td><td class="n">${fCant(i.cantidad)} ${esc(i.unidad)}</td><td class="n">${fPeso(i.cantidad * i.costo_unit)}</td></tr>`).join('') || '<tr><td colspan="4" class="vacio">Sin ingredientes registrados.</td></tr>'}</tbody></table></div></div>`;
+  const m = modal('Órdenes de producción', `<div class="guia-cab"><div class="guia-marca"><img src="${esc(logo())}" alt=""><div><strong>Nata &amp; Schlott</strong><span class="tenue">Sistema de producción y logística</span></div></div>
+    <div class="guia-num"><span>Órdenes de producción</span><strong>${periodo}</strong></div></div>
+    ${d.ordenes.length ? `<h3 class="sub-imp">Resumen del período</h3><div class="tabla-marco"><table><thead><tr><th>Código</th><th>Artículo</th><th class="n">Órdenes</th><th class="n">Cantidad</th><th class="n">Costo total</th></tr></thead><tbody>${Object.values(resumen).map(r => `<tr><td>${esc(r.codigo)}</td><td>${esc(r.nombre)}</td><td class="n">${fNum(r.ordenes)}</td><td class="n">${fCant(r.cantidad)} ${esc(r.unidad)}</td><td class="n">${fPeso(r.costo)}</td></tr>`).join('')}</tbody></table></div>
+    <h3 class="sub-imp">Detalle por orden</h3>${d.ordenes.map(orden).join('')}` : '<p class="vacio">No hay producciones vigentes en estas fechas.</p>'}
+    <div class="firmas"><div>Responsable de producción</div><div>Revisado por</div></div><p class="legal">Documento de control interno. No incluye producciones anuladas.</p>
+    <div class="modal-pie no-imprimir"><button type="button" class="btn primario imprimir">Imprimir</button></div>`, true);
+  $('.imprimir', m.el).addEventListener('click', () => print());
+}
 Vistas.produccion = async v => {
   const filas = await api('GET', '/produccion');
-  v.innerHTML = cabecera('Producción', 'Fabrica productos y subproductos según su receta.', can('produccion', 2) ? '<button class="btn primario" id="n">Registrar producción</button>' : '');
+  v.innerHTML = cabecera('Producción', 'Fabrica productos y subproductos según su receta.', '<button class="btn" id="imp">Imprimir por fechas</button>' + (can('produccion', 2) ? '<button class="btn primario" id="n">Registrar producción</button>' : ''));
+  $('#imp', v).addEventListener('click', () => formulario('Imprimir órdenes de producción', [
+    { k: 'desde', t: 'Desde', tipo: 'date', def: hoy() }, { k: 'hasta', t: 'Hasta', tipo: 'date', def: hoy() }], {}, async d => {
+    if (!d.desde || !d.hasta) throw new Error('Indica ambas fechas.');
+    imprimirProduccion(await api('GET', '/produccion/impresion' + qs(d)));
+  }, 'Ver para imprimir'));
   const c = v.appendChild(Object.assign(document.createElement('div'), { className: 'tarjeta' }));
   tabla(c, { filas, csv: 'produccion', vacio: 'Aún no hay producciones.', acciones: {
     anular: r => confirmar('Anular producción', `Se quitarán ${fCant(r.cantidad)} ${r.unidad} de ${r.nombre} y se devolverán sus ingredientes al stock.`, async () => { await api('POST', `/produccion/${r.id}/anular`, {}); aviso('Producción anulada.'); render(); }, 'Anular producción') }, cols: [
@@ -1249,7 +1272,42 @@ Vistas.config = async v => {
     r.readAsDataURL(a);
   });
   $('#qt', v)?.addEventListener('click', async () => { await api('PUT', '/config/logo', { logo: '' }); S.logo = null; marco(); render(); });
+  if (edita && !S.usuario.tienda_id) await tarjetaPos(v);
 };
+
+async function tarjetaPos(v) {
+  const t = document.createElement('div');
+  t.className = 'tarjeta';
+  v.append(t);
+  const pintar = async () => {
+    const s = await api('GET', '/config/pos');
+    const estado = !s.configurado ? '<b>Desactivada.</b> El POS no puede descontar stock hasta que generes una clave.'
+      : s.origen === 'variable' ? '<b>Activada</b> con la clave definida en el servidor (variable NS_POS_TOKEN).'
+      : '<b>Activada.</b>';
+    t.innerHTML = `<h2>Conexión con el POS</h2><p class="nota">Permite que el POS de las tiendas descuente del stock de cada tienda los ingredientes de cada venta, y lo devuelva si la venta se anula.</p>
+      <p>${estado} Consumos recibidos: <b>${s.consumos}</b>${s.ultimo ? ` · último: ${esc(s.ultimo)}` : ''}</p>
+      ${s.origen === 'variable' ? '' : `<div class="filtros"><button class="btn" id="pos-gen">${s.configurado ? 'Generar clave nueva' : 'Activar y generar clave'}</button>${s.configurado ? '<button class="btn" id="pos-off">Desactivar conexión</button>' : ''}</div>`}`;
+    const generar = async () => {
+      const r = await api('POST', '/config/pos/token', {});
+      const m = modal('Clave de conexión del POS', `<p>Copia esta clave y pégala en el POS, en la pantalla <b>Conexión</b>. <b>Solo se muestra esta vez.</b></p>
+        <input id="pos-clave" readonly value="${esc(r.token)}" aria-label="Clave del POS" style="width:100%;font-family:monospace">
+        <div class="modal-pie"><button type="button" class="btn primario" id="pos-copiar">Copiar clave</button></div>`);
+      $('#pos-copiar', m.el).addEventListener('click', async () => {
+        const i = $('#pos-clave', m.el); i.select();
+        try { await navigator.clipboard.writeText(i.value); } catch { document.execCommand('copy'); }
+        aviso('Clave copiada.');
+      });
+      pintar();
+    };
+    $('#pos-gen', t)?.addEventListener('click', () => {
+      if (!s.configurado) return generar().catch(x => aviso(x.message, 1));
+      confirmar('Generar clave nueva', 'La clave actual dejará de funcionar y tendrás que poner la nueva en el POS.', generar, 'Generar');
+    });
+    $('#pos-off', t)?.addEventListener('click', () => confirmar('Desactivar conexión con el POS', 'El POS no podrá descontar stock hasta que generes una clave nueva.',
+      async () => { await api('DELETE', '/config/pos/token'); aviso('Conexión con el POS desactivada.'); pintar(); }, 'Desactivar'));
+  };
+  try { await pintar(); } catch (x) { t.innerHTML = `<h2>Conexión con el POS</h2><p class="nota">${esc(x.message)}</p>`; }
+}
 
 /* ---------- arranque y rutas ---------- */
 const PERMISO_RUTA = { compras: ['compras', 'proveedores'], fudo: ['config'] };
