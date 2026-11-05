@@ -593,6 +593,33 @@ casi(stock(tienda)[con_stock], st[con_stock])
 P("POST", "/pos/consumos/anular", {"referencia": "POS-test-1"}, token=clave)  # ya anulado: 200 sin devolver dos veces
 casi(stock(tienda)[con_stock], st[con_stock])
 assert A("GET", "/config/pos")["consumos"] == 1
+# Stock de tienda y toma de inventario desde el POS
+st_pos = {x["articulo_id"]: x for x in P("GET", f"/pos/stock?tienda_id={tienda}", token=clave)}
+assert set(st_pos) == set(arts_pos)  # todos los de tienda, con 0 si no hay fila
+casi(st_pos[con_stock]["cantidad"], st[con_stock])
+P("GET", "/pos/stock?tienda_id=999999", token=clave, esperado=404)
+P("GET", f"/pos/stock?tienda_id={tienda}", token="mala", esperado=401)
+sin_fila = next((aid for aid in arts_pos if aid not in st), None)
+toma = {"referencia": "POSINV-test-1", "tienda_id": tienda, "fecha": "2026-11-04", "responsable": "María", "obs": "Cierre",
+        "items": [{"articulo_id": con_stock, "conteo": st[con_stock] - 0.5}] + ([{"articulo_id": sin_fila, "conteo": 3}] if sin_fila else [])}
+P("POST", "/pos/inventarios", {**toma, "items": toma["items"] * 2}, token=clave, esperado=400)  # repetido
+P("POST", "/pos/inventarios", {**toma, "items": [{"articulo_id": harina, "conteo": 1}]}, token=clave, esperado=404)  # no es de tienda
+P("POST", "/pos/inventarios", {**toma, "items": [{"articulo_id": con_stock, "conteo": -1}]}, token=clave, esperado=400)
+casi(stock(tienda)[con_stock], st[con_stock])  # nada se ajustó
+inv_abierto = A("POST", "/inventarios", {"bodega_id": tienda})["id"]
+P("POST", "/pos/inventarios", toma, token=clave, esperado=409)
+A("DELETE", f"/inventarios/{inv_abierto}")
+ri = P("POST", "/pos/inventarios", toma, token=clave)
+aj = {x["articulo_id"]: x for x in ri["ajustes"]}
+casi(aj[con_stock]["diferencia"], -0.5); casi(aj[con_stock]["stock_sistema"], st[con_stock])
+casi(stock(tienda)[con_stock], st[con_stock] - 0.5)
+if sin_fila:
+    casi(stock(tienda)[sin_fila], 3)
+ri2 = P("POST", "/pos/inventarios", toma, token=clave)
+assert ri2["repetido"] is True and ri2["id"] == ri["id"]
+casi(stock(tienda)[con_stock], st[con_stock] - 0.5)  # repetido: no ajusta de nuevo
+inv = A("GET", f"/inventarios/{ri['id']}")
+assert inv["estado"] == "CERRADO" and "María" in inv["obs"]
 clave2 = A("POST", "/config/pos/token", {})["token"]
 P("GET", "/pos/ping", token=clave, esperado=401)  # la clave anterior deja de servir
 P("GET", "/pos/ping", token=clave2)

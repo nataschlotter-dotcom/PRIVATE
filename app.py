@@ -115,6 +115,7 @@ CREATE TABLE IF NOT EXISTS pos_consumos(id INTEGER PRIMARY KEY, referencia TEXT 
   fecha TEXT NOT NULL, detalle TEXT NOT NULL DEFAULT '', estado TEXT NOT NULL DEFAULT 'VIGENTE', creado TEXT NOT NULL, anulado TEXT);
 CREATE TABLE IF NOT EXISTS inventarios(id INTEGER PRIMARY KEY, fecha TEXT NOT NULL, bodega_id INTEGER NOT NULL, estado TEXT NOT NULL DEFAULT 'ABIERTO',
   obs TEXT NOT NULL DEFAULT '', usuario_id INTEGER REFERENCES usuarios(id), cerrado TEXT, seccion TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS pos_inventarios(referencia TEXT PRIMARY KEY, inventario_id INTEGER NOT NULL REFERENCES inventarios(id));
 CREATE TABLE IF NOT EXISTS inventario_items(inventario_id INTEGER NOT NULL REFERENCES inventarios(id) ON DELETE CASCADE,
   articulo_id INTEGER NOT NULL REFERENCES articulos(id), stock_sistema REAL NOT NULL, conteo REAL, diferencia REAL,
   PRIMARY KEY(inventario_id, articulo_id));
@@ -1543,6 +1544,70 @@ def pos_consumo_anular(c):
         anular(c.db, None, "pos_consumos", "POS", cons["id"])
         c.db.execute("UPDATE pos_consumos SET anulado=? WHERE id=?", (f"{datetime.now():%Y-%m-%d %H:%M:%S}", cons["id"]))
     return {"ok": True, "id": cons["id"]}
+
+
+def pos_tienda(db, valor):
+    tid = entero(valor, "la tienda")
+    if not row(db, "SELECT id FROM tiendas WHERE id=?", tid):
+        raise ApiError(404, "Tienda no encontrada.")
+    return tid
+
+
+@ruta("GET", "/api/pos/stock", publica=True)
+def pos_stock(c):
+    pos_autorizar(c)
+    tid = pos_tienda(c.db, c.q.get("tienda_id"))
+    return rows(c.db, """SELECT a.id articulo_id, a.codigo, a.nombre, a.tipo, u.abreviatura unidad, COALESCE(s.cantidad,0) cantidad, a.stock_minimo
+        FROM articulos a JOIN unidades u ON u.id=a.unidad_id LEFT JOIN stock s ON s.articulo_id=a.id AND s.bodega_id=?
+        WHERE a.activo=1 AND (a.tipo='PRODUCTO' OR a.desechable=1) ORDER BY a.nombre""", tid)
+
+
+def pos_inventario_resultado(db, iid):
+    return {"ok": True, "id": iid, "ajustes": rows(db, """SELECT x.articulo_id, x.stock_sistema, x.conteo, x.diferencia FROM inventario_items x
+        JOIN articulos a ON a.id=x.articulo_id WHERE x.inventario_id=? ORDER BY a.nombre""", iid)}
+
+
+@ruta("POST", "/api/pos/inventarios", publica=True)
+def pos_inventario(c):
+    """Toma de inventario contada en el POS: crea y cierra la toma en una sola llamada, ajustando el stock al conteo."""
+    pos_autorizar(c)
+    d = c.body
+    ref = pos_referencia(d.get("referencia"))
+    previo = scalar(c.db, "SELECT inventario_id FROM pos_inventarios WHERE referencia=?", ref)
+    if previo:
+        return {**pos_inventario_resultado(c.db, previo), "repetido": True}
+    tid = pos_tienda(c.db, d.get("tienda_id"))
+    fecha = fecha_valida(d.get("fecha"))
+    responsable = txt(d.get("responsable"), "El responsable", False, 100)
+    obs = txt(d.get("obs"), "La observación", False, 300)
+    items = d.get("items")
+    if not isinstance(items, list) or not items:
+        raise ApiError(400, "La toma no trae conteos.")
+    conteos = {}
+    for i in items:
+        if not isinstance(i, dict):
+            raise ApiError(400, "Detalle inválido.")
+        aid = entero(i.get("articulo_id"), "el artículo en cada línea")
+        if aid in conteos:
+            raise ApiError(400, f"El artículo {aid} viene repetido en la toma.")
+        conteos[aid] = num(i.get("conteo"), "El conteo")
+    for aid in conteos:
+        if not row(c.db, "SELECT id FROM articulos WHERE id=? AND activo=1 AND (tipo='PRODUCTO' OR desechable=1)", aid):
+            raise ApiError(404, f"Artículo {aid} no encontrado o no se maneja en tiendas.")
+    if row(c.db, "SELECT id FROM inventarios WHERE bodega_id=? AND estado='ABIERTO'", tid):
+        raise ApiError(409, "Esta tienda tiene una toma de inventario abierta en el sistema de producción. Ciérrala o elimínala antes de enviar la del POS.")
+    detalle = " · ".join(x for x in ("POS", responsable, obs) if x)
+    iid = c.db.execute("INSERT INTO inventarios(fecha,bodega_id,seccion,obs,usuario_id) VALUES(?,?,'',?,NULL)", (fecha, tid, detalle)).lastrowid
+    for aid, conteo in conteos.items():
+        actual = stock_de(c.db, tid, aid)
+        dif = round(conteo - actual, 5)
+        c.db.execute("INSERT INTO inventario_items(inventario_id,articulo_id,stock_sistema,conteo,diferencia) VALUES(?,?,?,?,?)", (iid, aid, actual, conteo, dif))
+        if dif:
+            mover(c.db, aid, tid, dif, "INVENTARIO", None, fecha, "INVENTARIO", iid, f"Toma de inventario POS #{iid}",
+                  obs=f"Conteo físico: {conteo:g}; sistema: {actual:g}")
+    c.db.execute("UPDATE inventarios SET estado='CERRADO', cerrado=? WHERE id=?", (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), iid))
+    c.db.execute("INSERT INTO pos_inventarios(referencia,inventario_id) VALUES(?,?)", (ref, iid))
+    return pos_inventario_resultado(c.db, iid)
 
 
 @ruta("GET", "/api/mermas", "mermas")
