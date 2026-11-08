@@ -298,6 +298,31 @@ te = A("POST", "/inventarios", {"bodega_id": 0, "seccion": "ELABORADOS"})["id"]
 assert torta in {i["articulo_id"] for i in A("GET", f"/inventarios/{te}")["items"]}
 A("DELETE", f"/inventarios/{te}")
 
+# Toma por categorías: solo esas categorías, conviven si no repiten artículos, y se listan con su nombre
+cats0 = {x["id"]: x for x in A("GET", "/inventarios/categorias?bodega_id=0")}
+tf = A("POST", "/inventarios", {"bodega_id": 0, "fecha": "2026-03-02", "obs": "Inventario mensual"})["id"]
+A("PUT", f"/inventarios/{tf}", {"fecha": "2026-03-05", "obs": "Cierre de mes", "items": [{"articulo_id": harina, "conteo": 1}]})
+dt = A("GET", f"/inventarios/{tf}")
+assert dt["fecha"] == "2026-03-05" and dt["obs"] == "Cierre de mes" and "punto_venta" in dt["items"][0]
+assert next(i for i in dt["items"] if i["articulo_id"] == harina)["conteo"] == 1
+A("DELETE", f"/inventarios/{tf}")
+arts0 = A("GET", "/inventarios/articulos?bodega_id=0")
+assert harina in {a["articulo_id"] for a in arts0} and all("categoria_id" in a and "cantidad" in a for a in arts0)
+assert sum(x["articulos"] for x in cats0.values()) == len(arts0)
+cat_h = next(a["categoria_id"] for a in A("GET", "/articulos") if a["id"] == harina)
+assert cat_h in cats0 and cats0[cat_h]["articulos"] >= 1 and len(cats0) > 1, cats0
+cat_v = next(k for k in cats0 if k != cat_h)
+tk = A("POST", "/inventarios", {"bodega_id": 0, "categorias": [cat_h]})
+det_k = A("GET", f"/inventarios/{tk['id']}")
+assert {i["categoria_id"] for i in det_k["items"]} == {cat_h} and harina in {i["articulo_id"] for i in det_k["items"]}
+assert det_k["categorias_nombres"] == [cats0[cat_h]["nombre"]]
+A("POST", "/inventarios", {"bodega_id": 0, "categorias": [cat_h]}, 409)
+A("POST", "/inventarios", {"bodega_id": 0}, 409)
+tk2 = A("POST", "/inventarios", {"bodega_id": 0, "categorias": [cat_v]})["id"]
+assert any(r["id"] == tk["id"] and r["categorias_nombres"] for r in A("GET", "/inventarios"))
+A("POST", "/inventarios", {"bodega_id": 0, "categorias": ["x"]}, 400)
+A("DELETE", f"/inventarios/{tk['id']}"); A("DELETE", f"/inventarios/{tk2}")
+
 # Anular guía: revierte, pero no si la tienda ya no tiene el stock
 A("POST", f"/despachos/{g}/anular", {}, 409)  # los vasos ya bajaron a 28,5 de 30
 s0 = stock(); assert abs(s0[vaso] - 70) < 1e-6 and stock(tienda)[torta] == 1  # sin cambios parciales

@@ -875,36 +875,181 @@ Vistas.articulos = async v => {
 };
 
 /* ---------- Toma de inventario ---------- */
-const nombreToma = r => r.seccion ? `${r.bodega} · ${SECCIONES.find(s => s.id === r.seccion).nombre}` : r.bodega;
+const nombreToma = r => {
+  let n = r.seccion ? `${r.bodega} · ${SECCIONES.find(s => s.id === r.seccion).nombre}` : r.bodega;
+  const cs = r.categorias_nombres || [];
+  if (cs.length) n += ' · ' + (cs.length <= 2 ? cs.join(', ') : `${cs.length} categorías`);
+  return n;
+};
+const sinTilde = s => String(s ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+/* Conteo en una sola pantalla: bodega, fecha y motivo → tipo de artículo (o búsqueda) → conteos que se guardan solos. Lo vacío mantiene su stock. */
+const TIPOS_CONTEO = [{ id: 'PRODUCTO', nombre: 'Productos' }, { id: 'SUBPRODUCTO', nombre: 'Subproductos' }, { id: 'INSUMO', nombre: 'Insumos' },
+  { id: 'PUNTO_VENTA', nombre: 'Insumos para puntos de venta' }, { id: 'DESECHABLE', nombre: 'Desechables y aseo' }];
+const tipoConteo = a => a.punto_venta ? 'PUNTO_VENTA' : a.desechable ? 'DESECHABLE' : a.tipo;
+const MOTIVOS_TOMA = ['Inventario mensual', 'Inventario semanal', 'Cierre de mes', 'Control aleatorio', 'Recuento por diferencia'];
+const invPanel = { bodega: null, tipo: '', q: '', fecha: '', obs: '' };
+const tomaDePanel = r => r.estado === 'ABIERTO' && !r.seccion && !r.categorias;
+async function panelConteo(v, filas) {
+  const bods = bodegasOp();
+  if (!bods.length) return;
+  if (!bods.some(b => b.id === invPanel.bodega)) invPanel.bodega = bods[0].id;
+  const abierta = filas.find(r => tomaDePanel(r) && r.bodega_id === invPanel.bodega);
+  const otra = !abierta && filas.find(r => r.estado === 'ABIERTO' && r.bodega_id === invPanel.bodega);
+  let tomaId = abierta?.id || null;
+  const valores = new Map();
+  const norm = (a, stock) => ({ id: a.articulo_id, codigo: a.codigo, nombre: a.nombre, unidad: a.unidad, categoria: a.categoria, tipo: tipoConteo(a), stock });
+  let arts;
+  if (tomaId) {
+    const inv = await api('GET', `/inventarios/${tomaId}`);
+    arts = inv.items.map(i => norm(i, i.stock_actual));
+    inv.items.forEach(i => { if (i.conteo !== null) valores.set(i.articulo_id, i.conteo); });
+    invPanel.fecha = inv.fecha; invPanel.obs = inv.obs;
+  } else {
+    arts = (await api('GET', '/inventarios/articulos' + qs({ bodega_id: invPanel.bodega }))).map(a => norm(a, a.cantidad));
+    if (!invPanel.fecha) invPanel.fecha = hoy();
+  }
+  arts.sort((x, y) => x.categoria.localeCompare(y.categoria, 'es') || x.nombre.localeCompare(y.nombre, 'es'));
+  const tipos = TIPOS_CONTEO.filter(t => arts.some(a => a.tipo === t.id));
+  if (invPanel.tipo && invPanel.tipo !== 'TODOS' && !tipos.some(t => t.id === invPanel.tipo)) invPanel.tipo = '';
+  const cierra = puede('cerrar_inventario');
+  const t = v.appendChild(Object.assign(document.createElement('div'), { className: 'tarjeta conteo-panel' }));
+  t.innerHTML = `<div class="cp-paso"><span class="cp-num">1</span><div class="filtros">
+      <label>Bodega<select class="cp-bod">${opciones(bods, invPanel.bodega)}</select></label>
+      <label>Fecha<input type="date" class="cp-fecha" value="${esc(invPanel.fecha)}"></label>
+      <label class="cp-motivo">Motivo<input class="cp-obs" list="cp-motivos" maxlength="500" placeholder="Ej.: Inventario mensual" value="${esc(invPanel.obs)}"></label>
+      <datalist id="cp-motivos">${MOTIVOS_TOMA.map(m => `<option value="${esc(m)}">`).join('')}</datalist>
+      <span class="cp-estado tenue">${tomaId ? `Toma #${tomaId} en curso` : ''}</span></div></div>
+    ${otra ? `<p class="aviso-linea">La toma #${otra.id} de esta bodega quedó abierta con el método anterior. Ciérrala o elimínala desde la lista de abajo para contar aquí.</p>` : ''}
+    <div class="cp-paso"><span class="cp-num">2</span><div class="filtros">
+      <label>Tipo de artículo<select class="cp-tipo"><option value="">— Elige el tipo —</option>${tipos.map(x => `<option value="${x.id}" ${x.id === invPanel.tipo ? 'selected' : ''}>${esc(x.nombre)} (${arts.filter(a => a.tipo === x.id).length})</option>`).join('')}<option value="TODOS" ${invPanel.tipo === 'TODOS' ? 'selected' : ''}>Todos los tipos (${arts.length})</option></select></label>
+      <label class="cp-buscar">o busca un artículo<input type="search" class="cp-q" placeholder="Nombre o código…" value="${esc(invPanel.q)}"></label></div></div>
+    <div class="tabla-marco"><table><thead><tr><th>Código</th><th>Artículo</th><th class="n">Stock sistema</th><th class="n">Conteo físico</th><th class="n">Diferencia</th></tr></thead><tbody></tbody></table></div>
+    <div class="modal-pie"><span class="tenue cp-resumen" style="margin-right:auto"></span>
+      ${cierra ? '<button type="button" class="btn peligro cp-descartar">Descartar conteo</button><button type="button" class="btn primario cp-cerrar">Cerrar y ajustar stock</button>' : '<span class="tenue">Tu perfil no puede cerrar tomas: pide a quien tenga ese permiso que la cierre.</span>'}</div>`;
+  const cuerpo = $('tbody', t), estado = (x, mal) => { const e = $('.cp-estado', t); e.textContent = x; e.className = 'cp-estado ' + (mal ? 'neg' : 'tenue'); };
+  const listo = () => !!(invPanel.fecha && invPanel.obs.trim());
+  const resumen = () => {
+    const n = valores.size;
+    $('.cp-resumen', t).textContent = n ? `${fNum(n)} ${n === 1 ? 'artículo contado' : 'artículos contados'}. Lo que no cuentes mantiene su stock.` : 'Lo que no cuentes mantiene su stock.';
+  };
+  const dif = (a, td) => {
+    const n = valores.get(a.id);
+    if (n === undefined) { td.textContent = ''; td.className = 'n dif'; return; }
+    const x = n - a.stock;
+    td.textContent = (x > 0 ? '+' : '') + fCant(x); td.className = 'n dif ' + (x > 0 ? 'pos' : x < 0 ? 'neg' : '');
+  };
+  const pintaTabla = () => {
+    $('.cp-tipo', t).disabled = $('.cp-q', t).disabled = !listo();
+    if (!listo()) { cuerpo.innerHTML = '<tr><td colspan="5" class="vacio">Ingresa la fecha y el motivo de la toma para empezar.</td></tr>'; return; }
+    const q = sinTilde(invPanel.q.trim());
+    const lista = arts.filter(a => q ? sinTilde(`${a.codigo} ${a.nombre}`).includes(q) : invPanel.tipo && (invPanel.tipo === 'TODOS' || a.tipo === invPanel.tipo));
+    let cat = null;
+    cuerpo.innerHTML = lista.map(a => (a.categoria !== cat ? `<tr class="grupo"><td colspan="5">${esc(cat = a.categoria)}</td></tr>` : '') +
+      `<tr data-a="${a.id}"><td>${esc(a.codigo)}</td><td>${esc(a.nombre)}</td><td class="n">${fCant(a.stock)} ${esc(a.unidad)}</td>
+      <td class="n">${inputNum('c', valores.get(a.id) ?? '', 5).replace('<input', `<input aria-label="Conteo de ${esc(a.nombre)}"`)}</td><td class="n dif"></td></tr>`).join('')
+      || `<tr><td colspan="5" class="vacio">${q ? 'Ningún artículo coincide con la búsqueda.' : 'Elige el tipo de artículo o busca uno por nombre.'}</td></tr>`;
+    $$('tr[data-a]', cuerpo).forEach(tr => dif(arts.find(a => a.id === Number(tr.dataset.a)), $('.dif', tr)));
+  };
+  let cola = Promise.resolve();
+  const enCola = fn => { cola = cola.then(async () => { try { await fn(); } catch (x) { estado(x.message, true); } }); return cola; };
+  const guardar = (id, conteo) => enCola(async () => {
+    estado('Guardando…');
+    if (!tomaId) tomaId = (await api('POST', '/inventarios', { bodega_id: invPanel.bodega, fecha: invPanel.fecha, obs: invPanel.obs.trim() })).id;
+    await api('PUT', `/inventarios/${tomaId}`, { items: [{ articulo_id: id, conteo }] });
+    estado(`Toma #${tomaId} · guardado ✓`);
+  });
+  const guardarCabecera = () => { if (tomaId && listo()) enCola(async () => { await api('PUT', `/inventarios/${tomaId}`, { fecha: invPanel.fecha, obs: invPanel.obs.trim() }); estado(`Toma #${tomaId} · guardado ✓`); }); };
+  cuerpo.addEventListener('input', e => {
+    const tr = e.target.closest('tr[data-a]'); if (!tr) return;
+    const a = arts.find(x => x.id === Number(tr.dataset.a)), n = aNum(e.target.value);
+    if (n === null) valores.delete(a.id); else if (!Number.isNaN(n)) valores.set(a.id, n);
+    dif(a, $('.dif', tr));
+  });
+  cuerpo.addEventListener('change', e => {
+    const tr = e.target.closest('tr[data-a]'); if (!tr) return;
+    const n = aNum(e.target.value);
+    if (Number.isNaN(n)) return estado('Hay un conteo que no es un número válido.', true);
+    guardar(Number(tr.dataset.a), n); resumen();
+  });
+  $('.cp-fecha', t).addEventListener('change', e => { invPanel.fecha = e.target.value; pintaTabla(); guardarCabecera(); });
+  $('.cp-obs', t).addEventListener('input', e => { invPanel.obs = e.target.value; const antes = $('.cp-tipo', t).disabled; if (antes === listo()) pintaTabla(); });
+  $('.cp-obs', t).addEventListener('change', guardarCabecera);
+  $('.cp-tipo', t).addEventListener('change', e => { invPanel.tipo = e.target.value; invPanel.q = ''; $('.cp-q', t).value = ''; pintaTabla(); });
+  $('.cp-q', t).addEventListener('input', e => { invPanel.q = e.target.value; pintaTabla(); });
+  $('.cp-bod', t).addEventListener('change', async e => { await cola; Object.assign(invPanel, { bodega: Number(e.target.value), tipo: '', q: '', fecha: '', obs: '' }); render(); });
+  const reiniciar = () => Object.assign(invPanel, { tipo: '', q: '', fecha: '', obs: '' });
+  $('.cp-cerrar', t)?.addEventListener('click', async () => {
+    await cola;
+    if (!listo()) return estado('Ingresa la fecha y el motivo.', true);
+    if (!tomaId || !valores.size) return estado('Ingresa al menos un conteo antes de cerrar.', true);
+    confirmar('Cerrar toma', `Se ajustará el stock de ${valores.size} ${valores.size === 1 ? 'artículo' : 'artículos'} según lo contado. El resto mantiene su stock.`, async () => {
+      await api('POST', `/inventarios/${tomaId}/cerrar`, {}); reiniciar(); aviso('Toma cerrada y reflejada en el historial.'); render();
+    }, 'Cerrar y ajustar');
+  });
+  $('.cp-descartar', t)?.addEventListener('click', async () => {
+    await cola;
+    if (!tomaId) { valores.clear(); resumen(); pintaTabla(); return; }
+    confirmar('Descartar conteo', `¿Descartar la toma #${tomaId}? Se borran los conteos y no se ajusta ningún stock.`, async () => {
+      await api('DELETE', `/inventarios/${tomaId}`); reiniciar(); render();
+    }, 'Descartar');
+  });
+  resumen(); pintaTabla();
+  if (!listo()) $(invPanel.fecha ? '.cp-obs' : '.cp-fecha', t).focus();
+}
 Vistas.inventario = async v => {
   const filas = await api('GET', '/inventarios');
-  v.innerHTML = cabecera('Toma de inventario', 'Al cerrar, cada diferencia queda registrada en el historial y ajusta el stock.', can('inventario', 2) ? '<button class="btn primario" id="n">Nueva toma</button>' : '');
-  $('#n', v)?.addEventListener('click', () => formulario('Nueva toma de inventario', [
-    { k: 'bodega_id', t: 'Bodega', tipo: 'select', op: bodegasOp(), todo: 1 },
-    ...(S.usuario.tienda_id ? [] : [{ k: 'seccion', t: 'Sección de bodega central', tipo: 'select', op: SECCIONES, vacio: 'Toda la bodega', todo: 1, ayuda: 'Solo se aplica a la bodega central.' }]),
-    { k: 'obs', t: 'Observación', tipo: 'area', todo: 1 }], {}, async d => {
-    const r = await api('POST', '/inventarios', d); render(); abrirInventario(r.id);
-  }, 'Crear toma'));
+  const edita = can('inventario', 2);
+  v.innerHTML = cabecera('Toma de inventario', edita ? 'Ingresa la fecha y el motivo, elige el tipo de artículo (o búscalo) y escribe lo contado: se guarda solo. Al cerrar, cada diferencia ajusta el stock y queda en el historial.' : 'Tomas de inventario realizadas.');
+  if (edita) await panelConteo(v, filas);
   const c = v.appendChild(Object.assign(document.createElement('div'), { className: 'tarjeta' }));
-  tabla(c, { filas, vacio: 'Aún no hay tomas de inventario.', acciones: { abrir: r => abrirInventario(r.id),
+  c.innerHTML = '<h2>Tomas realizadas</h2><div></div>';
+  tabla(c.lastElementChild, { filas, vacio: 'Aún no hay tomas de inventario.', acciones: {
+    abrir: r => { if (edita && tomaDePanel(r)) { invPanel.bodega = r.bodega_id; render(); scrollTo(0, 0); } else abrirInventario(r.id); },
     borrar: r => confirmar('Eliminar toma', `¿Eliminar la toma #${r.id} sin aplicar ajustes?`, async () => { await api('DELETE', `/inventarios/${r.id}`); render(); }, 'Eliminar') }, cols: [
-    { t: 'N°', v: r => r.id }, { t: 'Fecha', v: r => r.fecha, h: r => fFecha(r.fecha) }, { t: 'Bodega', v: r => nombreToma(r) }, { t: 'Responsable', v: r => r.usuario },
+    { t: 'N°', v: r => r.id }, { t: 'Fecha', v: r => r.fecha, h: r => fFecha(r.fecha) }, { t: 'Bodega', v: r => nombreToma(r) }, { t: 'Motivo', v: r => r.obs }, { t: 'Responsable', v: r => r.usuario },
     { t: 'Contados', n: 1, v: r => r.contadas, h: r => `${fNum(r.contadas)} de ${fNum(r.lineas)}` }, { t: 'Con diferencia', n: 1, v: r => r.con_diferencia, h: r => fNum(r.con_diferencia) },
     { t: 'Estado', v: r => r.estado, h: r => r.estado === 'ABIERTO' ? etq('Abierta', 'alerta') : etq('Cerrada', 'bien') },
-    { t: '', h: r => `<div class="acciones">${accion('abrir', r.estado === 'ABIERTO' && can('inventario', 2) ? 'Contar' : 'Ver')}${r.estado === 'ABIERTO' && can('inventario', 2) && puede('cerrar_inventario') ? accion('borrar', 'Eliminar', 'peligro') : ''}</div>` }] });
+    { t: '', h: r => `<div class="acciones">${accion('abrir', r.estado === 'ABIERTO' && edita ? 'Contar' : 'Ver')}${r.estado === 'ABIERTO' && edita && puede('cerrar_inventario') ? accion('borrar', 'Eliminar', 'peligro') : ''}</div>` }] });
 };
 async function abrirInventario(id) {
   const inv = await api('GET', `/inventarios/${id}`);
   const abierto = inv.estado === 'ABIERTO' && can('inventario', 2);
-  const filas = inv.items.map(i => {
+  const cats = [];
+  for (const i of inv.items) if (!cats.some(x => x.id === i.categoria_id)) cats.push({ id: i.categoria_id, nombre: i.categoria });
+  const filas = cats.map(cat => `<tr class="grupo" data-g="${cat.id}"><td colspan="5">${esc(cat.nombre)} <span class="tenue g-avance"></span></td></tr>` + inv.items.filter(i => i.categoria_id === cat.id).map(i => {
     const sis = abierto ? i.stock_actual : i.stock_sistema;
-    return `<tr data-a="${i.articulo_id}" data-s="${sis}"><td>${esc(i.codigo)}</td><td>${esc(i.nombre)}</td><td class="n">${fCant(sis)} ${esc(i.unidad)}</td>
+    return `<tr class="art" data-a="${i.articulo_id}" data-g="${cat.id}" data-s="${sis}" data-n="${esc(`${i.codigo} ${i.nombre}`)}"><td>${esc(i.codigo)}</td><td>${esc(i.nombre)}</td><td class="n">${fCant(sis)} ${esc(i.unidad)}</td>
     <td class="n">${abierto ? inputNum('c', i.conteo, 5).replace('<input', `<input aria-label="Conteo de ${esc(i.nombre)}"`) : (i.conteo === null ? '—' : fCant(i.conteo))}</td><td class="n dif">${i.diferencia ? fCant(i.diferencia) : ''}</td></tr>`;
-  }).join('');
-  const m = modal(`Toma #${inv.id} · ${nombreToma(inv)}`, `<div class="tabla-marco"><table><thead><tr><th>Código</th><th>Artículo</th><th class="n">Stock sistema</th><th class="n">Conteo físico</th><th class="n">Diferencia</th></tr></thead><tbody>${filas}</tbody></table></div>
-    <p class="tenue">${abierto ? 'Los artículos sin conteo no se ajustan.' : `Cerrada el ${fFecha(inv.cerrado || '') || '—'}.`}</p><div class="error" hidden></div>
+  }).join('')).join('');
+  const m = modal(`Toma #${inv.id} · ${nombreToma(inv)}`, `<div class="filtros inv-filtros"><label>Buscar<input type="search" class="inv-q" placeholder="Nombre o código…"></label>
+      <label>Categoría<select class="inv-cat">${opciones(cats, '', 'Todas las categorías')}</select></label>
+      ${abierto ? '<label class="check"><input type="checkbox" class="inv-pend"> Solo sin contar</label>' : ''}<span class="tenue inv-avance"></span></div>
+    <div class="tabla-marco"><table><thead><tr><th>Código</th><th>Artículo</th><th class="n">Stock sistema</th><th class="n">Conteo físico</th><th class="n">Diferencia</th></tr></thead><tbody>${filas}
+    <tr class="inv-vacio" hidden><td colspan="5" class="vacio">Ningún artículo coincide con la búsqueda.</td></tr></tbody></table></div>
+    <p class="tenue">${abierto ? 'Los artículos sin conteo no se ajustan. Puedes contar por categoría y guardar el avance cuantas veces quieras.' : `Cerrada el ${fFecha(inv.cerrado || '') || '—'}.`}</p><div class="error" hidden></div>
     ${abierto ? '<form><div class="modal-pie"><button type="button" class="btn g">Guardar avance</button>' + (puede('cerrar_inventario') ? '<button class="btn primario">Cerrar y ajustar stock</button>' : '<span class="tenue">Tu perfil no puede cerrar tomas: pide a quien tenga ese permiso que la cierre.</span>') + '</div></form>' : ''}`, true);
+  const contado = tr => abierto ? $('.c', tr).value.trim() !== '' : !tr.children[3].textContent.includes('—');
+  const filtrar = () => {
+    const q = sinTilde($('.inv-q', m.el).value.trim()), cat = $('.inv-cat', m.el).value, pend = $('.inv-pend', m.el)?.checked;
+    let visibles = 0;
+    $$('tr.art', m.el).forEach(tr => {
+      const ver = (!q || sinTilde(tr.dataset.n).includes(q)) && (!cat || tr.dataset.g === cat) && (!pend || !contado(tr));
+      tr.style.display = ver ? '' : 'none'; visibles += ver;
+    });
+    $$('tr.grupo', m.el).forEach(g => { g.style.display = $$(`tr.art[data-g="${g.dataset.g}"]`, m.el).some(tr => tr.style.display !== 'none') ? '' : 'none'; });
+    $('.inv-vacio', m.el).hidden = visibles > 0;
+  };
+  const avance = () => {
+    const todas = $$('tr.art', m.el);
+    $$('tr.grupo', m.el).forEach(g => { const t = todas.filter(tr => tr.dataset.g === g.dataset.g); $('.g-avance', g).textContent = `· ${t.filter(contado).length} de ${t.length} contados`; });
+    $('.inv-avance', m.el).textContent = `${todas.filter(contado).length} de ${todas.length} contados`;
+  };
+  $('.inv-q', m.el).addEventListener('input', filtrar);
+  $('.inv-cat', m.el).addEventListener('change', filtrar);
+  $('.inv-pend', m.el)?.addEventListener('change', filtrar);
+  avance();
   if (!abierto) return;
+  $('tbody', m.el).addEventListener('change', avance);
   const pinta = tr => {
     const n = aNum($('.c', tr).value), d = $('.dif', tr);
     if (n === null || Number.isNaN(n)) { d.textContent = ''; return; }
@@ -912,8 +1057,8 @@ async function abrirInventario(id) {
     d.textContent = (x > 0 ? '+' : '') + fCant(x);
     d.className = 'n dif ' + (x > 0 ? 'pos' : x < 0 ? 'neg' : '');
   };
-  $$('tbody tr', m.el).forEach(tr => { pinta(tr); tr.addEventListener('input', () => pinta(tr)); });
-  const leer = () => $$('tbody tr', m.el).map(tr => {
+  $$('tr.art', m.el).forEach(tr => { pinta(tr); tr.addEventListener('input', () => pinta(tr)); });
+  const leer = () => $$('tr.art', m.el).map(tr => {
     const n = aNum($('.c', tr).value);
     if (Number.isNaN(n)) throw new Error('Hay un conteo que no es un número válido.');
     return { articulo_id: Number(tr.dataset.a), conteo: n };

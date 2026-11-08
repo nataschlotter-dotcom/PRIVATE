@@ -78,6 +78,28 @@ a { color: inherit; }
 .filtros input, .filtros select { min-width: 130px; }
 .filtros label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--tinta); padding-bottom: 8px; }
 .filtros label.check input { min-width: 0; }
+.cp-paso { display: flex; gap: 10px; align-items: flex-start; }
+.cp-paso .filtros { flex: 1; }
+.cp-num { flex: none; width: 24px; height: 24px; border-radius: 50%; background: var(--marca); color: #fff; font-size: 12.5px; font-weight: 600; display: grid; place-items: center; margin-top: 18px; }
+.conteo-panel .cp-motivo { flex: 1; min-width: 200px; }
+.conteo-panel .cp-motivo input { width: 100%; }
+.conteo-panel select:disabled, .conteo-panel input:disabled { opacity: .55; cursor: not-allowed; }
+.conteo-panel .cp-buscar { flex: 1; min-width: 220px; }
+.conteo-panel .cp-buscar input { width: 100%; }
+.cp-estado { padding-bottom: 8px; margin-left: auto; }
+.cp-cats-barra { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.cp-cats { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.chip { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--borde); border-radius: 999px; padding: 4px 10px; font-size: 13px; cursor: pointer; background: var(--superficie); user-select: none; }
+.chip input { margin: 0; }
+.chip small { color: var(--tinta-2); font-size: 11px; }
+.chip.activo { background: var(--celeste); border-color: var(--celeste-borde); color: var(--celeste-tinta); }
+.aviso-linea { background: #fff4e0; color: var(--alerta); border-radius: 6px; padding: 8px 10px; }
+.cat-lista { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 2px 12px; max-height: 260px; overflow-y: auto; border: 1px solid var(--borde); border-radius: 6px; padding: 6px 8px; }
+.cat-item { display: flex; align-items: baseline; gap: 6px; padding: 3px 0; font-size: 13.5px; cursor: pointer; }
+.cat-item small { margin-left: auto; white-space: nowrap; font-size: 11.5px; }
+.cat-q { min-width: 200px; flex: 1; }
+.inv-filtros { align-items: end; }
+.inv-avance { padding-bottom: 8px; margin-left: auto; }
 
 /* Controles */
 input, select, textarea { border: 1px solid #b9bcc0; border-radius: 6px; padding: 7px 9px; background: #fff; width: 100%; color: var(--tinta); }

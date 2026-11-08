@@ -133,7 +133,7 @@ CREATE TABLE IF NOT EXISTS salidas_tienda(id INTEGER PRIMARY KEY, fecha TEXT NOT
 CREATE TABLE IF NOT EXISTS pos_consumos(id INTEGER PRIMARY KEY, referencia TEXT NOT NULL UNIQUE, tienda_id INTEGER NOT NULL REFERENCES tiendas(id),
   fecha TEXT NOT NULL, detalle TEXT NOT NULL DEFAULT '', estado TEXT NOT NULL DEFAULT 'VIGENTE', creado TEXT NOT NULL, anulado TEXT);
 CREATE TABLE IF NOT EXISTS inventarios(id INTEGER PRIMARY KEY, fecha TEXT NOT NULL, bodega_id INTEGER NOT NULL, estado TEXT NOT NULL DEFAULT 'ABIERTO',
-  obs TEXT NOT NULL DEFAULT '', usuario_id INTEGER REFERENCES usuarios(id), cerrado TEXT, seccion TEXT NOT NULL DEFAULT '');
+  obs TEXT NOT NULL DEFAULT '', usuario_id INTEGER REFERENCES usuarios(id), cerrado TEXT, seccion TEXT NOT NULL DEFAULT '', categorias TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS pos_transferencias(id INTEGER PRIMARY KEY, referencia TEXT NOT NULL UNIQUE, tipo TEXT NOT NULL CHECK(tipo IN ('SALIDA','ENTRADA')),
   tienda_id INTEGER NOT NULL REFERENCES tiendas(id), contraparte_id INTEGER REFERENCES tiendas(id), fecha TEXT NOT NULL, detalle TEXT NOT NULL DEFAULT '',
   estado TEXT NOT NULL DEFAULT 'VIGENTE', creado TEXT NOT NULL, anulado TEXT);
@@ -505,7 +505,7 @@ def anular(db, uid, tabla, doc_tipo, doc_id):
 def articulos_de_bodega(db, bodega, seccion=""):
     filtro = f"AND {SECCIONES[seccion]}" if seccion else "" if bodega == CENTRAL else "AND (a.tipo='PRODUCTO' OR a.desechable=1)"
     return rows(db, f"""SELECT a.id articulo_id, a.codigo, a.nombre, a.tipo, a.desechable, a.stock_minimo, a.precio, a.costo,
-        c.punto_venta, c.nombre categoria, u.abreviatura unidad, COALESCE(s.cantidad,0) cantidad
+        c.punto_venta, c.id categoria_id, c.nombre categoria, u.abreviatura unidad, COALESCE(s.cantidad,0) cantidad
         FROM articulos a JOIN categorias c ON c.id=a.categoria_id JOIN unidades u ON u.id=a.unidad_id
         LEFT JOIN stock s ON s.articulo_id=a.id AND s.bodega_id=?
         WHERE a.activo=1 {filtro} ORDER BY a.tipo, a.nombre""", bodega)
@@ -2477,12 +2477,29 @@ def mermas_anular(c, i):
 @ruta("GET", "/api/inventarios", "inventario")
 def inventarios_lista(c):
     propia = c.user.get("tienda_id")
-    return rows(c.db, f"""SELECT i.*, COALESCE(t.nombre,'Bodega central') bodega, u.nombre usuario,
+    out = rows(c.db, f"""SELECT i.*, COALESCE(t.nombre,'Bodega central') bodega, u.nombre usuario,
         (SELECT COUNT(*) FROM inventario_items x WHERE x.inventario_id=i.id) lineas,
         (SELECT COUNT(*) FROM inventario_items x WHERE x.inventario_id=i.id AND x.conteo IS NOT NULL) contadas,
         (SELECT COUNT(*) FROM inventario_items x WHERE x.inventario_id=i.id AND ABS(COALESCE(x.diferencia,0))>0) con_diferencia
         FROM inventarios i LEFT JOIN tiendas t ON t.id=i.bodega_id LEFT JOIN usuarios u ON u.id=i.usuario_id
         {'WHERE i.bodega_id=' + str(int(propia)) if propia else ''} ORDER BY i.id DESC LIMIT 200""")
+    nombres = {r["id"]: r["nombre"] for r in rows(c.db, "SELECT id, nombre FROM categorias")}
+    for r in out:
+        r["categorias_nombres"] = categorias_de_toma(r, nombres)
+    return out
+
+
+def categorias_de_toma(inv, nombres):
+    """Nombres de las categorías elegidas para la toma; lista vacía = todas."""
+    ids = json.loads(inv.get("categorias") or "[]")
+    return sorted((nombres.get(i, f"#{i}") for i in ids), key=str.lower)
+
+
+def articulos_para_toma(db, bodega, seccion, categorias=None):
+    arts = articulos_de_bodega(db, bodega, seccion)
+    if categorias:
+        arts = [a for a in arts if a["categoria_id"] in categorias]
+    return arts
 
 
 def inventario_de(c, i):
@@ -2492,12 +2509,35 @@ def inventario_de(c, i):
     return inv
 
 
+@ruta("GET", "/api/inventarios/categorias", "inventario")
+def inventarios_categorias(c):
+    """Categorías con artículos en la bodega (y sección) elegida, para armar una toma por categorías."""
+    bodega = c.bodega(c.q.get("bodega_id"))
+    seccion = (c.q.get("seccion") or "") if bodega == CENTRAL else ""
+    if seccion and seccion not in SECCIONES:
+        raise ApiError(400, "Sección de bodega no válida.")
+    cats = {}
+    for a in articulos_de_bodega(c.db, bodega, seccion):
+        x = cats.setdefault(a["categoria_id"], {"id": a["categoria_id"], "nombre": a["categoria"], "articulos": 0, "con_stock": 0})
+        x["articulos"] += 1
+        x["con_stock"] += 1 if a["cantidad"] else 0
+    return sorted(cats.values(), key=lambda x: x["nombre"].lower())
+
+
+@ruta("GET", "/api/inventarios/articulos", "inventario")
+def inventarios_articulos(c):
+    """Artículos contables de una bodega con su stock y categoría, para contar antes de que exista la toma."""
+    return articulos_de_bodega(c.db, c.bodega(c.q.get("bodega_id")))
+
+
 @ruta("GET", r"/api/inventarios/(\d+)", "inventario")
 def inventarios_detalle(c, i):
     inv = inventario_de(c, i)
-    inv["items"] = rows(c.db, """SELECT x.*, a.codigo, a.nombre, a.tipo, a.desechable, a.costo, u.abreviatura unidad, COALESCE(s.cantidad,0) stock_actual
-        FROM inventario_items x JOIN articulos a ON a.id=x.articulo_id JOIN unidades u ON u.id=a.unidad_id
-        LEFT JOIN stock s ON s.articulo_id=a.id AND s.bodega_id=? WHERE x.inventario_id=? ORDER BY a.tipo, a.nombre""", inv["bodega_id"], int(i))
+    inv["categorias_nombres"] = categorias_de_toma(inv, {r["id"]: r["nombre"] for r in rows(c.db, "SELECT id, nombre FROM categorias")})
+    inv["items"] = rows(c.db, """SELECT x.*, a.codigo, a.nombre, a.tipo, a.desechable, a.costo, u.abreviatura unidad, COALESCE(s.cantidad,0) stock_actual,
+        ca.id categoria_id, ca.nombre categoria, ca.punto_venta
+        FROM inventario_items x JOIN articulos a ON a.id=x.articulo_id JOIN unidades u ON u.id=a.unidad_id JOIN categorias ca ON ca.id=a.categoria_id
+        LEFT JOIN stock s ON s.articulo_id=a.id AND s.bodega_id=? WHERE x.inventario_id=? ORDER BY ca.nombre COLLATE NOCASE, a.nombre COLLATE NOCASE""", inv["bodega_id"], int(i))
     return inv
 
 
@@ -2507,11 +2547,25 @@ def inventarios_crear(c):
     seccion = (c.body.get("seccion") or "") if bodega == CENTRAL else ""
     if seccion and seccion not in SECCIONES:
         raise ApiError(400, "Sección de bodega no válida.")
-    if row(c.db, "SELECT id FROM inventarios WHERE bodega_id=? AND estado='ABIERTO' AND (seccion=? OR seccion='' OR ?='')", bodega, seccion, seccion):
+    cats = c.body.get("categorias") or []
+    if not isinstance(cats, list):
+        raise ApiError(400, "Las categorías no son válidas.")
+    cats = sorted({entero(x, "la categoría") for x in cats})
+    arts = articulos_para_toma(c.db, bodega, seccion, cats)
+    if cats and not arts:
+        raise ApiError(400, "Las categorías elegidas no tienen artículos en esta bodega.")
+    if cats:
+        # Una toma por categorías puede convivir con otras de la misma bodega, siempre que no repitan artículos.
+        choque = row(c.db, f"""SELECT a.nombre, x.inventario_id FROM inventario_items x JOIN inventarios i ON i.id=x.inventario_id JOIN articulos a ON a.id=x.articulo_id
+            WHERE i.bodega_id=? AND i.estado='ABIERTO' AND x.articulo_id IN ({','.join('?' * len(arts))}) LIMIT 1""", bodega, *[a["articulo_id"] for a in arts])
+        if choque:
+            raise ApiError(409, f"{choque['nombre']} ya está en la toma abierta #{choque['inventario_id']}. Ciérrala o elige otras categorías.")
+    elif row(c.db, "SELECT id FROM inventarios WHERE bodega_id=? AND estado='ABIERTO' AND (seccion=? OR seccion='' OR ?='')", bodega, seccion, seccion):
         raise ApiError(409, "Esta bodega ya tiene una toma de inventario abierta.")
-    iid = c.db.execute("INSERT INTO inventarios(fecha,bodega_id,seccion,obs,usuario_id) VALUES(?,?,?,?,?)",
-                       (fecha_valida(c.body.get("fecha")), bodega, seccion, txt(c.body.get("obs"), "La observación", False, 500), c.uid)).lastrowid
-    for a in articulos_de_bodega(c.db, bodega, seccion):
+    iid = c.db.execute("INSERT INTO inventarios(fecha,bodega_id,seccion,categorias,obs,usuario_id) VALUES(?,?,?,?,?,?)",
+                       (fecha_valida(c.body.get("fecha")), bodega, seccion, json.dumps(cats) if cats else "",
+                        txt(c.body.get("obs"), "La observación", False, 500), c.uid)).lastrowid
+    for a in arts:
         c.db.execute("INSERT INTO inventario_items(inventario_id,articulo_id,stock_sistema) VALUES(?,?,?)", (iid, a["articulo_id"], a["cantidad"]))
     return {"id": iid}
 
@@ -2528,6 +2582,10 @@ def inventarios_guardar(c, i):
     inv = inventario_de(c, i)
     if inv["estado"] != "ABIERTO":
         raise ApiError(409, "La toma ya está cerrada.")
+    if "fecha" in c.body:
+        c.db.execute("UPDATE inventarios SET fecha=? WHERE id=?", (fecha_valida(c.body.get("fecha")), inv["id"]))
+    if "obs" in c.body:
+        c.db.execute("UPDATE inventarios SET obs=? WHERE id=?", (txt(c.body.get("obs"), "El motivo", False, 500), inv["id"]))
     guardar_conteos(c, inv["id"])
     return {"ok": True}
 
@@ -2541,7 +2599,7 @@ def inventarios_cerrar(c, i):
     contados = rows(c.db, "SELECT * FROM inventario_items WHERE inventario_id=? AND conteo IS NOT NULL", inv["id"])
     if not contados:
         raise ApiError(400, "Ingresa al menos un conteo antes de cerrar.")
-    hoy = date.today().isoformat()
+    hoy = inv["fecha"] or date.today().isoformat()  # el ajuste queda con la fecha de la toma
     for x in contados:
         # La diferencia se calcula contra el stock al cierre, por si hubo movimientos durante el conteo.
         actual = stock_de(c.db, inv["bodega_id"], x["articulo_id"])
@@ -2783,6 +2841,8 @@ def sembrar(db):
     db.executescript(SCHEMA)
     if "seccion" not in [col[1] for col in db.execute("PRAGMA table_info(inventarios)")]:  # bases creadas antes de las secciones
         db.execute("ALTER TABLE inventarios ADD COLUMN seccion TEXT NOT NULL DEFAULT ''")
+    if "categorias" not in [col[1] for col in db.execute("PRAGMA table_info(inventarios)")]:  # tomas por categorías: JSON con ids; '' = todas
+        db.execute("ALTER TABLE inventarios ADD COLUMN categorias TEXT NOT NULL DEFAULT ''")
     if "tipo_documento" not in [col[1] for col in db.execute("PRAGMA table_info(compras)")]:  # las compras anteriores quedan sin tipo: no se sabe cuál era
         db.execute("ALTER TABLE compras ADD COLUMN tipo_documento TEXT NOT NULL DEFAULT ''")
     if "stock_modo" not in [col[1] for col in db.execute("PRAGMA table_info(fudo_tiendas)")]:  # SISTEMA: suma por API; MANUAL: se carga en el detalle del gasto en Fudo
