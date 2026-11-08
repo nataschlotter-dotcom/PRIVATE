@@ -70,10 +70,14 @@ a { color: inherit; }
 .pestanas button { background: rgba(255,255,255,.12); color: #fff; border: 0; padding: 7px 12px; border-radius: 6px; cursor: pointer; }
 .pestanas button:hover { background: rgba(255,255,255,.2); }
 .pestanas button.activo { background: var(--celeste); color: var(--celeste-tinta); font-weight: 700; }
+.modal .pestanas button:not(.activo) { background: var(--suave); color: var(--tinta); border: 1px solid var(--borde); }
+.modal .pestanas button:not(.activo):hover { background: var(--celeste-claro); }
 .filtros { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; margin-bottom: 12px; }
 .filtros label { font-size: 12px; color: var(--tinta-2); display: grid; gap: 2px; }
 .filtros.sobre-gris label { color: #e9eaea; }
 .filtros input, .filtros select { min-width: 130px; }
+.filtros label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--tinta); padding-bottom: 8px; }
+.filtros label.check input { min-width: 0; }
 
 /* Controles */
 input, select, textarea { border: 1px solid #b9bcc0; border-radius: 6px; padding: 7px 9px; background: #fff; width: 100%; color: var(--tinta); }
@@ -103,6 +107,12 @@ tbody tr:hover td { background: #fafaf9; }
 .n { text-align: right; white-space: nowrap; }
 tfoot td { font-weight: 600; border-top: 2px solid var(--borde); border-bottom: 0; }
 .vacio { text-align: center; color: var(--tinta-2); padding: 24px 8px; }
+tr.grupo td { background: var(--celeste-claro); color: var(--celeste-tinta); font-weight: 600; border-bottom: 1px solid var(--celeste); }
+tbody tr.grupo:hover td { background: var(--celeste-claro); }
+.stock-tiendas td.cero { color: #b5b8bb; }
+.stock-tiendas th.n, .stock-tiendas td.n { min-width: 84px; }
+.stock-tiendas tbody tr:not(.grupo) td:nth-child(2) { min-width: 220px; }
+.stock-tiendas td.total, .stock-tiendas th.total { background: var(--suave); }
 .conteo { color: var(--tinta-2); font-size: 12px; margin-top: 6px; }
 .etq { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 12px; background: #eceded; white-space: nowrap; }
 .etq.bien { background: #e0f0e6; color: #1d5c37; }

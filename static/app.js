@@ -9,6 +9,7 @@ const TIPOS_MOV = {
   RECEPCION_TIENDA: ['Recepción en tienda', 'bien'], MERMA: ['Merma', 'mal'], INVENTARIO: ['Toma de inventario', 'dorada'], VENTA: ['Venta', ''],
   CONSUMO_INTERNO: ['Consumo interno', ''], ANULACION: ['Anulación', 'alerta'], AJUSTE_ADMIN: ['Actualización de stock', 'dorada'], DEVOLUCION_PROVEEDOR: ['Devolución a proveedor', 'alerta'],
   DEVOLUCION_TIENDA: ['Devolución de tienda', 'alerta'], RECEPCION_CENTRAL: ['Recepción en central', 'bien'], CONSUMO_CENTRAL: ['Consumo interno central', ''],
+  VENTA_FUDO: ['Ventas en Fudo', ''], TRANSFERENCIA_SALIDA: ['Transferencia enviada a otra tienda', ''], TRANSFERENCIA_ENTRADA: ['Transferencia recibida de otra tienda', 'bien'],
 };
 const NAV = [
   ['', [['panel', 'Panel de inicio']]],
@@ -26,6 +27,7 @@ const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': 
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const can = (m, n = 1) => (S.usuario?.permisos?.[m] || 0) >= n;
+const puede = a => !!S.usuario?.permisos?.['acc_' + a];  // acciones críticas (anular, eliminar, Fudo, respaldo)
 const hoy = () => { const d = new Date(); return new Date(d - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10); };
 const haceDias = n => { const d = new Date(Date.now() - n * 864e5); return new Date(d - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10); };
 const fFecha = f => f ? `${f.slice(8, 10)}-${f.slice(5, 7)}-${f.slice(0, 4)}${f.length > 10 ? ' ' + f.slice(11, 16) : ''}` : '';
@@ -102,6 +104,17 @@ document.addEventListener('mousemove', e => {
 });
 
 /* ---------- tabla genérica ---------- */
+function bajarCsv(nombre, filas) {
+  const celda = v => {
+    if (typeof v === 'number') return String(Math.round(v * 100000) / 100000).replace('.', ',');
+    let s = String(v ?? '');
+    if (/^[=+\-@]/.test(s)) s = "'" + s;
+    return `"${s.replace(/"/g, '""')}"`;
+  };
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob(['﻿' + filas.map(f => f.map(celda).join(';')).join('\r\n')], { type: 'text/csv;charset=utf-8' }));
+  a.download = nombre + '.csv'; a.click(); URL.revokeObjectURL(a.href);
+}
 function tabla(caja, cfg) {
   let q = '', orden = null, dir = 1;
   const valor = (c, r) => c.v ? c.v(r) : '';
@@ -130,16 +143,7 @@ function tabla(caja, cfg) {
   $('.buscar', caja)?.addEventListener('input', e => { q = e.target.value; dibujar(); });
   $('.csv', caja)?.addEventListener('click', () => {
     const cols = cfg.cols.filter(c => c.v);
-    const celda = v => {
-      if (typeof v === 'number') return String(Math.round(v * 100000) / 100000).replace('.', ',');
-      let s = String(v ?? '');
-      if (/^[=+\-@]/.test(s)) s = "'" + s;
-      return `"${s.replace(/"/g, '""')}"`;
-    };
-    const lineas = [cols.map(c => celda(c.t)).join(';'), ...cfg.filas.map(r => cols.map(c => celda(valor(c, r))).join(';'))];
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob(['﻿' + lineas.join('\r\n')], { type: 'text/csv;charset=utf-8' }));
-    a.download = cfg.csv + '.csv'; a.click(); URL.revokeObjectURL(a.href);
+    bajarCsv(cfg.csv, [cols.map(c => c.t), ...cfg.filas.map(r => cols.map(c => valor(c, r)))]);
   });
   caja.addEventListener('click', e => {
     const th = e.target.closest('th.ordenable');
@@ -489,7 +493,7 @@ Vistas.compras = async v => {
       { t: 'N°', v: r => r.id }, { t: 'Fecha', v: r => r.fecha, h: r => fFecha(r.fecha) }, { t: 'Proveedor', v: r => r.proveedor }, { t: 'RUT', v: r => r.rut }, { t: 'Tipo', v: r => TIPOS_DOC[r.tipo_documento] || '—' }, { t: 'Documento', v: r => r.documento },
       { t: 'Neto', n: 1, v: r => r.neto, h: r => fPeso(r.neto) }, { t: 'IVA', n: 1, v: r => r.iva, h: r => fPeso(r.iva) }, { t: 'Total', n: 1, v: r => r.total, h: r => fPeso(r.total) },
       { t: 'Estado', v: r => r.estado, h: r => r.estado === 'ANULADO' ? etq('Anulada', 'mal') : etq('Vigente', 'bien') },
-      { t: '', h: r => `<div class="acciones">${accion('ver', 'Ver')}${r.estado !== 'ANULADO' && can('compras', 2) ? accion('anular', 'Anular', 'peligro') : ''}</div>` }] });
+      { t: '', h: r => `<div class="acciones">${accion('ver', 'Ver')}${r.estado !== 'ANULADO' && can('compras', 2) && puede('anular_compras') ? accion('anular', 'Anular', 'peligro') : ''}</div>` }] });
     $('#nueva', v)?.addEventListener('click', nuevaCompra);
   } else if (t === 'proveedores') {
     const filas = await api('GET', '/proveedores');
@@ -546,30 +550,215 @@ Vistas.fudo = async v => {
   if (!can('config', 2)) { v.innerHTML = cabecera('Integración Fudo') + '<div class="tarjeta">Tu perfil solo puede ver esta sección con permiso de edición en Configuración.</div>'; return; }
   const filas = await api('GET', '/fudo');
   v.innerHTML = cabecera('Integración Fudo', 'Cada tienda se conecta con su propia cuenta de Fudo. Las guías se envían como gastos desde Despachos a tiendas.');
+  if (filas.some(r => r.comparte_con)) v.insertAdjacentHTML('beforeend', '<div class="tarjeta"><p class="error"><b>Hay tiendas conectadas a la misma cuenta Fudo.</b> Fudo lleva el stock por cuenta, así que cada tienda debe usar la API Key y API Secret de su propia cuenta. Mientras tanto, el envío de guías y las operaciones de stock de esas tiendas están bloqueados.</p></div>');
   const c = v.appendChild(Object.assign(document.createElement('div'), { className: 'tarjeta' }));
   const ajustes = async r => {
     const l = await api('POST', `/fudo/${r.tienda_id}/probar`, {});
     formulario(`Gastos de ${r.nombre}`, [
       { k: 'categoria_id', t: 'Categoría de gasto en Fudo', tipo: 'select', op: l.categorias, vacio: 'Selecciona…', todo: 1 },
-      { k: 'proveedor_id', t: 'Proveedor en Fudo', tipo: 'select', op: l.proveedores, vacio: 'Sin proveedor', todo: 1 },
-      { k: 'monto', t: 'Monto del gasto', tipo: 'select', op: [{ id: 'TOTAL', nombre: 'Total de la guía, con IVA' }, { id: 'NETO', nombre: 'Neto de la guía, sin IVA' }], todo: 1 }], r, async d => {
-      await api('PUT', `/fudo/${r.tienda_id}/gastos`, { ...d, categoria: l.categorias.find(x => x.id === d.categoria_id)?.nombre || '', proveedor: l.proveedores.find(x => x.id === d.proveedor_id)?.nombre || '' });
+      { k: 'monto', t: 'Monto del gasto', tipo: 'select', op: [{ id: 'TOTAL', nombre: 'Total de la guía, con IVA' }, { id: 'NETO', nombre: 'Neto de la guía, sin IVA' }], todo: 1,
+        ayuda: 'El gasto se registra con el proveedor "Nata & Schlott" (se crea en Fudo si no existe), pagado en Efectivo con la fecha de la guía.' },
+      { k: 'stock_modo', t: 'Stock de los insumos en Fudo', tipo: 'select', todo: 1, op: [
+        { id: 'SISTEMA', nombre: 'Lo suma el sistema automáticamente' },
+        { id: 'MANUAL', nombre: 'Lo cargo yo en el detalle del gasto en Fudo' }],
+        ayuda: 'Con "Lo cargo yo", el sistema no toca el stock de Fudo: abre el gasto GD-… en Fudo y carga su detalle de insumos (Fudo registra "Detalle de gasto creado"). El sistema igual cuenta esas cantidades para calcular el consumo por ventas.' }], r, async d => {
+      await api('PUT', `/fudo/${r.tienda_id}/gastos`, { ...d, categoria: l.categorias.find(x => x.id === d.categoria_id)?.nombre || '', proveedor_id: r.proveedor_id, proveedor: r.proveedor });
       aviso('Conexión con Fudo lista.'); render();
     }, 'Guardar');
   };
   const credenciales = r => formulario(`Conectar ${r.nombre} con Fudo`, [
     { k: 'api_key', t: 'API Key', auto: 'off', todo: 1, ayuda: r.key_final ? `Guardada, termina en ${r.key_final}. Déjala en blanco para mantenerla.` : 'En Fudo: Administración → Usuarios.' },
-    { k: 'api_secret', t: 'API Secret', tipo: 'password', auto: 'new-password', todo: 1, ayuda: r.conectada ? 'Guardada. Déjala en blanco para mantenerla.' : 'Se guarda en este sistema y no vuelve a mostrarse.' }], {}, async d => {
+    { k: 'api_secret', t: 'API Secret', tipo: 'password', auto: 'new-password', todo: 1, ayuda: r.conectada ? 'Guardada. Déjala en blanco para mantenerla.' : 'Se guarda en este sistema y no vuelve a mostrarse.' },
+    ...(r.equivalencias ? [{ k: 'reiniciar_equivalencias', t: `Si es otra cuenta Fudo, borrar las ${r.equivalencias} equivalencias de esta tienda (apuntan a la cuenta anterior)`, tipo: 'check', todo: 1 }] : [])], {}, async d => {
     await api('PUT', `/fudo/${r.tienda_id}/credenciales`, d);
     await ajustes(r);
     render();
   }, 'Guardar y probar');
-  tabla(c, { filas, vacio: 'Aún no hay tiendas.', acciones: { conectar: credenciales, ajustes: r => ajustes(r).catch(x => aviso(x.message, 1)) }, cols: [
+  tabla(c, { filas, vacio: 'Aún no hay tiendas.', acciones: { conectar: credenciales, ajustes: r => ajustes(r).catch(x => aviso(x.message, 1)), insumos: r => fudoInsumos(r) }, cols: [
     { t: 'Tienda', v: r => r.nombre },
-    { t: 'Conexión', v: r => r.conectada, h: r => r.conectada && r.categoria_id ? etq('Lista', 'bien') : r.conectada ? etq('Falta categoría', 'alerta') : etq('Sin conectar') },
+    { t: 'Conexión', v: r => r.conectada, h: r => (r.conectada && r.categoria_id ? etq('Lista', 'bien') : r.conectada ? etq('Falta categoría', 'alerta') : etq('Sin conectar')) +
+      (r.comparte_con ? ' ' + etq(`Misma cuenta que ${r.comparte_con}`, 'mal') : '') },
     { t: 'Categoría de gasto', v: r => r.categoria }, { t: 'Proveedor', v: r => r.proveedor }, { t: 'Monto', v: r => r.conectada ? (r.monto === 'NETO' ? 'Neto' : 'Total') : '' },
-    { t: '', h: r => `<div class="acciones">${accion('conectar', r.conectada ? 'Cambiar credenciales' : 'Conectar')}${r.conectada ? accion('ajustes', 'Ajustar gastos') : ''}</div>` }] });
+    { t: '', h: r => `<div class="acciones">${accion('conectar', r.conectada ? 'Cambiar credenciales' : 'Conectar')}${r.conectada ? accion('ajustes', 'Ajustar gastos') + accion('insumos', 'Insumos y stock') : ''}</div>` }] });
 };
+
+/* Insumos de Fudo equivalentes a los del sistema, por tienda: comparar stock, descontar ventas y sumar despachos */
+function fudoInsumos(t) {
+  const m = modal(`Insumos y stock Fudo · ${t.nombre}`, '<div class="pf-tabs"></div><div class="pf-cuerpo"></div>', true);
+  let pest = 'importar';
+  const cuerpo = $('.pf-cuerpo', m.el);
+  const articulos = () => S.cat.articulos.filter(a => a.activo !== 0 && (a.tipo === 'PRODUCTO' || a.desechable))
+    .map(a => ({ id: a.id, nombre: `${a.codigo} · ${a.nombre} (${a.unidad})` }));
+  const ir = async k => {
+    pest = k;
+    $('.pf-tabs', m.el).replaceChildren(pestanas([['importar', 'Importar desde Fudo'], ['equiv', 'Equivalencias'], ['comparar', 'Comparar y sincronizar'], ['hist', 'Sincronizaciones']], pest, ir));
+    cuerpo.innerHTML = '<p class="tenue">Cargando…</p>';
+    try { await VISTAS_FUDO[k](); } catch (x) { cuerpo.innerHTML = `<p class="error">${esc(x.message)}</p>`; }
+  };
+  const VISTAS_FUDO = {
+    async importar() {
+      const ings = await api('GET', `/fudo/${t.tienda_id}/importar`);
+      const pend = ings.filter(i => !i.equivalencia);
+      const creaArt = can('articulos', 2);
+      const arts = articulos();
+      const GRUPOS = [['PRODUCTO', 'Producto'], ['PUNTO_VENTA', 'Insumo punto de venta'], ['DESECHABLE', 'Desechable / aseo']];
+      const catsDe = g => S.cat.categorias.filter(c => g === 'PRODUCTO' ? c.de_productos : !c.de_productos && (g === 'PUNTO_VENTA' ? c.punto_venta : !c.punto_venta));
+      const fila = (i, k) => `<tr data-k="${k}">
+        <td class="c"><input type="checkbox" class="im-sel" aria-label="Importar ${esc(i.nombre)}" ${i.stock === null ? 'disabled' : ''}></td>
+        <td><b>${esc(i.nombre)}</b><br><small class="tenue">${esc(i.unidad || '—')} · stock ${i.stock === null ? 'sin control' : fCant(i.stock)}</small></td>
+        <td><select class="im-dest" aria-label="Artículo del sistema para ${esc(i.nombre)}">
+          ${creaArt ? '<option value="nuevo">➕ Crear artículo nuevo</option>' : ''}<option value="">Selecciona artículo existente…</option>
+          ${arts.map(a => `<option value="${a.id}" ${a.id === i.sugerido_id ? 'selected' : ''}>${esc(a.nombre)}</option>`).join('')}</select>
+          ${i.sugerido_id ? `<small class="tenue">Sugerido por nombre (${Math.round(i.parecido * 100)}% parecido)</small>` : ''}
+          <div class="im-nuevo filtros" style="margin-top:6px">
+            <select class="im-grupo" aria-label="Grupo">${GRUPOS.map(([v, n]) => `<option value="${v}" ${v === 'PUNTO_VENTA' ? 'selected' : ''}>${n}</option>`).join('')}</select>
+            <select class="im-cat" aria-label="Categoría"></select>
+            <select class="im-uni" aria-label="Unidad">${opciones(S.cat.unidades.map(u => ({ id: u.id, nombre: `${u.nombre} (${u.abreviatura})` })), i.unidad_id, 'Unidad…')}</select>
+            <input class="im-nom" value="${esc(i.nombre.replace(/^(IN|IPV|IDA)\s+/i, ''))}" aria-label="Nombre en el sistema" style="min-width:180px"></div></td>
+        <td><input class="im-fac" value="1" inputmode="decimal" aria-label="Equivalencia" style="width:80px"><br><small class="tenue">del sistema por 1 ${esc(i.unidad || 'un')}</small></td></tr>`;
+      cuerpo.innerHTML = `<p class="nota">Estos son los insumos de la cuenta Fudo de ${esc(t.nombre)} que aún no tienen equivalencia (${pend.length} de ${ings.length}).
+        Marca los que quieres traer y elige, para cada uno, el artículo del sistema que le corresponde o <b>crea uno nuevo</b> con los datos de Fudo.
+        Al importar, el stock actual de Fudo queda como punto de partida.${creaArt ? '' : ' Tu perfil no puede crear artículos: solo asociar existentes.'}</p>
+        ${pend.length ? `<div class="filtros"><input type="search" class="im-buscar" placeholder="Buscar insumo de Fudo…" aria-label="Buscar insumo de Fudo">
+          <button type="button" class="btn im-todos">Marcar todos</button><button type="button" class="btn im-ninguno">Desmarcar</button>
+          <button type="button" class="btn primario im-ok">Importar seleccionados</button></div>
+          ${creaArt ? `<div class="filtros"><span class="tenue">Para los marcados que se crearán nuevos:</span>
+            <select class="lote-grupo" aria-label="Grupo para los marcados">${GRUPOS.map(([v, n]) => `<option value="${v}" ${v === 'PUNTO_VENTA' ? 'selected' : ''}>${n}</option>`).join('')}</select>
+            <select class="lote-cat" aria-label="Categoría para los marcados"></select>
+            <button type="button" class="btn lote-ok">Aplicar a marcados</button></div>` : ''}
+          <div class="tabla-marco"><table><thead><tr><th></th><th>Insumo en Fudo</th><th>Artículo del sistema</th><th>Equivalencia</th></tr></thead><tbody>
+          ${pend.map(fila).join('')}</tbody></table></div>` : '<p class="tenue">Todos los insumos de Fudo de esta tienda ya tienen equivalencia.</p>'}`;
+      const ajustar = tr => {
+        const nuevo = $('.im-dest', tr).value === 'nuevo';
+        $('.im-nuevo', tr).style.display = nuevo ? '' : 'none';  // .filtros usa display:flex, que anula el atributo hidden
+        const g = $('.im-grupo', tr).value, cat = $('.im-cat', tr), previo = cat.value;
+        cat.innerHTML = opciones(catsDe(g), previo, 'Categoría…');
+      };
+      $$('tbody tr', cuerpo).forEach(tr => {
+        if (!$('.im-dest', tr).value && creaArt && !pend[tr.dataset.k].sugerido_id) $('.im-dest', tr).value = 'nuevo';
+        ajustar(tr);
+        tr.addEventListener('change', e => { if (e.target.matches('.im-dest, .im-grupo')) ajustar(tr); if (!e.target.matches('.im-sel')) { const s = $('.im-sel', tr); if (!s.disabled) s.checked = true; } });
+      });
+      $('.im-buscar', cuerpo)?.addEventListener('input', e => { const q = e.target.value.toLowerCase(); $$('tbody tr', cuerpo).forEach(tr => { tr.hidden = !pend[tr.dataset.k].nombre.toLowerCase().includes(q); }); });
+      $('.im-todos', cuerpo)?.addEventListener('click', () => $$('tbody tr:not([hidden]) .im-sel:not(:disabled)', cuerpo).forEach(s => { s.checked = true; }));
+      $('.im-ninguno', cuerpo)?.addEventListener('click', () => $$('.im-sel', cuerpo).forEach(s => { s.checked = false; }));
+      const loteCats = () => { const g = $('.lote-grupo', cuerpo); if (g) $('.lote-cat', cuerpo).innerHTML = opciones(catsDe(g.value), '', 'Categoría…'); };
+      $('.lote-grupo', cuerpo)?.addEventListener('change', loteCats);
+      loteCats();
+      $('.lote-ok', cuerpo)?.addEventListener('click', () => {
+        const g = $('.lote-grupo', cuerpo).value, cat = $('.lote-cat', cuerpo).value;
+        if (!cat) return aviso('Elige la categoría a aplicar.', 1);
+        let n = 0;
+        $$('tbody tr', cuerpo).filter(tr => $('.im-sel', tr).checked && $('.im-dest', tr).value === 'nuevo').forEach(tr => {
+          $('.im-grupo', tr).value = g; ajustar(tr); $('.im-cat', tr).value = cat; n++;
+        });
+        aviso(n ? `Grupo y categoría aplicados a ${n} insumo(s) marcados para crear.` : 'No hay insumos marcados para crear nuevos.', !n);
+      });
+      $('.im-ok', cuerpo)?.addEventListener('click', async () => {
+        const sel = $$('tbody tr', cuerpo).filter(tr => $('.im-sel', tr).checked);
+        if (!sel.length) return aviso('Marca al menos un insumo.', 1);
+        try {
+          const items = sel.map(tr => {
+            const i = pend[tr.dataset.k], dest = $('.im-dest', tr).value, factor = aNum($('.im-fac', tr).value);
+            if (Number.isNaN(factor) || factor <= 0) throw new Error(`${i.nombre}: la equivalencia debe ser mayor que 0.`);
+            if (!dest) throw new Error(`${i.nombre}: elige el artículo del sistema o "Crear artículo nuevo".`);
+            if (dest !== 'nuevo') return { fudo_id: i.id, articulo_id: Number(dest), factor };
+            const nuevo = { grupo: $('.im-grupo', tr).value, categoria_id: $('.im-cat', tr).value, unidad_id: $('.im-uni', tr).value, nombre: $('.im-nom', tr).value };
+            if (!nuevo.categoria_id || !nuevo.unidad_id) throw new Error(`${i.nombre}: elige categoría y unidad del artículo nuevo.`);
+            return { fudo_id: i.id, factor, nuevo };
+          });
+          const r = await api('POST', `/fudo/${t.tienda_id}/importar`, { items });
+          if (r.creados.length) await cargarCat();
+          aviso(`Importados ${r.equivalencias} insumo(s)${r.creados.length ? `; artículos creados: ${r.creados.map(x => x.codigo).join(', ')}` : ''}.`);
+          ir('equiv');
+        } catch (x) { aviso(x.message, 1); }
+      });
+    },
+    async equiv() {
+      const [eqs, ings] = await Promise.all([api('GET', `/fudo/${t.tienda_id}/equivalencias`), api('GET', `/fudo/${t.tienda_id}/ingredientes`)]);
+      const usados = new Set(eqs.map(e => e.fudo_id));
+      cuerpo.innerHTML = `<p class="nota">Indica a qué artículo del sistema corresponde cada insumo de Fudo en esta tienda.
+        <b>Equivalencia</b> = cuántas unidades del sistema hay en 1 unidad de Fudo. Por ejemplo, si en Fudo la leche está en ml y en el sistema en lt, la equivalencia es 0,001.</p>
+        <div class="filtros"><button type="button" class="btn primario" id="fe-nueva">Agregar equivalencia</button></div><div class="tarjeta" id="fe-tabla"></div>`;
+      tabla($('#fe-tabla', cuerpo), { filas: eqs, vacio: 'Aún no hay equivalencias.', acciones: {
+        editar: e => formulario('Editar equivalencia', [
+          { k: 'articulo_id', t: 'Artículo del sistema', tipo: 'select', op: articulos(), todo: 1 },
+          { k: 'factor', t: `Unidades del sistema por 1 ${e.fudo_unidad || 'unidad'} de Fudo`, tipo: 'num', todo: 1 }], e,
+          async d => { await api('PUT', `/fudo/equivalencias/${e.id}`, d); aviso('Equivalencia guardada.'); ir('equiv'); }),
+        quitar: e => confirmar('Quitar equivalencia', `${e.fudo_nombre} dejará de sincronizarse con ${e.nombre}.`, async () => { await api('DELETE', `/fudo/equivalencias/${e.id}`); ir('equiv'); }, 'Quitar') }, cols: [
+        { t: 'Insumo en Fudo', v: e => e.fudo_nombre }, { t: 'Unidad Fudo', v: e => e.fudo_unidad },
+        { t: 'Artículo del sistema', v: e => `${e.codigo} · ${e.nombre}` }, { t: 'Equivalencia', n: 1, v: e => e.factor, h: e => `1 ${esc(e.fudo_unidad || 'un')} = ${fCant(e.factor)} ${esc(e.unidad)}` },
+        { t: '', h: () => `<div class="acciones">${accion('editar', 'Editar')}${accion('quitar', 'Quitar', 'peligro')}</div>` }] });
+      $('#fe-nueva', cuerpo).addEventListener('click', () => {
+        const libres = ings.filter(i => !usados.has(i.id)).map(i => ({ id: i.id, nombre: `${i.nombre}${i.unidad ? ` (${i.unidad})` : ''}${i.stock === null ? ' — sin control de stock' : ''}` }));
+        formulario('Nueva equivalencia', [
+          { k: 'fudo_id', t: 'Insumo en Fudo', tipo: 'select', op: libres, vacio: 'Selecciona…', todo: 1 },
+          { k: 'articulo_id', t: 'Artículo del sistema', tipo: 'select', op: articulos(), vacio: 'Selecciona…', todo: 1 },
+          { k: 'factor', t: 'Unidades del sistema por 1 unidad de Fudo', tipo: 'num', def: 1, todo: 1, ayuda: 'Misma unidad en ambos: 1. Fudo en gramos y sistema en kg: 0,001.' }], {},
+          async d => {
+            const i = ings.find(x => x.id === d.fudo_id);
+            if (!i) throw new Error('Selecciona el insumo de Fudo.');
+            await api('POST', `/fudo/${t.tienda_id}/equivalencias`, { ...d, fudo_nombre: i.nombre, fudo_unidad: i.unidad });
+            aviso('Equivalencia creada. El stock actual de Fudo queda como punto de partida.'); ir('equiv');
+          }, 'Crear');
+      });
+    },
+    async comparar() {
+      const r = await api('GET', `/fudo/${t.tienda_id}/comparar`);
+      const alerta = [r.comparte_con.length ? `<p class="error"><b>Esta tienda está conectada a la misma cuenta Fudo que ${esc(r.comparte_con.join(', '))}.</b> El stock de Fudo de abajo es el de esa cuenta, no el de esta tienda, y las operaciones de stock están bloqueadas. Conecta cada tienda con la API Key y API Secret de su propia cuenta (Integración Fudo → Cambiar credenciales).</p>` : '',
+        r.envios_por_revisar ? `<p class="error">${r.envios_por_revisar} guía(s) con envío de stock a Fudo por revisar: resuélvelas en Despachos antes de sincronizar.</p>` : '',
+        r.guias_sin_enviar ? `<p class="nota">${r.guias_sin_enviar} guía(s) vigentes con insumos equivalentes aún no suman su stock en Fudo (Despachos → Stock a Fudo).</p>` : ''].join('');
+      cuerpo.innerHTML = `<p class="nota"><b>Consumo por ventas</b> = lo que Fudo descontó con sus recetas desde la última sincronización
+        (stock anterior de Fudo + lo enviado desde el sistema − stock actual de Fudo). Al sincronizar se descuenta del stock de la tienda.
+        Las mermas o ajustes hechos directamente en Fudo también cuentan como consumo.</p>${alerta}
+        <div class="filtros"><label class="campo"><span>Fecha del descuento</span><input type="date" id="fs-fecha" value="${hoy()}"></label>
+        ${puede('stock_fudo') ? `<button type="button" class="btn primario" id="fs-sinc" ${r.filas.length ? '' : 'disabled'}>Sincronizar ventas de Fudo</button>
+        <button type="button" class="btn" id="fs-ajustar" ${r.filas.length ? '' : 'disabled'}>Ajustar sistema a Fudo</button>
+        <button type="button" class="btn" id="fs-igualar" ${r.filas.length ? '' : 'disabled'}>Igualar Fudo al sistema</button>` : '<span class="tenue">Tu perfil puede ver la comparación, pero no sincronizar ni ajustar stock.</span>'}</div><div class="tarjeta" id="fs-tabla"></div>`;
+      if (puede('stock_fudo')) $('#fs-ajustar', cuerpo).addEventListener('click', () => confirmar('Ajustar sistema a Fudo',
+        'El stock de esta tienda en el sistema quedará igual al de Fudo en cada artículo equivalente. Se registra como una toma de inventario cerrada, visible en Toma de inventario.', async () => {
+          const s = await api('POST', `/fudo/${t.tienda_id}/ajustar-sistema`, { fecha: $('#fs-fecha', cuerpo).value });
+          aviso(`Stock ajustado a Fudo (toma de inventario N° ${s.inventario_id}).${s.avisos.length ? ' Avisos: ' + s.avisos.join(' · ') : ''}`, s.avisos.length > 0);
+          ir('comparar');
+        }, 'Ajustar sistema'));
+      tabla($('#fs-tabla', cuerpo), { filas: r.filas, csv: `comparacion-fudo-${t.nombre}`, vacio: 'Aún no hay equivalencias.', cols: [
+        { t: 'Artículo', v: e => `${e.codigo} · ${e.nombre}` }, { t: 'Insumo Fudo', v: e => e.fudo_nombre },
+        { t: 'Stock sistema', n: 1, v: e => e.stock_sistema, h: e => `${fCant(e.stock_sistema)} ${esc(e.unidad)}` },
+        { t: 'Stock Fudo', n: 1, v: e => e.fudo_en_sistema, h: e => e.fudo_stock === null ? '—' : `${fCant(e.fudo_en_sistema)} ${esc(e.unidad)}` },
+        { t: 'Diferencia', n: 1, v: e => e.diferencia, h: e => e.diferencia === null ? '—' : etq(fCant(e.diferencia), Math.abs(e.diferencia) < 1e-6 ? 'bien' : 'alerta') },
+        { t: 'Consumo por ventas', n: 1, v: e => e.consumo_pendiente, h: e => e.consumo_pendiente === null ? '—' : `${fCant(e.consumo_pendiente)} ${esc(e.unidad)}` },
+        { t: 'Aviso', v: e => e.error, h: e => e.error ? etq(e.error, 'mal') : '' }] });
+      $('#fs-sinc', cuerpo)?.addEventListener('click', () => confirmar('Sincronizar ventas de Fudo',
+        'Se descontará del stock de la tienda el consumo por ventas de cada insumo. Lo consumido que supere el stock del sistema queda informado como faltante.', async () => {
+          const s = await api('POST', `/fudo/${t.tienda_id}/sincronizar`, { fecha: $('#fs-fecha', cuerpo).value });
+          aviso(`Sincronización N° ${s.id} registrada.`); ir('hist');
+        }, 'Sincronizar'));
+      $('#fs-igualar', cuerpo)?.addEventListener('click', () => confirmar('Igualar Fudo al sistema',
+        'El stock de cada insumo equivalente en Fudo se reemplazará por el stock que tiene el sistema en esta tienda. Úsalo para partir alineados; el consumo pendiente sin sincronizar se pierde.', async () => {
+          const s = await api('POST', `/fudo/${t.tienda_id}/igualar`, {});
+          if (!s.ok) throw new Error(`Igualados: ${s.igualados}. Con error: ${s.errores.map(e => e.error).join(' · ')}`);
+          aviso('Stock de Fudo igualado al sistema.'); ir('comparar');
+        }, 'Igualar'));
+    },
+    async hist() {
+      const filas = await api('GET', `/fudo/${t.tienda_id}/sincronizaciones`);
+      cuerpo.innerHTML = '<div class="tarjeta" id="fh-tabla"></div>';
+      const resumen = s => s.detalle.filter(x => x.descontado > 0 || x.faltante > 0 || x.error);
+      tabla($('#fh-tabla', cuerpo), { filas, vacio: 'Aún no hay sincronizaciones.', acciones: {
+        ver: s => modal(`Ventas Fudo N° ${s.id}`, `<p>${fFecha(s.fecha)} · ${esc(s.usuario || '')}</p><div class="tabla-marco"><table><thead><tr><th>Artículo</th><th class="n">Consumo</th><th class="n">Descontado</th><th class="n">Faltante</th><th>Aviso</th></tr></thead><tbody>
+          ${s.detalle.map(x => `<tr><td>${esc(x.codigo)} · ${esc(x.nombre)}</td><td class="n">${x.error ? '—' : fCant(x.consumo)} ${esc(x.unidad)}</td><td class="n">${fCant(x.descontado || 0)}</td><td class="n">${fCant(x.faltante || 0)}</td>
+          <td>${x.error ? etq(x.error, 'mal') : x.entrada_en_fudo ? etq(`Fudo subió ${fCant(x.entrada_en_fudo)} sin envío del sistema`, 'alerta') : ''}</td></tr>`).join('')}</tbody></table></div>`, true),
+        anular: s => confirmar('Anular sincronización', 'Lo descontado vuelve al stock de la tienda. Ese consumo no se volverá a contar en la próxima sincronización.',
+          async () => { await api('POST', `/fudo/sincronizaciones/${s.id}/anular`, {}); aviso('Sincronización anulada.'); ir('hist'); }, 'Anular') }, cols: [
+        { t: 'N°', v: s => s.id }, { t: 'Fecha', v: s => s.fecha, h: s => fFecha(s.fecha) }, { t: 'Registrada', v: s => s.creado, h: s => fFecha(s.creado) }, { t: 'Por', v: s => s.usuario },
+        { t: 'Artículos descontados', n: 1, v: s => s.detalle.filter(x => x.descontado > 0).length },
+        { t: 'Con faltante o aviso', n: 1, v: s => resumen(s).filter(x => x.faltante > 0 || x.error).length },
+        { t: 'Estado', v: s => s.estado, h: s => s.estado === 'ANULADO' ? etq('Anulada', 'mal') : etq('Vigente', 'bien') },
+        { t: '', h: s => `<div class="acciones">${accion('ver', 'Ver')}${s.estado === 'VIGENTE' && puede('stock_fudo') ? accion('anular', 'Anular', 'peligro') : ''}</div>` }] });
+    },
+  };
+  ir(pest);
+}
 
 /* ---------- Devoluciones a proveedores ---------- */
 Vistas.devoluciones = async v => {
@@ -582,7 +771,7 @@ Vistas.devoluciones = async v => {
     { t: 'N°', v: r => r.id }, { t: 'Fecha', v: r => r.fecha, h: r => fFecha(r.fecha) }, { t: 'Proveedor', v: r => r.proveedor }, { t: 'RUT', v: r => r.rut }, { t: 'Documento', v: r => r.documento }, { t: 'Motivo', v: r => r.motivo },
     { t: 'Neto', n: 1, v: r => r.neto, h: r => fPeso(r.neto) }, { t: 'IVA', n: 1, v: r => r.iva, h: r => fPeso(r.iva) }, { t: 'Total', n: 1, v: r => r.total, h: r => fPeso(r.total) },
     { t: 'Estado', v: r => r.estado, h: r => r.estado === 'ANULADO' ? etq('Anulada', 'mal') : etq('Vigente', 'bien') },
-    { t: '', h: r => `<div class="acciones">${accion('ver', 'Ver')}${r.estado !== 'ANULADO' && crea ? accion('anular', 'Anular', 'peligro') : ''}</div>` }] });
+    { t: '', h: r => `<div class="acciones">${accion('ver', 'Ver')}${r.estado !== 'ANULADO' && crea && puede('anular_devoluciones') ? accion('anular', 'Anular', 'peligro') : ''}</div>` }] });
   $('#n', v)?.addEventListener('click', async () => {
     const central = await api('GET', '/stock/central');
     const stock = Object.fromEntries(central.map(a => [a.articulo_id, a.cantidad]));
@@ -652,7 +841,7 @@ Vistas.articulos = async v => {
     }
     tabla($('#tc', c) || c, { filas: tabArt === 'categorias' && filtroCat !== '' ? lista.filter(x => String(x.de_productos) === filtroCat) : lista, acciones: { editar: form,
       borrar: r => confirmar('Eliminar', `¿Eliminar "${r.nombre}"? No se podrá si algún artículo la usa.`, async () => { await api('DELETE', `/${tabArt}/${r.id}`); aviso('Eliminado.'); render(); }, 'Eliminar') },
-    cols: [...(tabArt === 'categorias' ? [{ t: 'Nombre', v: r => r.nombre }, { t: 'Tipo de categoría', v: r => r.de_productos ? 'Productos' : r.punto_venta ? 'No productos · puntos de venta' : 'No productos' }] : campos.map(f => ({ t: f.t, v: r => r[f.k] }))), { t: '', h: () => edita ? `<div class="acciones">${accion('editar', 'Editar')}${accion('borrar', 'Eliminar', 'peligro')}</div>` : '' }] });
+    cols: [...(tabArt === 'categorias' ? [{ t: 'Nombre', v: r => r.nombre }, { t: 'Tipo de categoría', v: r => r.de_productos ? 'Productos' : r.punto_venta ? 'No productos · puntos de venta' : 'No productos' }] : campos.map(f => ({ t: f.t, v: r => r[f.k] }))), { t: '', h: () => edita ? `<div class="acciones">${accion('editar', 'Editar')}${puede('eliminar_registros') ? accion('borrar', 'Eliminar', 'peligro') : ''}</div>` : '' }] });
     return;
   }
   const todos = await api('GET', '/articulos');
@@ -682,7 +871,7 @@ Vistas.articulos = async v => {
     { t: 'Stock central', n: 1, v: r => r.stock, h: r => `${fCant(r.stock)}${r.stock < r.stock_minimo ? ' ' + etq('Bajo mínimo', 'mal') : ''}` },
     { t: 'Precio', n: 1, v: r => r.precio, h: r => fPrecio(r.precio) },
     { t: 'Estado', v: r => r.activo ? 'Activo' : 'Inactivo', h: r => r.activo ? etq('Activo', 'bien') : etq('Inactivo') },
-    { t: '', h: () => edita ? `<div class="acciones">${accion('editar', 'Editar')}${accion('borrar', 'Eliminar', 'peligro')}</div>` : '' }] });
+    { t: '', h: () => edita ? `<div class="acciones">${accion('editar', 'Editar')}${puede('eliminar_registros') ? accion('borrar', 'Eliminar', 'peligro') : ''}</div>` : '' }] });
 };
 
 /* ---------- Toma de inventario ---------- */
@@ -702,7 +891,7 @@ Vistas.inventario = async v => {
     { t: 'N°', v: r => r.id }, { t: 'Fecha', v: r => r.fecha, h: r => fFecha(r.fecha) }, { t: 'Bodega', v: r => nombreToma(r) }, { t: 'Responsable', v: r => r.usuario },
     { t: 'Contados', n: 1, v: r => r.contadas, h: r => `${fNum(r.contadas)} de ${fNum(r.lineas)}` }, { t: 'Con diferencia', n: 1, v: r => r.con_diferencia, h: r => fNum(r.con_diferencia) },
     { t: 'Estado', v: r => r.estado, h: r => r.estado === 'ABIERTO' ? etq('Abierta', 'alerta') : etq('Cerrada', 'bien') },
-    { t: '', h: r => `<div class="acciones">${accion('abrir', r.estado === 'ABIERTO' && can('inventario', 2) ? 'Contar' : 'Ver')}${r.estado === 'ABIERTO' && can('inventario', 2) ? accion('borrar', 'Eliminar', 'peligro') : ''}</div>` }] });
+    { t: '', h: r => `<div class="acciones">${accion('abrir', r.estado === 'ABIERTO' && can('inventario', 2) ? 'Contar' : 'Ver')}${r.estado === 'ABIERTO' && can('inventario', 2) && puede('cerrar_inventario') ? accion('borrar', 'Eliminar', 'peligro') : ''}</div>` }] });
 };
 async function abrirInventario(id) {
   const inv = await api('GET', `/inventarios/${id}`);
@@ -714,7 +903,7 @@ async function abrirInventario(id) {
   }).join('');
   const m = modal(`Toma #${inv.id} · ${nombreToma(inv)}`, `<div class="tabla-marco"><table><thead><tr><th>Código</th><th>Artículo</th><th class="n">Stock sistema</th><th class="n">Conteo físico</th><th class="n">Diferencia</th></tr></thead><tbody>${filas}</tbody></table></div>
     <p class="tenue">${abierto ? 'Los artículos sin conteo no se ajustan.' : `Cerrada el ${fFecha(inv.cerrado || '') || '—'}.`}</p><div class="error" hidden></div>
-    ${abierto ? '<form><div class="modal-pie"><button type="button" class="btn g">Guardar avance</button><button class="btn primario">Cerrar y ajustar stock</button></div></form>' : ''}`, true);
+    ${abierto ? '<form><div class="modal-pie"><button type="button" class="btn g">Guardar avance</button>' + (puede('cerrar_inventario') ? '<button class="btn primario">Cerrar y ajustar stock</button>' : '<span class="tenue">Tu perfil no puede cerrar tomas: pide a quien tenga ese permiso que la cierre.</span>') + '</div></form>' : ''}`, true);
   if (!abierto) return;
   const pinta = tr => {
     const n = aNum($('.c', tr).value), d = $('.dif', tr);
@@ -774,7 +963,7 @@ Vistas.mermas = async v => {
     $('#n', v)?.addEventListener('click', () => form());
     tabla(c, { filas: await api('GET', '/motivos_merma'), acciones: { editar: form,
       borrar: r => confirmar('Eliminar motivo', `¿Eliminar "${r.nombre}"? No se podrá si tiene mermas registradas.`, async () => { await api('DELETE', `/motivos_merma/${r.id}`); render(); }, 'Eliminar') }, cols: [
-      { t: 'Motivo', v: r => r.nombre }, { t: '', h: () => edita ? `<div class="acciones">${accion('editar', 'Editar')}${accion('borrar', 'Eliminar', 'peligro')}</div>` : '' }] });
+      { t: 'Motivo', v: r => r.nombre }, { t: '', h: () => edita ? `<div class="acciones">${accion('editar', 'Editar')}${puede('eliminar_registros') ? accion('borrar', 'Eliminar', 'peligro') : ''}</div>` : '' }] });
     return;
   }
   const filas = await api('GET', '/mermas');
@@ -789,7 +978,7 @@ Vistas.mermas = async v => {
     { t: 'Cantidad', n: 1, v: r => r.cantidad, h: r => `${fCant(r.cantidad)} ${esc(r.unidad)}` }, { t: 'Costo', n: 1, v: r => r.cantidad * r.costo_unit, h: r => fPeso(r.cantidad * r.costo_unit) },
     { t: 'Observación', v: r => r.obs }, { t: 'Usuario', v: r => r.usuario },
     { t: 'Estado', v: r => r.estado, h: r => r.estado === 'ANULADO' ? etq('Anulada', 'mal') : etq('Vigente', 'bien') },
-    { t: '', h: r => r.estado === 'VIGENTE' && edita ? `<div class="acciones">${accion('anular', 'Anular', 'peligro')}</div>` : '' }] });
+    { t: '', h: r => r.estado === 'VIGENTE' && edita && puede('anular_mermas') ? `<div class="acciones">${accion('anular', 'Anular', 'peligro')}</div>` : '' }] });
   $('#n', v)?.addEventListener('click', () => {
     const bod = bodegasOp();
     const m = modal('Registrar merma', `<form novalidate><div class="campos"><label class="campo"><span>Bodega</span><select name="bodega_id">${opciones(bod, bod[0]?.id)}</select></label>
@@ -919,7 +1108,7 @@ Vistas.recetas = async v => {
     { t: 'Ingredientes', n: 1, v: r => r.items?.length || 0, h: r => r.tiene_receta ? fNum(r.items.length) : etq('Sin receta', 'alerta') },
     { t: 'Costo unitario', n: 1, v: r => r.costo_unit || 0, h: r => r.tiene_receta ? fPrecio(r.costo_unit) : '' },
     { t: 'Se puede fabricar', n: 1, v: r => r.max_producible || 0, h: r => r.tiene_receta ? `${fCant(Math.floor(r.max_producible))} ${esc(r.unidad)}` : '' },
-    { t: '', h: r => `<div class="acciones">${r.tiene_receta ? accion('ver', 'Ver') : ''}${edita ? accion('editar', r.tiene_receta ? 'Editar' : 'Crear') : ''}${edita && r.tiene_receta ? accion('borrar', 'Eliminar', 'peligro') : ''}</div>` }] });
+    { t: '', h: r => `<div class="acciones">${r.tiene_receta ? accion('ver', 'Ver') : ''}${edita ? accion('editar', r.tiene_receta ? 'Editar' : 'Crear') : ''}${edita && r.tiene_receta && puede('eliminar_registros') ? accion('borrar', 'Eliminar', 'peligro') : ''}</div>` }] });
 };
 function verReceta(r) {
   modal(`Receta: ${r.nombre}`, `<p><b>Rendimiento:</b> ${fCant(r.rendimiento)} ${esc(r.unidad)} · <b>Costo unitario:</b> ${fPrecio(r.costo_unit)}</p>
@@ -984,7 +1173,7 @@ Vistas.produccion = async v => {
     { t: 'Cantidad', n: 1, v: r => r.cantidad, h: r => `${fCant(r.cantidad)} ${esc(r.unidad)}` }, { t: 'Costo total', n: 1, v: r => r.costo_total, h: r => fPeso(r.costo_total) },
     { t: 'Costo unitario', n: 1, v: r => r.costo_total / r.cantidad, h: r => fPrecio(r.costo_total / r.cantidad) }, { t: 'Usuario', v: r => r.usuario },
     { t: 'Estado', v: r => r.estado, h: r => r.estado === 'ANULADO' ? etq('Anulada', 'mal') : etq('Vigente', 'bien') },
-    { t: '', h: r => r.estado === 'VIGENTE' && can('produccion', 2) ? `<div class="acciones">${accion('anular', 'Anular', 'peligro')}</div>` : '' }] });
+    { t: '', h: r => r.estado === 'VIGENTE' && can('produccion', 2) && puede('anular_produccion') ? `<div class="acciones">${accion('anular', 'Anular', 'peligro')}</div>` : '' }] });
   $('#n', v)?.addEventListener('click', async () => {
     const recs = (await api('GET', '/produccion/recetas')).filter(r => r.tiene_receta);
     const m = modal('Registrar producción', `<form novalidate><div class="campos"><label class="campo todo"><span>Artículo a fabricar</span><select name="articulo_id"><option value="">Selecciona…</option>${recs.map(r => `<option value="${r.articulo_id}">${esc(r.codigo)} · ${esc(r.nombre)}</option>`).join('')}</select></label>
@@ -1020,7 +1209,7 @@ const SALIDAS = {
 const tabsDespachos = () => pestanas([['guias', 'Guías a tiendas'], ...Object.entries(SALIDAS).filter(([k]) => k === 'DEVOLUCION_TIENDA' || !S.usuario.tienda_id).map(([k, x]) => [k, x.tab])], tabDespachos, k => { tabDespachos = k; render(); });
 async function vistaSalidas(v, tipo) {
   const cfg = SALIDAS[tipo], crea = can('despachos', 2), filas = await api('GET', '/salidas-internas' + qs({ tipo }));
-  const anula = crea && !S.usuario.tienda_id, esDev = tipo === 'DEVOLUCION_TIENDA';
+  const anula = crea && !S.usuario.tienda_id && puede('anular_salidas'), esDev = tipo === 'DEVOLUCION_TIENDA';
   v.innerHTML = cabecera(cfg.titulo, cfg.nota, crea ? `<button class="btn primario" id="n">${esc(cfg.nuevo)}</button>` : '');
   v.append(tabsDespachos());
   const c = v.appendChild(Object.assign(document.createElement('div'), { className: 'tarjeta' }));
@@ -1076,20 +1265,49 @@ Vistas.despachos = async v => {
     const x = await api('POST', `/despachos/${r.id}/fudo${ruta}`, cuerpo);
     render();
     if (!x.ok) throw new Error(x.error);
-    aviso(ok);
+    if (x.pago_error) return aviso(`${ok} Pero el pago no quedó registrado: ${x.pago_error} Puedes reintentarlo desde el detalle de la guía.`, 1);
+    if (x.stock_error) return aviso(`${ok} Pero el stock en Fudo quedó con problemas: ${x.stock_error}`, 1);
+    if (x.manual) return aviso(`${ok} Ahora carga el detalle de insumos del gasto GD-${nGuia(r)} en Fudo.`);
+    aviso(ok + (x.stock === 'ENVIADO' ? ' Stock sumado en Fudo.' : x.stock === 'REVERTIDO' ? ' Stock restado en Fudo.' : ''));
   };
   const nGuia = r => String(r.id).padStart(6, '0');
-  const estadoFudo = r => r.fudo_estado === 'ENVIADO' ? etq(r.estado === 'ANULADO' ? 'Gasto vigente' : `Gasto #${r.fudo_gasto_id}`, r.estado === 'ANULADO' ? 'alerta' : 'bien') : r.fudo_estado === 'ANULADO' ? etq('Gasto anulado') : ['ENVIANDO', 'REVISAR'].includes(r.fudo_estado) ? etq('Revisar', 'alerta') : r.estado === 'VIGENTE' ? etq('Sin enviar') : '—';
+  const estadoStockFudo = r => {
+    const e = r.fudo_stock_estado;
+    if (r.fudo_stock_manual && e === 'ENVIADO') return `<span title="Carga el detalle de insumos del gasto GD-${nGuia(r)} en Fudo">${etq(r.estado === 'ANULADO' ? 'Manual (guía anulada)' : 'Cargar a mano en Fudo', 'alerta')}</span>`;
+    if (r.fudo_stock_manual && e === 'REVERTIDO') return etq('Manual anulado');
+    if (e === 'ENVIADO') return etq(r.estado === 'ANULADO' ? 'Sumado (guía anulada)' : 'Sumado', r.estado === 'ANULADO' ? 'alerta' : 'bien');
+    if (e === 'REVERTIDO') return etq('Restado');
+    if (e === 'ENVIANDO' || e === 'REVISAR') return etq('Revisar', 'alerta');
+    if (e === 'ERROR') return `<span title="${esc(r.fudo_stock_error)}">${etq('Con error', 'mal')}</span>`;
+    return r.fudo_stock_lineas && r.estado === 'VIGENTE' ? etq('Sin sumar') : '—';
+  };
+  const accionStockFudo = r => {
+    const e = r.fudo_stock_estado;
+    if (['ENVIANDO', 'REVISAR'].includes(e)) return puede(r.estado === 'VIGENTE' ? 'enviar_fudo' : 'anular_fudo') ? accion('stockrev', 'Revisar stock Fudo') : '';
+    if (r.estado === 'VIGENTE' && r.fudo_stock_lineas && (!e || e === 'ERROR')) return puede('enviar_fudo') ? accion('stock', e === 'ERROR' ? 'Reintentar stock Fudo' : 'Stock a Fudo') : '';
+    if (!puede('anular_fudo')) return '';
+    if (r.estado === 'ANULADO' && r.fudo_stock_manual && e === 'ENVIADO' && r.fudo_estado !== 'ENVIADO') return accion('stockdes', 'Quitar carga manual', 'peligro');
+    if (r.estado === 'ANULADO' && !r.fudo_stock_manual && (e === 'ENVIADO' || e === 'ERROR')) return accion('stockdes', 'Restar stock Fudo', 'peligro');
+    return '';
+  };
+  const estadoFudo = r => r.fudo_estado === 'ENVIADO' ? etq(r.estado === 'ANULADO' ? 'Gasto vigente' : `Gasto #${r.fudo_gasto_id}`, r.estado === 'ANULADO' ? 'alerta' : 'bien') +
+      (r.estado === 'ANULADO' ? '' : r.fudo_pago && r.fudo_pago !== 'REVISAR' ? ' ' + etq('Pagado', 'bien') : ' ' + etq(r.fudo_pago === 'REVISAR' ? 'Pago por revisar' : 'Sin pago', 'alerta')) : r.fudo_estado === 'ANULADO' ? etq('Gasto anulado') : ['ENVIANDO', 'REVISAR'].includes(r.fudo_estado) ? etq('Revisar', 'alerta') : r.estado === 'VIGENTE' ? etq('Sin enviar') : '—';
   tabla(c, { filas, csv: 'despachos', vacio: 'Aún no hay guías.', acciones: { ver: r => verGuia(r.id),
-    fudo: r => confirmar('Enviar a Fudo', `Se creará un gasto en la cuenta Fudo de ${r.tienda} por la guía ${nGuia(r)}.`, () => fudoEnvio(r, '', {}, 'Gasto creado en Fudo.'), 'Enviar a Fudo'),
+    fudo: r => confirmar('Enviar a Fudo', `Se creará un gasto del proveedor Nata & Schlott en la cuenta Fudo de ${r.tienda} por la guía ${nGuia(r)}${r.fudo_stock_lineas ? `, y se sumará el stock de sus ${r.fudo_stock_lineas} insumo(s) equivalentes` : ''}.`, () => fudoEnvio(r, '', {}, 'Gasto creado en Fudo.'), 'Enviar a Fudo'),
     fudorev: r => confirmar('Reenviar a Fudo', `No se sabe si el gasto de la guía ${nGuia(r)} llegó a Fudo. Busca el comprobante GD-${nGuia(r)} en Fudo: reenvía solo si NO está, para no duplicarlo.`, () => fudoEnvio(r, '', { confirmar_reenvio: true }, 'Gasto creado en Fudo.'), 'No está: reenviar'),
-    fudoanula: r => confirmar('Anular gasto en Fudo', `Se anulará en Fudo el gasto #${r.fudo_gasto_id} de la guía ${nGuia(r)}.`, () => fudoEnvio(r, '/anular', {}, 'Gasto anulado en Fudo.'), 'Anular gasto'),
+    fudoanula: r => confirmar('Anular gasto en Fudo', `Se anulará en Fudo el gasto #${r.fudo_gasto_id} de la guía ${nGuia(r)}${r.fudo_stock_estado === 'ENVIADO' ? ' y se restará el stock que se había sumado' : ''}.`, () => fudoEnvio(r, '/anular', {}, 'Gasto anulado en Fudo.'), 'Anular gasto'),
+    stock: r => confirmar('Sumar stock en Fudo', `Se sumarán en Fudo de ${r.tienda} las cantidades de la guía ${nGuia(r)} para sus ${r.fudo_stock_lineas} insumo(s) equivalentes.`, () => fudoEnvio(r, '-stock', {}, 'Stock sumado en Fudo.'), 'Sumar stock'),
+    stockrev: r => confirmar('Revisar stock en Fudo', `No se sabe si parte del stock de la guía ${nGuia(r)} se aplicó en Fudo (${r.fudo_stock_error}). Revisa esos insumos en Fudo: continúa solo si NO se aplicó, para no duplicarlo.`,
+      () => fudoEnvio(r, r.estado === 'VIGENTE' ? '-stock' : '-stock/revertir', { confirmar_reenvio: true }, 'Listo.'), 'No se aplicó: continuar'),
+    stockdes: r => r.fudo_stock_manual
+      ? confirmar('Quitar carga manual', `La guía ${nGuia(r)} está anulada: el sistema dejará de contar sus cantidades como cargadas en Fudo. Si ya cargaste ese detalle en Fudo, quítalo allá.`, () => fudoEnvio(r, '-stock/revertir', {}, 'Carga manual quitada.'), 'Quitar')
+      : confirmar('Restar stock en Fudo', `La guía ${nGuia(r)} está anulada: se restará en Fudo el stock que se le había sumado.`, () => fudoEnvio(r, '-stock/revertir', {}, 'Stock restado en Fudo.'), 'Restar stock'),
     anular: r => confirmar('Anular guía', `Se devolverá a la bodega central lo despachado en la guía ${String(r.id).padStart(6, '0')}. Requiere que la tienda aún tenga ese stock.`, async () => { await api('POST', `/despachos/${r.id}/anular`, {}); aviso('Guía anulada.'); render(); }, 'Anular guía') }, cols: [
     { t: 'Guía', v: r => String(r.id).padStart(6, '0') }, { t: 'Fecha', v: r => r.fecha, h: r => fFecha(r.fecha) }, { t: 'Tienda', v: r => r.tienda }, { t: 'Líneas', n: 1, v: r => r.lineas },
     { t: 'Neto', n: 1, v: r => r.neto, h: r => fPeso(r.neto) }, { t: 'Total', n: 1, v: r => r.total, h: r => fPeso(r.total) }, { t: 'Transportista', v: r => r.transportista },
     { t: 'Estado', v: r => r.estado, h: r => r.estado === 'ANULADO' ? etq('Anulada', 'mal') : etq('Emitida', 'bien') },
-    ...(S.usuario.tienda_id ? [] : [{ t: 'Fudo', v: r => r.fudo_estado, h: estadoFudo }]),
-    { t: '', h: r => `<div class="acciones">${accion('ver', 'Ver guía')}${crea && r.estado === 'VIGENTE' && !r.fudo_estado ? accion('fudo', 'Enviar a Fudo') : ''}${crea && r.estado === 'VIGENTE' && ['ENVIANDO', 'REVISAR'].includes(r.fudo_estado) ? accion('fudorev', 'Revisar Fudo') : ''}${crea && r.estado === 'ANULADO' && r.fudo_estado === 'ENVIADO' ? accion('fudoanula', 'Anular en Fudo', 'peligro') : ''}${r.estado === 'VIGENTE' && crea ? accion('anular', 'Anular', 'peligro') : ''}</div>` }] });
+    ...(S.usuario.tienda_id ? [] : [{ t: 'Fudo', v: r => r.fudo_estado, h: estadoFudo }, { t: 'Stock Fudo', v: r => r.fudo_stock_estado, h: estadoStockFudo }]),
+    { t: '', h: r => `<div class="acciones">${accion('ver', 'Ver guía')}${crea ? accionStockFudo(r) : ''}${crea && puede('enviar_fudo') && r.estado === 'VIGENTE' && !r.fudo_estado ? accion('fudo', 'Enviar a Fudo') : ''}${crea && puede('enviar_fudo') && r.estado === 'VIGENTE' && ['ENVIANDO', 'REVISAR'].includes(r.fudo_estado) ? accion('fudorev', 'Revisar Fudo') : ''}${crea && puede('anular_fudo') && r.estado === 'ANULADO' && r.fudo_estado === 'ENVIADO' ? accion('fudoanula', 'Anular en Fudo', 'peligro') : ''}${r.estado === 'VIGENTE' && crea && puede('anular_despachos') ? accion('anular', 'Anular', 'peligro') : ''}</div>` }] });
   $('#n', v)?.addEventListener('click', async () => {
     const central = await api('GET', '/stock/central');
     const stock = Object.fromEntries(central.map(a => [a.articulo_id, a.cantidad]));
@@ -1121,17 +1339,67 @@ async function verGuia(id) {
     <div class="totales"><div><span>Neto</span><span>${fPeso(g.neto)}</span></div><div><span>IVA ${fNum(g.iva_pct, 0, 2)}%</span><span>${fPeso(g.iva)}</span></div><div class="total"><span>Total</span><span>${fPeso(g.total)}</span></div></div>
     ${g.obs ? `<p><b>Observación:</b> ${esc(g.obs)}</p>` : ''}<div class="firmas"><div>Entrega</div><div>Recibe conforme</div></div>
     <p class="legal">Documento de control interno. No reemplaza la guía de despacho electrónica exigida por el SII.</p>
-    <div class="modal-pie no-imprimir"><button type="button" class="btn primario imprimir">Imprimir</button></div>`, true);
+    <div class="modal-pie no-imprimir">${botonesGuiaFudo(g)}<button type="button" class="btn primario imprimir">Imprimir</button></div>`, true);
   $('.imprimir', m.el).addEventListener('click', () => print());
+  const rehacer = () => { m.cerrar(); render(); verGuia(id); };
+  const llamar = async (ruta, cuerpo) => {
+    const x = await api('POST', `/despachos/${id}${ruta}`, cuerpo || {});
+    if (x.ok === false) throw new Error(x.error);
+    return x;
+  };
+  const resultadoStock = x => (x.pago === 'PAGADO' ? ' Quedó Pagado.' : x.pago_error ? ` Pero el pago no quedó registrado: ${x.pago_error}` : '') + (x.stock_error ? ` Pero el stock en Fudo quedó con problemas: ${x.stock_error}` : x.manual ? ' Carga el detalle de insumos del gasto en Fudo.'
+    : x.stock === 'ENVIADO' ? ' Stock de Fudo actualizado.' : x.stock === 'REVERTIDO' ? ' Stock descontado en Fudo.' : '');
+  $('.g-fudo', m.el)?.addEventListener('click', () => confirmar('Enviar a Fudo',
+    `${['REVISAR', 'ENVIANDO'].includes(g.fudo_estado) ? `No se sabe si el envío anterior llegó: busca el gasto GD-${num} en Fudo y continúa solo si NO está, para no duplicarlo. ` : ''}Se creará en Fudo de ${g.tienda} el gasto de la guía N° ${num} (proveedor Nata & Schlott, pagado en Efectivo)${g.fudo_stock_lineas ? ` y se sumará el stock de sus ${g.fudo_stock_lineas} insumo(s) equivalentes` : ''}.`, async () => {
+      const x = await llamar('/fudo', g.fudo_estado === 'REVISAR' || g.fudo_estado === 'ENVIANDO' ? { confirmar_reenvio: true } : {});
+      aviso('Gasto creado en Fudo.' + resultadoStock(x), !!(x.stock_error || x.pago_error)); rehacer();
+    }, 'Enviar a Fudo'));
+  $('.g-pago', m.el)?.addEventListener('click', () => confirmar('Registrar pago en Fudo',
+    `${g.fudo_pago === 'REVISAR' ? `No se sabe si el pago anterior llegó: revisa el gasto GD-${num} en Fudo y continúa solo si NO está pagado, para no duplicarlo. ` : ''}Se registrará en Fudo el pago en Efectivo del gasto de la guía N° ${num}, con la fecha de la guía.`, async () => {
+      await llamar('/fudo/pago', g.fudo_pago === 'REVISAR' ? { confirmar_reenvio: true } : {});
+      aviso('Gasto marcado como Pagado en Fudo.'); rehacer();
+    }, 'Registrar pago'));
+  $('.g-stock', m.el)?.addEventListener('click', () => confirmar('Actualizar stock en Fudo', `Se sumará en Fudo el stock pendiente de la guía N° ${num}.`, async () => {
+    const x = await llamar('-stock', ['REVISAR', 'ENVIANDO'].includes(g.fudo_stock_estado) ? { confirmar_reenvio: true } : {});
+    aviso(x.error ? `Stock con problemas: ${x.error}` : 'Stock actualizado en Fudo.', !!x.error); rehacer();
+  }, 'Actualizar stock'));
+  $('.g-anular', m.el)?.addEventListener('click', () => confirmar('Anular guía',
+    `Se devolverá a la bodega central lo despachado en la guía N° ${num} (requiere que la tienda aún tenga ese stock).${g.fudo_estado === 'ENVIADO' ? ' En Fudo se anulará el gasto y se descontará del stock lo que sumó la guía.' : g.fudo_stock_estado === 'ENVIADO' ? ' En Fudo se descontará del stock lo que sumó la guía.' : ''}`, async () => {
+      await api('POST', `/despachos/${id}/anular`, {});
+      let msg = 'Guía anulada.';
+      try {
+        if (g.fudo_estado === 'ENVIADO') msg += ' Gasto anulado en Fudo.' + resultadoStock(await llamar('/fudo/anular'));
+        else if (['ENVIADO', 'ERROR'].includes(g.fudo_stock_estado)) msg += resultadoStock({ ...(await llamar('-stock/revertir')), stock: 'REVERTIDO' });
+      } catch (x) { msg += ` Pero en Fudo no se pudo completar: ${x.message} Reinténtalo desde la lista de guías.`; aviso(msg, 1); return rehacer(); }
+      aviso(msg, msg.includes('problemas')); rehacer();
+    }, 'Anular guía'));
+}
+function botonesGuiaFudo(g) {
+  if (!can('despachos', 2) || S.usuario.tienda_id || g.estado !== 'VIGENTE') return '';
+  let b = '';
+  if (!puede('enviar_fudo')) { /* sin permiso: no se ofrece enviar */ }
+  else if (g.fudo_lista && g.fudo_estado !== 'ENVIADO' && g.fudo_estado !== 'ANULADO')
+    b += `<button type="button" class="btn g-fudo">${['REVISAR', 'ENVIANDO'].includes(g.fudo_estado) ? 'Reintentar envío a Fudo' : 'Enviar a Fudo'}</button>`;
+  else {
+    if (g.fudo_estado === 'ENVIADO' && ['', 'REVISAR'].includes(g.fudo_pago || ''))
+      b += '<button type="button" class="btn g-pago">Registrar pago en Fudo</button>';
+    if (g.fudo_estado === 'ENVIADO' && g.fudo_stock_lineas && ['', 'ERROR', 'REVISAR', 'ENVIANDO'].includes(g.fudo_stock_estado))
+      b += '<button type="button" class="btn g-stock">Actualizar stock en Fudo</button>';
+  }
+  // Anular una guía ya enviada también deshace en Fudo: requiere ambos permisos
+  const enFudo = g.fudo_estado === 'ENVIADO' || g.fudo_stock_estado === 'ENVIADO';
+  if (puede('anular_despachos') && (!enFudo || puede('anular_fudo'))) b += '<button type="button" class="btn peligro g-anular">Anular guía</button>';
+  return b;
 }
 
 /* ---------- Reportes ---------- */
 let tabRep = 'rendimiento', rango = { desde: haceDias(90), hasta: hoy() }, insumoSel = '';
+const stockRep = { tipo: '', ver: 'cantidad', central: true, conStock: false, q: '' };
 Vistas.reportes = async v => {
-  const tabs = [['rendimiento', 'Rendimiento de producción'], ['precios', 'Precios de insumos'], ['margenes', 'Márgenes'], ['cobertura', 'Cobertura y reposición'], ['compras', 'Compras'], ['despachos', 'Despachos'], ['mermas', 'Mermas']];
+  const tabs = [['rendimiento', 'Rendimiento de producción'], ['precios', 'Precios de insumos'], ['margenes', 'Márgenes'], ['cobertura', 'Cobertura y reposición'], ['stock', 'Stock por tienda'], ['compras', 'Compras'], ['despachos', 'Despachos'], ['mermas', 'Mermas']];
   v.innerHTML = cabecera('Reportes de gestión', 'Indicadores para decidir qué producir, comprar y corregir.');
   v.append(pestanas(tabs, tabRep, k => { tabRep = k; render(); }));
-  if (tabRep !== 'margenes') {
+  if (tabRep !== 'margenes' && tabRep !== 'stock') {
     const fr = v.appendChild(document.createElement('form'));
     fr.className = 'filtros sobre-gris';
     fr.innerHTML = `<label>Desde<input type="date" name="desde" value="${rango.desde}"></label><label>Hasta<input type="date" name="hasta" value="${rango.hasta}"></label><button class="btn">Aplicar</button>`;
@@ -1184,6 +1452,55 @@ const REP = {
       { t: 'Consumo diario', n: 1, v: r => r.consumo_diario, h: r => fNum(r.consumo_diario, 0, 2) }, { t: 'Días de cobertura', n: 1, v: r => r.dias ?? '', h: r => r.dias === null ? '<span class="tenue">Sin consumo</span>' : r.dias < 7 ? `${fNum(r.dias, 0, 1)} ${etq('Crítico', 'mal')}` : fNum(r.dias, 0, 1) },
       { t: 'Reposición sugerida', n: 1, v: r => r.sugerido, h: r => r.sugerido ? `${fNum(r.sugerido, 0, 2)} ${esc(r.unidad)}` : '—' }] });
   },
+  async stock(z, tarjeta, kpis) {
+    const d = await api('GET', '/reportes/stock-tiendas' + qs({ tipo: stockRep.tipo }));
+    const bod = d.bodegas.filter(b => stockRep.central || b.id !== 0);
+    const cant = (r, b) => r.stock[String(b.id)] || 0;
+    const valorFila = (r, b) => cant(r, b) * r.costo;
+    const enValor = stockRep.ver === 'valor';
+    const celdaV = (r, b) => enValor ? valorFila(r, b) : cant(r, b);
+    const total = r => bod.reduce((s, b) => s + celdaV(r, b), 0);
+    const fmt = x => enValor ? fPeso(x) : fCant(x);
+    const tiendas = d.bodegas.filter(b => b.id !== 0);
+    const valTiendas = d.filas.reduce((s, r) => s + tiendas.reduce((t, b) => t + valorFila(r, b), 0), 0);
+    kpis([['Artículos', fNum(d.filas.length), 'activos del tipo elegido'], ['Con stock en tiendas', fNum(d.filas.filter(r => tiendas.some(b => cant(r, b))).length)],
+      ['Valor en tiendas', fPeso(valTiendas), 'a costo'], ['Valor en bodega central', fPeso(d.filas.reduce((s, r) => s + valorFila(r, { id: 0 }), 0)), 'a costo']]);
+    const c = tarjeta(`<h2>Stock por tienda</h2><p class="nota">Stock actual del sistema por bodega. Las filas se agrupan por categoría.${enValor ? ' Valor = cantidad × costo actual del artículo.' : ''}</p>
+      <div class="filtros"><label>Tipo<select id="st-tipo">${[['', 'Todos'], ['PRODUCTO', 'Productos'], ['SUBPRODUCTO', 'Subproductos'], ['INSUMO', 'Insumos']].map(([k, t]) => `<option value="${k}" ${k === stockRep.tipo ? 'selected' : ''}>${t}</option>`).join('')}</select></label>
+      <label>Mostrar<select id="st-ver"><option value="cantidad">Cantidades</option><option value="valor" ${enValor ? 'selected' : ''}>Valor a costo</option></select></label>
+      <label class="check"><input type="checkbox" id="st-central" ${stockRep.central ? 'checked' : ''}> Incluir bodega central</label>
+      <label class="check"><input type="checkbox" id="st-con" ${stockRep.conStock ? 'checked' : ''}> Solo con stock</label></div>
+      <div class="tabla-barra"><input type="search" class="buscar" placeholder="Buscar artículo o categoría…" value="${esc(stockRep.q)}"><button type="button" class="btn mini csv">Descargar CSV</button></div>
+      <div class="tabla-marco stock-tiendas"></div><div class="conteo"></div>`);
+    const filtradas = () => {
+      const t = stockRep.q.trim().toLowerCase();
+      return d.filas.filter(r => (!stockRep.conStock || bod.some(b => cant(r, b))) && (!t || `${r.codigo} ${r.nombre} ${r.categoria}`.toLowerCase().includes(t)));
+    };
+    const dibujar = () => {
+      const f = filtradas(), ncol = 3 + bod.length + 1;
+      const grupos = [];
+      for (const r of f) { if (!grupos.length || grupos.at(-1).cat !== r.categoria) grupos.push({ cat: r.categoria, filas: [] }); grupos.at(-1).filas.push(r); }
+      const celda = (x, cls = '') => `<td class="n ${cls} ${x ? '' : 'cero'}">${x ? fmt(x) : '—'}</td>`;
+      const cuerpo = grupos.map(g => {
+        const cab = enValor
+          ? `<tr class="grupo"><td colspan="3">${esc(g.cat)} <span class="tenue">(${g.filas.length})</span></td>${bod.map(b => `<td class="n">${fPeso(g.filas.reduce((s, r) => s + valorFila(r, b), 0))}</td>`).join('')}<td class="n">${fPeso(g.filas.reduce((s, r) => s + total(r), 0))}</td></tr>`
+          : `<tr class="grupo"><td colspan="${ncol}">${esc(g.cat)} <span class="tenue">(${g.filas.length})</span></td></tr>`;
+        return cab + g.filas.map(r => `<tr><td>${esc(r.codigo)}</td><td>${esc(r.nombre)} <span class="tenue">${esc(claseArticulo(r))}</span></td><td>${esc(r.unidad)}</td>${bod.map(b => celda(celdaV(r, b))).join('')}${celda(total(r), 'total')}</tr>`).join('');
+      }).join('') || `<tr><td colspan="${ncol}" class="vacio">Sin artículos para mostrar.</td></tr>`;
+      const pie = enValor && f.length ? `<tfoot><tr><td colspan="3">Total</td>${bod.map(b => `<td class="n">${fPeso(f.reduce((s, r) => s + valorFila(r, b), 0))}</td>`).join('')}<td class="n total">${fPeso(f.reduce((s, r) => s + total(r), 0))}</td></tr></tfoot>` : '';
+      $('.tabla-marco', c).innerHTML = `<table><thead><tr><th>Código</th><th>Artículo</th><th>Unidad</th>${bod.map(b => `<th class="n">${esc(b.nombre)}</th>`).join('')}<th class="n total">Total</th></tr></thead><tbody>${cuerpo}</tbody>${pie}</table>`;
+      $('.conteo', c).textContent = `${f.length} ${f.length === 1 ? 'artículo' : 'artículos'} en ${grupos.length} ${grupos.length === 1 ? 'categoría' : 'categorías'}`;
+    };
+    dibujar();
+    $('#st-tipo', c).addEventListener('change', e => { stockRep.tipo = e.target.value; render(); });
+    $('#st-ver', c).addEventListener('change', e => { stockRep.ver = e.target.value; render(); });
+    $('#st-central', c).addEventListener('change', e => { stockRep.central = e.target.checked; render(); });
+    $('#st-con', c).addEventListener('change', e => { stockRep.conStock = e.target.checked; dibujar(); });
+    $('.buscar', c).addEventListener('input', e => { stockRep.q = e.target.value; dibujar(); });
+    $('.csv', c).addEventListener('click', () => bajarCsv(`stock_por_tienda_${hoy()}`, [
+      ['Categoría', 'Código', 'Artículo', 'Tipo', 'Unidad', ...bod.map(b => b.nombre), 'Total'],
+      ...filtradas().map(r => [r.categoria, r.codigo, r.nombre, claseArticulo(r), r.unidad, ...bod.map(b => celdaV(r, b)), total(r)])]));
+  },
   async compras(z, tarjeta) {
     const d = await api('GET', '/reportes/compras' + qs(rango));
     tarjeta(`<h2>Compras netas por proveedor</h2>${barras(d.filas, r => r.nombre, r => r.neto)}`);
@@ -1229,15 +1546,32 @@ Vistas.usuarios = async v => {
       { t: '', h: () => edita ? `<div class="acciones">${accion('editar', 'Editar')}</div>` : '' }] });
   } else {
     const form = p => {
+      const esAdmin = p?.nombre === 'Administrador';
       const m = modal(p ? `Perfil: ${p.nombre}` : 'Nuevo perfil', `<form novalidate><label class="campo"><span>Nombre del perfil</span><input name="nombre" value="${esc(p?.nombre)}"></label>
         <div class="tabla-marco" style="margin-top:12px"><table class="perm"><thead><tr><th>Módulo</th><th class="c">Sin acceso</th><th class="c">Ver</th><th class="c">Editar</th></tr></thead><tbody>
         ${S.modulos.map(x => `<tr><td>${esc(x.nombre)}</td>${[0, 1, 2].map(n => `<td class="c"><input type="radio" name="p_${x.id}" value="${n}" aria-label="${esc(x.nombre)}: ${['sin acceso', 'ver', 'editar'][n]}" ${(p?.permisos?.[x.id] || 0) === n ? 'checked' : ''}></td>`).join('')}</tr>`).join('')}</tbody></table></div>
+        <h3 style="font-size:15px;margin:16px 0 4px">Acciones críticas</h3>
+        <p class="nota">Además de "Editar" en su módulo, cada acción necesita su propio permiso. ${esAdmin ? 'El perfil Administrador siempre las tiene todas.' : 'Solo se pueden marcar si el perfil puede editar ese módulo.'}</p>
+        <div class="tabla-marco"><table class="perm"><thead><tr><th>Acción</th><th>Módulo</th><th class="c">Permitida</th></tr></thead><tbody>
+        ${S.acciones.map(a => `<tr><td>${esc(a.nombre)}</td><td class="tenue">${esc(a.modulo ? (S.modulos.find(x => x.id === a.modulo)?.nombre || a.modulo) : 'Varios')}</td>
+          <td class="c"><input type="checkbox" name="acc_${a.id}" data-mod="${a.modulo || ''}" aria-label="${esc(a.nombre)}" ${esAdmin || p?.permisos?.['acc_' + a.id] ? 'checked' : ''} ${esAdmin ? 'disabled' : ''}></td></tr>`).join('')}</tbody></table></div>
         <div class="error" hidden></div><div class="modal-pie"><button type="button" class="btn cerrar">Cancelar</button><button class="btn primario">Guardar perfil</button></div></form>`, true);
       $$('.cerrar', m.el).forEach(b => b.addEventListener('click', m.cerrar));
       const f = $('form', m.el);
+      const habilitar = () => {  // una acción solo se puede marcar si el perfil edita su módulo
+        if (esAdmin) return;
+        const edita = id => Number(f[`p_${id}`].value) === 2;
+        $$('input[name^="acc_"]', f).forEach(i => {
+          const ok = i.dataset.mod ? edita(i.dataset.mod) : S.modulos.some(x => edita(x.id));
+          i.disabled = !ok; if (!ok) i.checked = false;
+        });
+      };
+      f.addEventListener('change', e => { if (e.target.name?.startsWith('p_')) habilitar(); });
+      habilitar();
       conEnvio(f, m, async () => {
         const permisos = {};
         S.modulos.forEach(x => { const n = Number(f[`p_${x.id}`].value); if (n) permisos[x.id] = n; });
+        S.acciones.forEach(a => { if (f[`acc_${a.id}`].checked) permisos['acc_' + a.id] = 1; });
         await api(p ? 'PUT' : 'POST', '/perfiles' + (p ? '/' + p.id : ''), { nombre: f.nombre.value, permisos });
         aviso('Perfil guardado.'); if (p) await refrescarUsuario(); render();
       });
@@ -1245,8 +1579,9 @@ Vistas.usuarios = async v => {
     $('#n', v)?.addEventListener('click', () => form());
     tabla(c, { filas: perfiles, acciones: { editar: form,
       borrar: p => confirmar('Eliminar perfil', `¿Eliminar el perfil ${p.nombre}?`, async () => { await api('DELETE', `/perfiles/${p.id}`); render(); }, 'Eliminar') }, cols: [
-      { t: 'Perfil', v: r => r.nombre }, { t: 'Usuarios', n: 1, v: r => r.usuarios }, { t: 'Módulos con acceso', n: 1, v: r => Object.keys(r.permisos).length },
-      { t: 'Módulos que puede editar', n: 1, v: r => Object.values(r.permisos).filter(x => x === 2).length },
+      { t: 'Perfil', v: r => r.nombre }, { t: 'Usuarios', n: 1, v: r => r.usuarios }, { t: 'Módulos con acceso', n: 1, v: r => S.modulos.filter(x => r.permisos[x.id]).length },
+      { t: 'Módulos que puede editar', n: 1, v: r => S.modulos.filter(x => r.permisos[x.id] === 2).length },
+      { t: 'Acciones críticas', n: 1, v: r => r.nombre === 'Administrador' ? S.acciones.length : S.acciones.filter(a => r.permisos['acc_' + a.id]).length },
       { t: '', h: r => edita ? `<div class="acciones">${accion('editar', 'Editar accesos')}${r.usuarios ? '' : accion('borrar', 'Eliminar', 'peligro')}</div>` : '' }] });
   }
 };
@@ -1260,7 +1595,7 @@ Vistas.config = async v => {
   const edita = can('config', 2);
   v.innerHTML = cabecera('Configuración', 'Identidad del sistema') + `<div class="tarjeta"><h2>Logo</h2><p class="nota">Aparece en el acceso, el menú y las guías. PNG, JPG, WEBP o SVG de hasta 2 MB.</p>
     <img class="logo-vista" src="${esc(logo())}" alt="Logo actual"><div class="filtros" style="margin-top:12px">${edita ? `<input type="file" id="lg" accept="image/png,image/jpeg,image/webp,image/svg+xml" aria-label="Archivo del logo" style="max-width:320px">${S.logo ? '<button class="btn" id="qt">Quitar logo</button>' : ''}` : ''}</div></div>
-    ${edita ? '<div class="tarjeta"><h2>Respaldo</h2><p class="nota">Descarga una copia completa de la base de datos. Guárdala en un lugar seguro: incluye toda la información del sistema.</p><a class="btn" href="/api/config/respaldo" style="display:inline-block;text-decoration:none">Descargar respaldo</a></div>' : ''}`;
+    ${edita && puede('respaldo') ? '<div class="tarjeta"><h2>Respaldo</h2><p class="nota">Descarga una copia completa de la base de datos. Guárdala en un lugar seguro: incluye toda la información del sistema.</p><a class="btn" href="/api/config/respaldo" style="display:inline-block;text-decoration:none">Descargar respaldo</a></div>' : ''}`;
   $('#lg', v)?.addEventListener('change', e => {
     const a = e.target.files[0]; if (!a) return;
     if (a.size > 2 * 1024 * 1024) return aviso('El archivo supera 2 MB.', 1);
@@ -1338,7 +1673,7 @@ async function render() {
 }
 async function iniciar() {
   S.estado = await api('GET', '/estado');
-  S.usuario = S.estado.usuario; S.modulos = S.estado.modulos; S.logo = S.estado.logo;
+  S.usuario = S.estado.usuario; S.modulos = S.estado.modulos; S.acciones = S.estado.acciones || []; S.logo = S.estado.logo;
   if (!S.usuario) return pantallaAcceso();
   marco();
   render();

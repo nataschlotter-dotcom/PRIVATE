@@ -4,6 +4,7 @@
 Servidor sin dependencias externas (Python 3.10+ y SQLite).
 Variables de entorno: PORT o NS_PORT (8080), NS_HOST (127.0.0.1), NS_DB (nata_schlott.db), NS_CLAVE_INSTALACION.
 """
+import difflib
 import hashlib
 import hmac
 import json
@@ -14,7 +15,9 @@ import re
 import secrets
 import sqlite3
 import tempfile
+import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from datetime import date, datetime, timedelta
@@ -47,6 +50,22 @@ MODULOS = [
     ("reportes", "Reportes de gestión"), ("usuarios", "Usuarios y perfiles"), ("config", "Configuración"),
 ]
 TODOS = [m for m, _ in MODULOS]
+# Acciones críticas: además del nivel "editar" en su módulo, requieren este permiso propio (clave "acc_<id>" en perfiles.permisos).
+ACCIONES = [
+    ("anular_compras", "Anular compras", "compras"),
+    ("anular_devoluciones", "Anular devoluciones a proveedores", "devoluciones"),
+    ("anular_produccion", "Anular producciones", "produccion"),
+    ("anular_despachos", "Anular guías de despacho", "despachos"),
+    ("anular_salidas", "Anular devoluciones de tiendas y consumos internos", "despachos"),
+    ("enviar_fudo", "Enviar guías a Fudo (gasto y stock)", "despachos"),
+    ("anular_fudo", "Anular gastos y restar stock en Fudo", "despachos"),
+    ("anular_mermas", "Anular mermas", "mermas"),
+    ("cerrar_inventario", "Cerrar o eliminar tomas de inventario (ajusta stock)", "inventario"),
+    ("eliminar_registros", "Eliminar artículos, recetas, categorías, unidades, proveedores y tiendas", None),  # aplica a varios módulos
+    ("stock_fudo", "Sincronizar, igualar y ajustar stock con Fudo", "config"),
+    ("respaldo", "Descargar respaldo de la base de datos", "config"),
+]
+ACCIONES_IDS = [a for a, _, _ in ACCIONES]
 PERFIL_ADMIN = "Administrador"  # "stock" no está en MODULOS: solo este perfil lo recibe, y no se puede asignar a otros
 PERFILES = {
     PERFIL_ADMIN: {m: 2 for m in TODOS},
@@ -115,6 +134,17 @@ CREATE TABLE IF NOT EXISTS pos_consumos(id INTEGER PRIMARY KEY, referencia TEXT 
   fecha TEXT NOT NULL, detalle TEXT NOT NULL DEFAULT '', estado TEXT NOT NULL DEFAULT 'VIGENTE', creado TEXT NOT NULL, anulado TEXT);
 CREATE TABLE IF NOT EXISTS inventarios(id INTEGER PRIMARY KEY, fecha TEXT NOT NULL, bodega_id INTEGER NOT NULL, estado TEXT NOT NULL DEFAULT 'ABIERTO',
   obs TEXT NOT NULL DEFAULT '', usuario_id INTEGER REFERENCES usuarios(id), cerrado TEXT, seccion TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS pos_transferencias(id INTEGER PRIMARY KEY, referencia TEXT NOT NULL UNIQUE, tipo TEXT NOT NULL CHECK(tipo IN ('SALIDA','ENTRADA')),
+  tienda_id INTEGER NOT NULL REFERENCES tiendas(id), contraparte_id INTEGER REFERENCES tiendas(id), fecha TEXT NOT NULL, detalle TEXT NOT NULL DEFAULT '',
+  estado TEXT NOT NULL DEFAULT 'VIGENTE', creado TEXT NOT NULL, anulado TEXT);
+CREATE TABLE IF NOT EXISTS fudo_equivalencias(id INTEGER PRIMARY KEY, tienda_id INTEGER NOT NULL REFERENCES tiendas(id), fudo_id TEXT NOT NULL,
+  fudo_nombre TEXT NOT NULL, fudo_unidad TEXT NOT NULL DEFAULT '', articulo_id INTEGER NOT NULL REFERENCES articulos(id), factor REAL NOT NULL,
+  base REAL NOT NULL DEFAULT 0, enviado REAL NOT NULL DEFAULT 0, base_fecha TEXT NOT NULL, creado TEXT NOT NULL,
+  UNIQUE(tienda_id, fudo_id), UNIQUE(tienda_id, articulo_id));
+CREATE TABLE IF NOT EXISTS fudo_stock_envios(despacho_id INTEGER PRIMARY KEY REFERENCES despachos(id), tienda_id INTEGER NOT NULL REFERENCES tiendas(id),
+  estado TEXT NOT NULL, items TEXT NOT NULL DEFAULT '{}', error TEXT NOT NULL DEFAULT '', actualizado TEXT NOT NULL, manual INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS fudo_sincronizaciones(id INTEGER PRIMARY KEY, tienda_id INTEGER NOT NULL REFERENCES tiendas(id), fecha TEXT NOT NULL,
+  creado TEXT NOT NULL, usuario_id INTEGER REFERENCES usuarios(id), estado TEXT NOT NULL DEFAULT 'VIGENTE', detalle TEXT NOT NULL DEFAULT '[]');
 CREATE TABLE IF NOT EXISTS pos_inventarios(referencia TEXT PRIMARY KEY, inventario_id INTEGER NOT NULL REFERENCES inventarios(id));
 CREATE TABLE IF NOT EXISTS inventario_items(inventario_id INTEGER NOT NULL REFERENCES inventarios(id) ON DELETE CASCADE,
   articulo_id INTEGER NOT NULL REFERENCES articulos(id), stock_sistema REAL NOT NULL, conteo REAL, diferencia REAL,
@@ -486,9 +516,10 @@ def articulos_de_bodega(db, bodega, seccion=""):
 RUTAS = []
 
 
-def ruta(metodo, patron, modulo=None, nivel=1, publica=False):
+def ruta(metodo, patron, modulo=None, nivel=1, publica=False, accion=None):
+    assert accion is None or accion in ACCIONES_IDS, accion
     def deco(fn):
-        RUTAS.append((metodo, re.compile("^" + patron + "$"), modulo, nivel, publica, fn))
+        RUTAS.append((metodo, re.compile("^" + patron + "$"), modulo, nivel, publica, accion, fn))
         return fn
     return deco
 
@@ -541,7 +572,8 @@ def cargar_usuario(db, u):
 def estado(c):
     cfg = {r["clave"]: r["valor"] for r in rows(c.db, "SELECT * FROM config WHERE clave='logo'")}
     return {"requiere_instalacion": not scalar(c.db, "SELECT COUNT(*) FROM usuarios"), "requiere_clave": bool(CLAVE_INSTALACION), "logo": cfg.get("logo"),
-            "usuario": c.user, "modulos": [{"id": m, "nombre": n} for m, n in MODULOS]}
+            "usuario": c.user, "modulos": [{"id": m, "nombre": n} for m, n in MODULOS],
+            "acciones": [{"id": a, "nombre": n, "modulo": m} for a, n, m in ACCIONES]}
 
 
 @ruta("POST", "/api/instalar", publica=True)
@@ -669,7 +701,11 @@ def perfiles_lista(c):
 def permisos_validos(v):
     if not isinstance(v, dict):
         raise ApiError(400, "Permisos inválidos.")
-    return json.dumps({m: int(v[m]) for m in TODOS if m in v and int(v[m]) in (1, 2)})
+    out = {m: int(v[m]) for m in TODOS if m in v and int(v[m]) in (1, 2)}
+    for a, _, modulo in ACCIONES:  # una acción crítica solo tiene sentido si el perfil puede editar su módulo
+        if v.get("acc_" + a) and (out.get(modulo) == 2 if modulo else 2 in out.values()):
+            out["acc_" + a] = 1
+    return json.dumps(out)
 
 
 @ruta("POST", "/api/perfiles", "usuarios", 2)
@@ -723,7 +759,7 @@ def crud_simple(tabla, modulo, campos, validar_edicion=None):
             c.db.execute(f"UPDATE {tabla} SET activo=? WHERE id=?", (1 if c.body["activo"] else 0, int(i)))
         return {"ok": True}
 
-    @ruta("DELETE", ruta_base + r"/(\d+)", modulo, 2)
+    @ruta("DELETE", ruta_base + r"/(\d+)", modulo, 2, accion="eliminar_registros")
     def borrar(c, i):
         c.db.execute(f"DELETE FROM {tabla} WHERE id=?", (int(i),))
         return {"ok": True}
@@ -805,7 +841,7 @@ def config_pos_quitar(c):
     return {"ok": True}
 
 
-@ruta("GET", "/api/config/respaldo", "config", 2)
+@ruta("GET", "/api/config/respaldo", "config", 2, accion="respaldo")
 def config_respaldo(c):
     with tempfile.TemporaryDirectory() as carpeta:
         ruta_copia = Path(carpeta) / "respaldo.db"
@@ -877,10 +913,10 @@ def articulos_editar(c, i):
 
 RELACIONES_ARTICULO = (("movimientos", "movimientos en el historial"), ("compra_items", "compras"), ("devolucion_items", "devoluciones a proveedores"), ("salida_interna_items", "devoluciones de tiendas o consumos internos"), ("historial_precios", "historial de precios"),
                        ("producciones", "producciones"), ("despacho_items", "guías de despacho"), ("mermas", "mermas"), ("salidas_tienda", "ventas o consumos de tienda"),
-                       ("recetas", "una receta propia"), ("receta_items", "recetas donde es ingrediente"))
+                       ("recetas", "una receta propia"), ("receta_items", "recetas donde es ingrediente"), ("fudo_equivalencias", "equivalencias con insumos de Fudo"))
 
 
-@ruta("DELETE", r"/api/articulos/(\d+)", "articulos", 2)
+@ruta("DELETE", r"/api/articulos/(\d+)", "articulos", 2, accion="eliminar_registros")
 def articulos_borrar(c, i):
     i = int(i)
     articulo(c.db, i)
@@ -962,7 +998,7 @@ def receta_guardar(c, art_id):
     return {"ok": True}
 
 
-@ruta("DELETE", r"/api/recetas/(\d+)", "recetas", 2)
+@ruta("DELETE", r"/api/recetas/(\d+)", "recetas", 2, accion="eliminar_registros")
 def receta_borrar(c, art_id):
     c.db.execute("DELETE FROM recetas WHERE articulo_id=?", (int(art_id),))
     return {"ok": True}
@@ -997,7 +1033,7 @@ def produccion_crear(c):
     return {"id": crear_produccion(c.db, c.uid, c.body)}
 
 
-@ruta("POST", r"/api/produccion/(\d+)/anular", "produccion", 2)
+@ruta("POST", r"/api/produccion/(\d+)/anular", "produccion", 2, accion="anular_produccion")
 def produccion_anular(c, i):
     anular(c.db, c.uid, "producciones", "PRODUCCION", int(i))
     return {"ok": True}
@@ -1028,7 +1064,7 @@ def compras_crear(c):
     return {"id": crear_compra(c.db, c.uid, c.body)}
 
 
-@ruta("POST", r"/api/compras/(\d+)/anular", "compras", 2)
+@ruta("POST", r"/api/compras/(\d+)/anular", "compras", 2, accion="anular_compras")
 def compras_anular(c, i):
     anular(c.db, c.uid, "compras", "COMPRA", int(i))
     return {"ok": True}
@@ -1109,7 +1145,7 @@ def salidas_internas_crear(c):
     return {"id": sid}
 
 
-@ruta("POST", r"/api/salidas-internas/(\d+)/anular", "despachos", 2)
+@ruta("POST", r"/api/salidas-internas/(\d+)/anular", "despachos", 2, accion="anular_salidas")
 def salidas_internas_anular(c, i):
     salida_interna_de(c, i)
     c.sin_tienda()
@@ -1201,9 +1237,21 @@ def fudo_lista(cfg, ruta):
 @ruta("GET", "/api/fudo", "config", 2)
 def fudo_tiendas_lista(c):
     return rows(c.db, """SELECT t.id tienda_id, t.nombre, COALESCE(f.categoria,'') categoria, COALESCE(f.categoria_id,'') categoria_id, COALESCE(f.proveedor,'') proveedor,
-        COALESCE(f.proveedor_id,'') proveedor_id, COALESCE(f.monto,'TOTAL') monto, CASE WHEN f.api_secret<>'' THEN 1 ELSE 0 END conectada,
-        CASE WHEN f.api_key<>'' THEN substr(f.api_key,-4) ELSE '' END key_final
+        COALESCE(f.proveedor_id,'') proveedor_id, COALESCE(f.monto,'TOTAL') monto, COALESCE(f.stock_modo,'SISTEMA') stock_modo, CASE WHEN f.api_secret<>'' THEN 1 ELSE 0 END conectada,
+        CASE WHEN f.api_key<>'' THEN substr(f.api_key,-4) ELSE '' END key_final,
+        (SELECT group_concat(t2.nombre, ', ') FROM fudo_tiendas f2 JOIN tiendas t2 ON t2.id=f2.tienda_id
+          WHERE f2.api_key=f.api_key AND f.api_key<>'' AND f2.tienda_id<>f.tienda_id) comparte_con,
+        (SELECT COUNT(*) FROM fudo_equivalencias e WHERE e.tienda_id=t.id) equivalencias
         FROM tiendas t LEFT JOIN fudo_tiendas f ON f.tienda_id=t.id WHERE t.activo=1 ORDER BY t.nombre""")
+
+
+def fudo_cuenta_propia(db, tienda):
+    """El stock de Fudo es por cuenta: si otra tienda usa la misma, las operaciones de stock mezclarían tiendas."""
+    otras = [r["nombre"] for r in rows(db, """SELECT t.nombre FROM fudo_tiendas f JOIN fudo_tiendas f2 ON f2.api_key=f.api_key AND f2.tienda_id<>f.tienda_id
+        JOIN tiendas t ON t.id=f2.tienda_id WHERE f.tienda_id=? AND f.api_key<>''""", tienda)]
+    if otras:
+        raise ApiError(409, f"Esta tienda usa la misma cuenta Fudo que {', '.join(otras)}. El stock de Fudo es por cuenta: "
+                            "conecta cada tienda con la API Key y API Secret de su propia cuenta antes de operar stock.")
 
 
 @ruta("PUT", r"/api/fudo/(\d+)/credenciales", "config", 2)
@@ -1214,6 +1262,19 @@ def fudo_credenciales(c, t):
     actual = row(c.db, "SELECT * FROM fudo_tiendas WHERE tienda_id=?", t) or {}
     clave = txt(c.body.get("api_key"), "la API Key", not actual.get("api_key"), 200) or actual.get("api_key")
     secreto = txt(c.body.get("api_secret"), "la API Secret", not actual.get("api_secret"), 500) or actual.get("api_secret")
+    otra = row(c.db, "SELECT t.nombre FROM fudo_tiendas f JOIN tiendas t ON t.id=f.tienda_id WHERE f.api_key=? AND f.tienda_id<>?", clave, t)
+    if otra:
+        raise ApiError(409, f"Esa API Key ya está conectada a {otra['nombre']}. Cada tienda debe usar las credenciales de su propia cuenta Fudo.")
+    if actual.get("api_key") and clave != actual["api_key"]:
+        # Las equivalencias apuntan a insumos de la cuenta anterior: no sirven en la nueva.
+        n = scalar(c.db, "SELECT COUNT(*) FROM fudo_equivalencias WHERE tienda_id=?", t)
+        if n and not c.body.get("reiniciar_equivalencias"):
+            raise ApiError(409, f"Al cambiar de cuenta Fudo se borrarán las {n} equivalencias de esta tienda (apuntan a la cuenta anterior). Confirma para continuar.")
+        if fudo_stock_pendiente(c.db, t):
+            raise ApiError(409, "Hay guías de esta tienda con envío de stock a Fudo por revisar. Resuélvelas antes de cambiar de cuenta.")
+        c.db.execute("DELETE FROM fudo_equivalencias WHERE tienda_id=?", (t,))
+        # proveedor y categoría de gasto también son de la otra cuenta: se eligen de nuevo en "Ajustar gastos"
+        c.db.execute("UPDATE fudo_tiendas SET proveedor_id='', proveedor='', categoria_id='', categoria='' WHERE tienda_id=?", (t,))
     c.db.execute("INSERT INTO fudo_tiendas(tienda_id,api_key,api_secret) VALUES(?,?,?) ON CONFLICT(tienda_id) DO UPDATE SET api_key=excluded.api_key,api_secret=excluded.api_secret",
                  (t, clave, secreto))
     FUDO_TOKENS.pop(t, None)
@@ -1234,6 +1295,10 @@ def fudo_ajustes(c, t):
     d = c.body
     if d.get("monto") not in ("TOTAL", "NETO"):
         raise ApiError(400, "Indica si se envía el total o el neto.")
+    modo = d.get("stock_modo") or "SISTEMA"
+    if modo not in ("SISTEMA", "MANUAL"):
+        raise ApiError(400, "Indica cómo se suma el stock en Fudo.")
+    c.db.execute("UPDATE fudo_tiendas SET stock_modo=? WHERE tienda_id=?", (modo, int(t)))
     fudo_config(c.db, int(t))
     categoria_id = txt(d.get("categoria_id"), "la categoría de gasto", True, 10)
     if not categoria_id.isdigit() or not str(d.get("proveedor_id") or "0").isdigit():
@@ -1243,14 +1308,38 @@ def fudo_ajustes(c, t):
     return {"ok": True}
 
 
-def fudo_gasto(g, cfg):
+PROVEEDOR_FUDO = "Nata & Schlott"
+
+
+def fudo_proveedor_ns(cfg):
+    """Id del proveedor "Nata & Schlott" en la cuenta Fudo de la tienda; si no existe, se crea."""
+    clave = lambda s: re.sub(r"[^a-z0-9]", "", s.lower().replace("&", "y"))
+    for p in fudo_lista(cfg, "/providers"):
+        if clave(p["nombre"]) == clave(PROVEEDOR_FUDO):
+            return p["id"]
+    try:
+        return str(fudo_api(cfg, "/providers", "POST", {"data": {"type": "Provider", "attributes": {"name": PROVEEDOR_FUDO}}})["data"]["id"])
+    except (KeyError, TypeError):
+        raise FudoError("Fudo no devolvió el proveedor creado.") from None
+
+
+def fudo_medio_efectivo(cfg):
+    """Id del medio de pago "Efectivo" en la cuenta Fudo de la tienda."""
+    for m in fudo_lista(cfg, "/payment-methods"):
+        if "efectivo" in m["nombre"].lower():
+            return m["id"]
+    raise FudoError("La cuenta Fudo de esta tienda no tiene un medio de pago llamado Efectivo.")
+
+
+def fudo_gasto(g, cfg, proveedor_id, medio_id):
     num_guia = f"GD-{g['id']:06d}"
-    relaciones = {"expenseCategory": {"data": {"id": cfg["categoria_id"], "type": "ExpenseCategory"}}}
-    if cfg["proveedor_id"]:
-        relaciones["provider"] = {"data": {"id": cfg["proveedor_id"], "type": "Provider"}}
+    relaciones = {"expenseCategory": {"data": {"id": cfg["categoria_id"], "type": "ExpenseCategory"}},
+                  "provider": {"data": {"id": proveedor_id, "type": "Provider"}},
+                  "paymentMethod": {"data": {"id": medio_id, "type": "PaymentMethod"}}}
+    desc = f"{datetime.now():%d-%m-%Y %H:%M} · Guía N° {g['id']:06d}"  # comentario: fecha y hora del envío y número de guía
     return {"data": {"type": "Expense", "attributes": {
-        "amount": round(g["total"] if cfg["monto"] == "TOTAL" else g["neto"]), "date": g["fecha"][:10], "useInCashCount": False,
-        "receiptNumber": num_guia, "description": f"Guía de despacho interna N° {g['id']:06d} desde Nata & Schlott"}, "relationships": relaciones}}
+        "amount": round(g["total"] if cfg["monto"] == "TOTAL" else g["neto"]), "date": g["fecha"][:10], "paymentDate": g["fecha"][:10],
+        "useInCashCount": False, "receiptNumber": num_guia, "description": desc[:255]}, "relationships": relaciones}}
 
 
 def fudo_guardar(db, gid, estado, gasto=None, error=""):
@@ -1260,7 +1349,7 @@ def fudo_guardar(db, gid, estado, gasto=None, error=""):
         db.execute("UPDATE despachos SET fudo_estado=?,fudo_gasto_id=?,fudo_error=? WHERE id=?", (estado, gasto, error, gid))
 
 
-@ruta("POST", r"/api/despachos/(\d+)/fudo", "despachos", 2)
+@ruta("POST", r"/api/despachos/(\d+)/fudo", "despachos", 2, accion="enviar_fudo")
 def despacho_a_fudo(c, i):
     """El estado ENVIANDO se confirma antes de llamar a Fudo: si el resultado es incierto, no se reenvía sin confirmación."""
     c.sin_tienda()
@@ -1275,10 +1364,16 @@ def despacho_a_fudo(c, i):
     if g["fudo_estado"] in ("ENVIANDO", "REVISAR") and not c.body.get("confirmar_reenvio"):
         raise ApiError(409, "No se sabe si el gasto de esta guía llegó a Fudo. Revísalo allá antes de reenviar.")
     cfg = fudo_config(c.db, g["tienda_id"])
+    fudo_cuenta_propia(c.db, g["tienda_id"])  # el gasto iría a la cuenta de otra tienda
     if not cfg["categoria_id"]:
         raise ApiError(400, "Falta elegir la categoría de gasto de esta tienda en Administración → Integración Fudo.")
+    try:  # proveedor y medio de pago se resuelven antes de marcar la guía: si fallan, no hay nada incierto
+        prov, medio = fuera_de_tx(c.db, lambda: (fudo_proveedor_ns(cfg), fudo_medio_efectivo(cfg)))
+    except FudoError as e:
+        return {"ok": False, "error": "No se pudo preparar el gasto en Fudo. " + e.mensaje}
+    c.db.execute("UPDATE fudo_tiendas SET proveedor_id=?, proveedor=? WHERE tienda_id=?", (prov, PROVEEDOR_FUDO, g["tienda_id"]))
     fudo_guardar(c.db, gid, "ENVIANDO")
-    cuerpo = fudo_gasto(g, cfg)
+    cuerpo = fudo_gasto(g, cfg, prov, medio)
     try:
         r = fuera_de_tx(c.db, lambda: fudo_api(cfg, "/expenses", "POST", cuerpo))
         gasto = str(r["data"]["id"])
@@ -1289,10 +1384,64 @@ def despacho_a_fudo(c, i):
         fudo_guardar(c.db, gid, "REVISAR" if e.incierto else "", error=e.mensaje)
         return {"ok": False, "error": e.mensaje + (" No se sabe si el gasto llegó: revísalo en Fudo antes de reenviar." if e.incierto else "")}
     fudo_guardar(c.db, gid, "ENVIADO", gasto)
-    return {"ok": True, "gasto_id": gasto}
+    pago = despacho_pagar(c, {**g, "fudo_gasto_id": gasto}, cfg, cuerpo["data"]["attributes"]["amount"], medio)
+    return {"ok": True, "gasto_id": gasto, **pago, **despacho_stock_tras_gasto(c, g)}
 
 
-@ruta("POST", r"/api/despachos/(\d+)/fudo/anular", "despachos", 2)
+def despacho_pagar(c, g, cfg, monto, medio=None):
+    """Registra en Fudo el pago del gasto (Efectivo, fecha de la guía) para que quede "Pagado". Sin caja: no afecta el arqueo."""
+    c.db.execute("UPDATE despachos SET fudo_pago='REVISAR' WHERE id=?", (g["id"],))  # si se corta a mitad, queda por revisar
+    confirmar_tx(c.db)
+    try:
+        def pagar():
+            m = medio or fudo_medio_efectivo(cfg)
+            return fudo_api(cfg, "/payments", "POST", {"data": {"type": "Payment", "attributes": {"amount": monto, "paidAt": g["fecha"][:10]},
+                "relationships": {"paymentMethod": {"data": {"id": m, "type": "PaymentMethod"}}, "expense": {"data": {"id": g["fudo_gasto_id"], "type": "Expense"}}}}})
+        r = fuera_de_tx(c.db, pagar)
+        pid = str(r["data"]["id"])
+    except (KeyError, TypeError):
+        return {"pago": "REVISAR", "pago_error": "Fudo respondió sin el número del pago. Revisa el gasto en Fudo."}
+    except FudoError as e:
+        c.db.execute("UPDATE despachos SET fudo_pago=? WHERE id=?", ("REVISAR" if e.incierto else "", g["id"]))
+        return {"pago": "REVISAR" if e.incierto else "", "pago_error": e.mensaje + (" No se sabe si el pago llegó: revisa el gasto en Fudo antes de reintentar." if e.incierto else "")}
+    c.db.execute("UPDATE despachos SET fudo_pago=? WHERE id=?", (pid, g["id"]))
+    return {"pago": "PAGADO", "pago_id": pid}
+
+
+@ruta("POST", r"/api/despachos/(\d+)/fudo/pago", "despachos", 2, accion="enviar_fudo")
+def despacho_fudo_pago(c, i):
+    """Reintenta el pago de un gasto ya creado en Fudo."""
+    c.sin_tienda()
+    g = row(c.db, "SELECT * FROM despachos WHERE id=?", int(i))
+    if not g:
+        raise ApiError(404, "Guía no encontrada.")
+    if g["fudo_estado"] != "ENVIADO" or g["estado"] != "VIGENTE":
+        raise ApiError(409, "Esta guía no tiene un gasto vigente en Fudo.")
+    if g["fudo_pago"] not in ("", "REVISAR"):
+        raise ApiError(409, "El gasto de esta guía ya está pagado en Fudo.")
+    if g["fudo_pago"] == "REVISAR" and not c.body.get("confirmar_reenvio"):
+        raise ApiError(409, "No se sabe si el pago anterior llegó a Fudo. Revisa el gasto allá antes de reintentar.")
+    cfg = fudo_config(c.db, g["tienda_id"])
+    r = despacho_pagar(c, g, cfg, round(g["total"] if cfg["monto"] == "TOTAL" else g["neto"]))
+    return {"ok": r["pago"] == "PAGADO", "error": r.get("pago_error", ""), **r}
+
+
+def despacho_stock_tras_gasto(c, g):
+    """Con el gasto creado, suma en Fudo el stock de los insumos equivalentes (si aún no se sumó)."""
+    envio = row(c.db, "SELECT * FROM fudo_stock_envios WHERE despacho_id=?", g["id"])
+    if not despacho_lineas_fudo(c.db, g):
+        return {"stock": "SIN_EQUIVALENCIAS"}
+    if envio and envio["estado"] in ("ENVIADO", "ENVIANDO", "REVISAR"):
+        return {"stock": envio["estado"]}
+    confirmar_tx(c.db)  # el gasto queda guardado aunque falle el stock
+    try:
+        r = fudo_mover_stock(c, g, envio, 1, "ENVIADO")
+    except ApiError as e:
+        return {"stock": "", "stock_error": e.mensaje}
+    return {"stock": r["estado"], "stock_error": r["error"], "manual": bool(r.get("manual"))}
+
+
+@ruta("POST", r"/api/despachos/(\d+)/fudo/anular", "despachos", 2, accion="anular_fudo")
 def despacho_fudo_anular(c, i):
     c.sin_tienda()
     gid = int(i)
@@ -1310,7 +1459,553 @@ def despacho_fudo_anular(c, i):
         fudo_guardar(c.db, gid, "ENVIADO", error=e.mensaje)
         return {"ok": False, "error": e.mensaje}
     fudo_guardar(c.db, gid, "ANULADO")
+    envio = row(c.db, "SELECT * FROM fudo_stock_envios WHERE despacho_id=?", gid)
+    if envio and envio["estado"] in ("ENVIADO", "ERROR") and any(it.get("estado") == "OK" for it in json.loads(envio["items"]).values()):
+        confirmar_tx(c.db)  # el gasto anulado queda guardado aunque falle la resta de stock
+        try:
+            r = fudo_mover_stock(c, g, envio, -1, "REVERTIDO")
+        except ApiError as e:
+            return {"ok": True, "stock": "", "stock_error": e.mensaje}
+        return {"ok": True, "stock": r["estado"], "stock_error": r["error"]}
     return {"ok": True}
+
+
+# ---------------------------------------------------------------- Fudo: insumos equivalentes y stock
+# Fudo no expone sus recetas: el consumo por ventas se obtiene del stock de sus insumos.
+# Por cada equivalencia se guarda "base" (stock Fudo en la última lectura) y "enviado" (lo que el sistema le sumó desde entonces).
+# Consumo por ventas = base + enviado − stock Fudo actual (en unidades de Fudo); × factor = unidades del sistema.
+
+FUDO_STOCK_LOCK = threading.Lock()  # lectura y escritura de stock en Fudo no son atómicas: una operación a la vez
+
+
+def ahora():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def confirmar_tx(db):
+    db.execute("COMMIT")
+    db.execute("BEGIN IMMEDIATE")
+
+
+def fudo_ingredientes(cfg):
+    """{fudo_id: {id, nombre, unidad, stock (None si Fudo no controla su stock), control}} de todas las páginas."""
+    out, unidades, n = {}, {}, 1
+    while True:
+        r = fudo_api(cfg, f"/ingredients?page%5Bsize%5D=500&page%5Bnumber%5D={n}&include=unit")
+        for x in r.get("included") or []:
+            if x.get("type") == "Unit":
+                a = x.get("attributes") or {}
+                unidades[str(x.get("id"))] = a.get("abbreviation") or a.get("symbol") or a.get("name") or ""
+        datos = r.get("data") or []
+        for x in datos:
+            a = x.get("attributes") or {}
+            uid = (((x.get("relationships") or {}).get("unit") or {}).get("data") or {}).get("id")
+            out[str(x["id"])] = {"id": str(x["id"]), "nombre": a.get("name") or str(x["id"]), "unidad": unidades.get(str(uid), ""),
+                                 "stock": None if a.get("stock") is None else float(a["stock"]), "control": bool(a.get("stockControl")),
+                                 "costo": float(a.get("cost") or 0)}
+        if len(datos) < 500 or n >= 50:
+            return out
+        n += 1
+
+
+def fudo_stock_de(cfg, fid):
+    a = (fudo_api(cfg, f"/ingredients/{fid}").get("data") or {}).get("attributes") or {}
+    if a.get("stock") is None:
+        raise FudoError("Este insumo no tiene control de stock en Fudo. Actívalo allá.")
+    return float(a["stock"])
+
+
+def fudo_poner_stock(cfg, fid, valor):
+    fudo_api(cfg, f"/ingredients/{fid}", "PATCH", {"data": {"id": str(fid), "type": "Ingredient", "attributes": {"stock": round(valor, 5)}}})
+
+
+def equivalencias_de(db, tienda):
+    return rows(db, """SELECT e.*, a.codigo, a.nombre, un.abreviatura unidad, COALESCE(s.cantidad,0) stock_sistema FROM fudo_equivalencias e
+        JOIN articulos a ON a.id=e.articulo_id JOIN unidades un ON un.id=a.unidad_id
+        LEFT JOIN stock s ON s.articulo_id=e.articulo_id AND s.bodega_id=e.tienda_id WHERE e.tienda_id=? ORDER BY a.nombre""", tienda)
+
+
+@ruta("GET", r"/api/fudo/(\d+)/ingredientes", "config", 2)
+def fudo_ingredientes_lista(c, t):
+    cfg = fudo_config(c.db, int(t))
+    try:
+        return sorted(fuera_de_tx_lectura(c.db, lambda: fudo_ingredientes(cfg)).values(), key=lambda x: x["nombre"].lower())
+    except FudoError as e:
+        raise ApiError(502, e.mensaje) from None
+
+
+def fuera_de_tx_lectura(db, fn):
+    """En GET no hay transacción abierta: la llamada a Fudo no retiene la base."""
+    return fn() if not db.in_transaction else fuera_de_tx(db, fn)
+
+
+@ruta("GET", r"/api/fudo/(\d+)/equivalencias", "config", 2)
+def fudo_equivalencias_lista(c, t):
+    return equivalencias_de(c.db, int(t))
+
+
+def validar_equivalencia(db, d):
+    aid = entero(d.get("articulo_id"), "el artículo del sistema")
+    if not row(db, "SELECT id FROM articulos WHERE id=? AND activo=1 AND (tipo='PRODUCTO' OR desechable=1)", aid):
+        raise ApiError(400, "Solo se pueden asociar artículos que se manejan en tiendas: productos, insumos de punto de venta y desechables.")
+    return aid, num(d.get("factor"), "La equivalencia", 0, True)
+
+
+@ruta("POST", r"/api/fudo/(\d+)/equivalencias", "config", 2)
+def fudo_equivalencia_crear(c, t):
+    t = int(t)
+    cfg = fudo_config(c.db, t)
+    fudo_cuenta_propia(c.db, t)
+    d = c.body
+    fid = txt(d.get("fudo_id"), "el insumo de Fudo", True, 12)
+    if not fid.isdigit():
+        raise ApiError(400, "Insumo de Fudo no válido.")
+    aid, factor = validar_equivalencia(c.db, d)
+    if row(c.db, "SELECT id FROM fudo_equivalencias WHERE tienda_id=? AND fudo_id=?", t, fid):
+        raise ApiError(409, "Ese insumo de Fudo ya tiene equivalencia en esta tienda.")
+    if row(c.db, "SELECT id FROM fudo_equivalencias WHERE tienda_id=? AND articulo_id=?", t, aid):
+        raise ApiError(409, "Ese artículo del sistema ya está asociado a otro insumo de Fudo en esta tienda.")
+    with FUDO_STOCK_LOCK:
+        try:
+            base = fuera_de_tx(c.db, lambda: fudo_stock_de(cfg, fid))
+        except FudoError as e:
+            raise ApiError(502, e.mensaje) from None
+        eid = c.db.execute("""INSERT INTO fudo_equivalencias(tienda_id,fudo_id,fudo_nombre,fudo_unidad,articulo_id,factor,base,enviado,base_fecha,creado)
+            VALUES(?,?,?,?,?,?,?,0,?,?)""", (t, fid, txt(d.get("fudo_nombre"), "El nombre en Fudo", False, 255) or fid,
+                                           txt(d.get("fudo_unidad"), "La unidad en Fudo", False, 30), aid, factor, base, ahora(), ahora())).lastrowid
+        confirmar_tx(c.db)
+    return {"id": eid, "base": base}
+
+
+@ruta("PUT", r"/api/fudo/equivalencias/(\d+)", "config", 2)
+def fudo_equivalencia_editar(c, i):
+    e = row(c.db, "SELECT * FROM fudo_equivalencias WHERE id=?", int(i))
+    if not e:
+        raise ApiError(404, "Equivalencia no encontrada.")
+    aid, factor = validar_equivalencia(c.db, c.body)
+    if row(c.db, "SELECT id FROM fudo_equivalencias WHERE tienda_id=? AND articulo_id=? AND id<>?", e["tienda_id"], aid, e["id"]):
+        raise ApiError(409, "Ese artículo del sistema ya está asociado a otro insumo de Fudo en esta tienda.")
+    c.db.execute("UPDATE fudo_equivalencias SET articulo_id=?, factor=? WHERE id=?", (aid, factor, e["id"]))
+    return {"ok": True}
+
+
+@ruta("DELETE", r"/api/fudo/equivalencias/(\d+)", "config", 2)
+def fudo_equivalencia_borrar(c, i):
+    c.db.execute("DELETE FROM fudo_equivalencias WHERE id=?", (int(i),))
+    return {"ok": True}
+
+
+def normalizar_nombre(s):
+    s = unicodedata.normalize("NFKD", str(s or "").lower())
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    s = re.sub(r"^(in|ipv|ida|p|sp)\s+", "", s.strip())  # prefijos de código que a veces se escriben en Fudo ("IN GALLETA…")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def sugerir_articulo(nombre, articulos):
+    """Artículo de tienda más parecido por nombre (o None)."""
+    n = normalizar_nombre(nombre)
+    if not n:
+        return None
+    mejor, puntaje = None, 0.0
+    for a in articulos:
+        m = normalizar_nombre(a["nombre"])
+        p = 1.0 if m == n else difflib.SequenceMatcher(None, n, m).ratio()
+        if m and (m in n or n in m):
+            p = max(p, 0.85)
+        if p > puntaje:
+            mejor, puntaje = a, p
+    return (mejor["id"], round(puntaje, 2)) if mejor and puntaje >= 0.72 else None
+
+
+def sugerir_unidad(db, abrev):
+    a = normalizar_nombre(abrev)
+    # Se lleva a un nombre canónico y se compara contra nombre y abreviatura de las unidades del sistema
+    canon = {"un": "unidad", "unit": "unidad", "units": "unidad", "unidades": "unidad", "u": "unidad",
+             "kg": "kilogramo", "kilo": "kilogramo", "kilogram": "kilogramo", "kilos": "kilogramo",
+             "g": "gramo", "gr": "gramo", "gram": "gramo", "gramos": "gramo",
+             "l": "litro", "lt": "litro", "litre": "litro", "liter": "litro", "litros": "litro",
+             "ml": "mililitro", "cc": "mililitro", "millilitre": "mililitro", "milliliter": "mililitro"}
+    a = canon.get(a, a)
+    for u in rows(db, "SELECT id, nombre, abreviatura FROM unidades"):
+        if a and a in {canon.get(normalizar_nombre(u["abreviatura"]), normalizar_nombre(u["abreviatura"])),
+                       canon.get(normalizar_nombre(u["nombre"]), normalizar_nombre(u["nombre"]))}:
+            return u["id"]
+    return None
+
+
+@ruta("GET", r"/api/fudo/(\d+)/importar", "config", 2)
+def fudo_importar_lista(c, t):
+    """Insumos de Fudo de la tienda, con su equivalencia actual o una sugerencia de artículo y unidad para importarlos."""
+    t = int(t)
+    cfg = fudo_config(c.db, t)
+    try:
+        ing = fuera_de_tx_lectura(c.db, lambda: fudo_ingredientes(cfg))
+    except FudoError as e:
+        raise ApiError(502, e.mensaje) from None
+    eqs = {e["fudo_id"]: e for e in equivalencias_de(c.db, t)}
+    usados = {e["articulo_id"] for e in eqs.values()}
+    articulos = rows(c.db, "SELECT id, nombre FROM articulos WHERE activo=1 AND (tipo='PRODUCTO' OR desechable=1)")
+    libres = [a for a in articulos if a["id"] not in usados]
+    out = []
+    for f in sorted(ing.values(), key=lambda x: x["nombre"].lower()):
+        e = eqs.get(f["id"])
+        sug = None if e else sugerir_articulo(f["nombre"], libres)
+        out.append({**f, "equivalencia": {"articulo_id": e["articulo_id"], "codigo": e["codigo"], "nombre": e["nombre"], "factor": e["factor"]} if e else None,
+                    "sugerido_id": sug[0] if sug else None, "parecido": sug[1] if sug else None, "unidad_id": sugerir_unidad(c.db, f["unidad"])})
+    return out
+
+
+@ruta("POST", r"/api/fudo/(\d+)/importar", "config", 2)
+def fudo_importar(c, t):
+    """Crea en lote las equivalencias elegidas; si se pide, crea antes el artículo del sistema. Todo o nada."""
+    t = int(t)
+    cfg = fudo_config(c.db, t)
+    fudo_cuenta_propia(c.db, t)
+    items = c.body.get("items")
+    if not isinstance(items, list) or not items:
+        raise ApiError(400, "Selecciona al menos un insumo de Fudo.")
+    if any(isinstance(i, dict) and i.get("nuevo") for i in items) and c.user["permisos"].get("articulos", 0) < 2:
+        raise ApiError(403, "Para crear artículos nuevos tu perfil necesita editar Artículos y catálogos.")
+    with FUDO_STOCK_LOCK:
+        try:
+            ing = fuera_de_tx(c.db, lambda: fudo_ingredientes(cfg))
+        except FudoError as e:
+            raise ApiError(502, e.mensaje) from None
+        creados, asociados, vistos = [], 0, set()
+        for i in items:
+            if not isinstance(i, dict):
+                raise ApiError(400, "Detalle inválido.")
+            fid = str(i.get("fudo_id") or "")
+            f = ing.get(fid)
+            if not f:
+                raise ApiError(404, f"El insumo {fid} ya no existe en Fudo.")
+            if f["stock"] is None:
+                raise ApiError(400, f"{f['nombre']}: activa el control de stock de este insumo en Fudo antes de importarlo.")
+            if fid in vistos or row(c.db, "SELECT id FROM fudo_equivalencias WHERE tienda_id=? AND fudo_id=?", t, fid):
+                raise ApiError(409, f"{f['nombre']} ya tiene equivalencia en esta tienda.")
+            vistos.add(fid)
+            nuevo = i.get("nuevo")
+            if nuevo:
+                grupo = nuevo.get("grupo")
+                if grupo not in ("PRODUCTO", "PUNTO_VENTA", "DESECHABLE"):
+                    raise ApiError(400, f"{f['nombre']}: elige si es producto, insumo de punto de venta o desechable.")
+                datos = {"tipo": "PRODUCTO" if grupo == "PRODUCTO" else "INSUMO", "categoria_id": nuevo.get("categoria_id"), "unidad_id": nuevo.get("unidad_id"),
+                         "nombre": txt(nuevo.get("nombre") or f["nombre"], "El nombre", True, 120), "precio": f["costo"],
+                         "desechable": grupo == "DESECHABLE"}
+                if grupo != "PRODUCTO":
+                    datos["punto_venta"] = grupo == "PUNTO_VENTA"
+                try:
+                    v = datos_articulo(c.db, datos)
+                except ApiError as e:
+                    raise ApiError(e.status, f"{f['nombre']}: {e.mensaje}") from None
+                aid = c.db.execute("INSERT INTO articulos(tipo,desechable,categoria_id,unidad_id,codigo,nombre,stock_minimo,precio,costo) VALUES(?,?,?,?,?,?,?,?,?)",
+                                   (*v, v[7] if v[0] == "INSUMO" else 0)).lastrowid
+                creados.append({"id": aid, "codigo": v[4], "nombre": v[5]})
+            else:
+                aid = entero(i.get("articulo_id"), f"el artículo del sistema para {f['nombre']}")
+            try:
+                _, factor = validar_equivalencia(c.db, {"articulo_id": aid, "factor": i.get("factor", 1)})
+            except ApiError as e:
+                raise ApiError(e.status, f"{f['nombre']}: {e.mensaje}") from None
+            if row(c.db, "SELECT id FROM fudo_equivalencias WHERE tienda_id=? AND articulo_id=?", t, aid):
+                raise ApiError(409, f"{f['nombre']}: ese artículo del sistema ya está asociado a otro insumo de Fudo en esta tienda.")
+            c.db.execute("""INSERT INTO fudo_equivalencias(tienda_id,fudo_id,fudo_nombre,fudo_unidad,articulo_id,factor,base,enviado,base_fecha,creado)
+                VALUES(?,?,?,?,?,?,?,0,?,?)""", (t, fid, f["nombre"], f["unidad"], aid, factor, f["stock"], ahora(), ahora()))
+            asociados += 1
+        confirmar_tx(c.db)
+    return {"equivalencias": asociados, "creados": creados}
+
+
+def fudo_stock_pendiente(db, tienda):
+    return scalar(db, "SELECT COUNT(*) FROM fudo_stock_envios WHERE tienda_id=? AND estado IN ('ENVIANDO','REVISAR')", tienda)
+
+
+@ruta("GET", r"/api/fudo/(\d+)/comparar", "config", 2)
+def fudo_comparar(c, t):
+    """Stock del sistema y de Fudo lado a lado, y el consumo por ventas que se descontaría al sincronizar."""
+    t = int(t)
+    cfg = fudo_config(c.db, t)
+    eqs = equivalencias_de(c.db, t)
+    try:
+        ing = fuera_de_tx_lectura(c.db, lambda: fudo_ingredientes(cfg)) if eqs else {}
+    except FudoError as e:
+        raise ApiError(502, e.mensaje) from None
+    filas = []
+    for e in eqs:
+        f = ing.get(e["fudo_id"])
+        fila = {**e, "fudo_stock": None, "fudo_en_sistema": None, "diferencia": None, "consumo_pendiente": None,
+                "error": "" if f else "El insumo ya no existe en Fudo."}
+        if f and f["stock"] is None:
+            fila["error"] = "Fudo no controla el stock de este insumo."
+        elif f:
+            fila.update(fudo_stock=f["stock"], fudo_en_sistema=round(f["stock"] * e["factor"], 5),
+                        diferencia=round(f["stock"] * e["factor"] - e["stock_sistema"], 5),
+                        consumo_pendiente=round((e["base"] + e["enviado"] - f["stock"]) * e["factor"], 5))
+        filas.append(fila)
+    sin_enviar = scalar(c.db, """SELECT COUNT(DISTINCT d.id) FROM despachos d JOIN despacho_items i ON i.despacho_id=d.id
+        JOIN fudo_equivalencias e ON e.articulo_id=i.articulo_id AND e.tienda_id=d.tienda_id
+        LEFT JOIN fudo_stock_envios f ON f.despacho_id=d.id
+        WHERE d.tienda_id=? AND d.estado='VIGENTE' AND d.fecha>=substr(e.creado,1,10) AND COALESCE(f.estado,'') NOT IN ('ENVIADO')""", t)
+    comparte = [r["nombre"] for r in rows(c.db, """SELECT t.nombre FROM fudo_tiendas f JOIN fudo_tiendas f2 ON f2.api_key=f.api_key AND f2.tienda_id<>f.tienda_id
+        JOIN tiendas t ON t.id=f2.tienda_id WHERE f.tienda_id=? AND f.api_key<>''""", t)]
+    return {"filas": filas, "guias_sin_enviar": sin_enviar, "envios_por_revisar": fudo_stock_pendiente(c.db, t), "comparte_con": comparte}
+
+
+@ruta("POST", r"/api/fudo/(\d+)/sincronizar", "config", 2, accion="stock_fudo")
+def fudo_sincronizar(c, t):
+    """Descuenta del stock de la tienda lo que Fudo consumió por ventas desde la sincronización anterior."""
+    t = int(t)
+    cfg = fudo_config(c.db, t)
+    fudo_cuenta_propia(c.db, t)
+    if fudo_stock_pendiente(c.db, t):
+        raise ApiError(409, "Hay guías cuyo envío de stock a Fudo quedó por revisar. Resuélvelas en Despachos antes de sincronizar.")
+    if not row(c.db, "SELECT id FROM fudo_equivalencias WHERE tienda_id=?", t):
+        raise ApiError(400, "Esta tienda aún no tiene insumos equivalentes con Fudo.")
+    fecha = fecha_valida(c.body.get("fecha"))
+    with FUDO_STOCK_LOCK:
+        try:
+            ing = fuera_de_tx(c.db, lambda: fudo_ingredientes(cfg))
+        except FudoError as e:
+            raise ApiError(502, e.mensaje) from None
+        sid = c.db.execute("INSERT INTO fudo_sincronizaciones(tienda_id,fecha,creado,usuario_id) VALUES(?,?,?,?)", (t, fecha, ahora(), c.uid)).lastrowid
+        detalle = []
+        for e in equivalencias_de(c.db, t):
+            f = ing.get(e["fudo_id"])
+            linea = {"articulo_id": e["articulo_id"], "codigo": e["codigo"], "nombre": e["nombre"], "unidad": e["unidad"], "fudo_nombre": e["fudo_nombre"]}
+            if not f or f["stock"] is None:
+                detalle.append({**linea, "error": "El insumo ya no existe en Fudo." if not f else "Fudo no controla el stock de este insumo."})
+                continue
+            consumo_fudo = round(e["base"] + e["enviado"] - f["stock"], 5)
+            consumo = round(consumo_fudo * e["factor"], 5)
+            descontado = round(min(max(consumo, 0), max(stock_de(c.db, t, e["articulo_id"]), 0)), 5)
+            if descontado > 0:
+                mover(c.db, e["articulo_id"], t, -descontado, "VENTA_FUDO", c.uid, fecha, "FUDO_VENTA", sid, f"Ventas Fudo #{sid}",
+                      obs=f"Consumo en Fudo de {e['fudo_nombre']}: {consumo_fudo:g} {e['fudo_unidad']}".strip())
+            c.db.execute("UPDATE fudo_equivalencias SET base=?, enviado=0, base_fecha=? WHERE id=?", (f["stock"], ahora(), e["id"]))
+            detalle.append({**linea, "consumo": consumo + 0.0, "descontado": descontado + 0.0, "faltante": round(max(consumo - descontado, 0), 5) + 0.0,
+                            "entrada_en_fudo": round(max(-consumo, 0), 5) + 0.0})
+        c.db.execute("UPDATE fudo_sincronizaciones SET detalle=? WHERE id=?", (json.dumps(detalle, ensure_ascii=False), sid))
+        confirmar_tx(c.db)
+    return {"id": sid, "detalle": detalle}
+
+
+@ruta("GET", r"/api/fudo/(\d+)/sincronizaciones", "config", 2)
+def fudo_sincronizaciones_lista(c, t):
+    filas = rows(c.db, """SELECT s.*, u.nombre usuario FROM fudo_sincronizaciones s LEFT JOIN usuarios u ON u.id=s.usuario_id
+        WHERE s.tienda_id=? ORDER BY s.id DESC LIMIT 200""", int(t))
+    for f in filas:
+        f["detalle"] = json.loads(f["detalle"] or "[]")
+    return filas
+
+
+@ruta("POST", r"/api/fudo/sincronizaciones/(\d+)/anular", "config", 2, accion="stock_fudo")
+def fudo_sincronizacion_anular(c, i):
+    """Devuelve al stock lo descontado. No vuelve a contarse en la próxima sincronización."""
+    anular(c.db, c.uid, "fudo_sincronizaciones", "FUDO_VENTA", int(i))
+    return {"ok": True}
+
+
+@ruta("POST", r"/api/fudo/(\d+)/igualar", "config", 2, accion="stock_fudo")
+def fudo_igualar(c, t):
+    """Deja en Fudo el stock que tiene el sistema (para partir alineados). Opcionalmente solo algunas equivalencias."""
+    t = int(t)
+    cfg = fudo_config(c.db, t)
+    fudo_cuenta_propia(c.db, t)
+    ids = c.body.get("ids")
+    eqs = [e for e in equivalencias_de(c.db, t) if not ids or e["id"] in ids]
+    if not eqs:
+        raise ApiError(400, "No hay insumos equivalentes para igualar.")
+    resultado = {}
+    with FUDO_STOCK_LOCK:
+        def enviar():
+            for e in eqs:
+                valor = round(max(e["stock_sistema"], 0) / e["factor"], 5)
+                try:
+                    fudo_poner_stock(cfg, e["fudo_id"], valor)
+                    resultado[e["id"]] = (True, valor)
+                except FudoError as x:
+                    resultado[e["id"]] = (False, x.mensaje + (" No se sabe si Fudo lo aplicó: revisa ese insumo allá." if x.incierto else ""))
+        fuera_de_tx(c.db, enviar)
+        for eid, (ok, valor) in resultado.items():
+            if ok:
+                c.db.execute("UPDATE fudo_equivalencias SET base=?, enviado=0, base_fecha=? WHERE id=?", (valor, ahora(), eid))
+        confirmar_tx(c.db)
+    errores = [{"id": eid, "error": v} for eid, (ok, v) in resultado.items() if not ok]
+    return {"ok": not errores, "igualados": len(resultado) - len(errores), "errores": errores}
+
+
+@ruta("POST", r"/api/fudo/(\d+)/ajustar-sistema", "config", 2, accion="stock_fudo")
+def fudo_ajustar_sistema(c, t):
+    """Deja en el sistema el stock que tiene Fudo, como una toma de inventario cerrada. Fudo queda como nuevo punto de partida."""
+    t = int(t)
+    cfg = fudo_config(c.db, t)
+    fudo_cuenta_propia(c.db, t)
+    if fudo_stock_pendiente(c.db, t):
+        raise ApiError(409, "Hay guías cuyo envío de stock a Fudo quedó por revisar. Resuélvelas en Despachos antes de ajustar.")
+    ids = c.body.get("ids")
+    if not [e for e in equivalencias_de(c.db, t) if not ids or e["id"] in ids]:
+        raise ApiError(400, "No hay insumos equivalentes para ajustar.")
+    fecha = fecha_valida(c.body.get("fecha"))
+    with FUDO_STOCK_LOCK:
+        try:
+            ing = fuera_de_tx(c.db, lambda: fudo_ingredientes(cfg))
+        except FudoError as e:
+            raise ApiError(502, e.mensaje) from None
+        if row(c.db, "SELECT id FROM inventarios WHERE bodega_id=? AND estado='ABIERTO'", t):
+            raise ApiError(409, "Esta tienda tiene una toma de inventario abierta. Ciérrala o elimínala antes de ajustar.")
+        iid = c.db.execute("INSERT INTO inventarios(fecha,bodega_id,seccion,obs,usuario_id,estado,cerrado) VALUES(?,?,'',?,?,'CERRADO',?)",
+                           (fecha, t, "Ajuste al stock de Fudo", c.uid, ahora())).lastrowid
+        ajustes, avisos = [], []
+        for e in equivalencias_de(c.db, t):
+            if ids and e["id"] not in ids:
+                continue
+            f = ing.get(e["fudo_id"])
+            if not f or f["stock"] is None:
+                avisos.append(f"{e['nombre']}: {'el insumo ya no existe en Fudo' if not f else 'Fudo no controla su stock'}")
+                continue
+            objetivo = round(max(f["stock"] * e["factor"], 0), 5)
+            actual = stock_de(c.db, t, e["articulo_id"])
+            dif = round(objetivo - actual, 5)
+            c.db.execute("INSERT OR REPLACE INTO inventario_items(inventario_id,articulo_id,stock_sistema,conteo,diferencia) VALUES(?,?,?,?,?)",
+                         (iid, e["articulo_id"], actual, objetivo, dif))
+            if dif:
+                mover(c.db, e["articulo_id"], t, dif, "INVENTARIO", c.uid, fecha, "INVENTARIO", iid, f"Ajuste a Fudo #{iid}",
+                      obs=f"Stock en Fudo de {e['fudo_nombre']}: {f['stock']:g} {e['fudo_unidad']}".strip())
+            c.db.execute("UPDATE fudo_equivalencias SET base=?, enviado=0, base_fecha=? WHERE id=?", (f["stock"], ahora(), e["id"]))
+            if f["stock"] < 0:
+                avisos.append(f"{e['nombre']}: Fudo tiene stock negativo ({f['stock']:g}); en el sistema queda en 0")
+            ajustes.append({"articulo_id": e["articulo_id"], "nombre": e["nombre"], "unidad": e["unidad"], "antes": actual, "ahora": objetivo, "diferencia": dif})
+        if not ajustes:
+            raise ApiError(502, "No se pudo leer el stock de ningún insumo en Fudo. " + " · ".join(avisos))
+        confirmar_tx(c.db)
+    return {"inventario_id": iid, "ajustes": ajustes, "avisos": avisos}
+
+
+def despacho_lineas_fudo(db, g):
+    return rows(db, """SELECT e.fudo_id, e.fudo_nombre, e.factor, SUM(di.cantidad) cantidad FROM despacho_items di
+        JOIN fudo_equivalencias e ON e.articulo_id=di.articulo_id AND e.tienda_id=? WHERE di.despacho_id=? GROUP BY e.id""", g["tienda_id"], g["id"])
+
+
+def fudo_mover_stock(c, g, envio, signo, estado_final):
+    """Suma (signo 1) o resta (−1) en Fudo las cantidades de la guía. Cada insumo se registra por separado: un fallo no repite los ya aplicados."""
+    cfg = fudo_config(c.db, g["tienda_id"])
+    fudo_cuenta_propia(c.db, g["tienda_id"])
+    items = json.loads(envio["items"]) if envio else {}
+    if signo > 0:
+        lineas = [l for l in despacho_lineas_fudo(c.db, g) if (items.get(l["fudo_id"]) or {}).get("estado") != "OK"]
+        if not lineas and not items:
+            raise ApiError(400, "Ningún artículo de esta guía tiene un insumo equivalente en Fudo.")
+        tareas = [(l["fudo_id"], l["fudo_nombre"], round(l["cantidad"] / l["factor"], 5)) for l in lineas]
+    else:
+        tareas = [(fid, it.get("nombre", fid), it["cantidad"]) for fid, it in items.items() if it.get("estado") == "OK"]
+    # Modo MANUAL: el stock lo carga la tienda en el detalle del gasto en Fudo (o lo descuenta Fudo al anular el gasto).
+    # No se llama a Fudo; solo se registra lo esperado para que el consumo por ventas siga cuadrando.
+    manual = (envio or {}).get("manual") if signo < 0 else cfg.get("stock_modo") == "MANUAL"
+    if manual:
+        for fid, nombre, q in tareas:
+            c.db.execute("UPDATE fudo_equivalencias SET enviado=enviado+? WHERE tienda_id=? AND fudo_id=?", (signo * q, g["tienda_id"], fid))
+            if signo > 0:
+                items[fid] = {"estado": "OK", "cantidad": q, "nombre": nombre}
+            else:
+                items[fid]["estado"] = "REVERTIDO"
+        c.db.execute("""INSERT INTO fudo_stock_envios(despacho_id,tienda_id,estado,items,actualizado,manual) VALUES(?,?,?,?,?,1)
+            ON CONFLICT(despacho_id) DO UPDATE SET estado=excluded.estado, items=excluded.items, error='', actualizado=excluded.actualizado, manual=1""",
+                     (g["id"], g["tienda_id"], estado_final, json.dumps(items, ensure_ascii=False), ahora()))
+        return {"ok": True, "estado": estado_final, "error": "", "manual": True}
+    resultado = {}
+    with FUDO_STOCK_LOCK:
+        c.db.execute("""INSERT INTO fudo_stock_envios(despacho_id,tienda_id,estado,items,actualizado) VALUES(?,?,'ENVIANDO',?,?)
+            ON CONFLICT(despacho_id) DO UPDATE SET estado='ENVIANDO', actualizado=excluded.actualizado""", (g["id"], g["tienda_id"], json.dumps(items), ahora()))
+        confirmar_tx(c.db)
+
+        def enviar():
+            for fid, _, q in tareas:
+                try:
+                    actual = fudo_stock_de(cfg, fid)
+                except FudoError as e:
+                    resultado[fid] = ("ERROR", e.mensaje)
+                    continue
+                try:
+                    fudo_poner_stock(cfg, fid, actual + signo * q)
+                    resultado[fid] = ("OK", "")
+                except FudoError as e:
+                    resultado[fid] = ("REVISAR" if e.incierto else "ERROR", e.mensaje)
+        fuera_de_tx(c.db, enviar)
+        errores = []
+        for fid, nombre, q in tareas:
+            st, msg = resultado[fid]
+            if st == "OK":
+                c.db.execute("UPDATE fudo_equivalencias SET enviado=enviado+? WHERE tienda_id=? AND fudo_id=?", (signo * q, g["tienda_id"], fid))
+                if signo > 0:
+                    items[fid] = {"estado": "OK", "cantidad": q, "nombre": nombre}
+                else:
+                    items[fid]["estado"] = "REVERTIDO"
+            else:
+                if st == "REVISAR":
+                    items.setdefault(fid, {"cantidad": q, "nombre": nombre})["estado"] = "REVISAR" if signo > 0 else "REVISAR_REVERSO"
+                errores.append(f"{nombre}: {msg}")
+        if signo < 0:
+            pend = [it for it in items.values() if it.get("estado") in ("OK", "REVISAR_REVERSO")]
+            estado = "REVISAR" if any(it["estado"] == "REVISAR_REVERSO" for it in pend) else estado_final if not pend else "ENVIADO"
+        else:
+            todos = all((items.get(l["fudo_id"]) or {}).get("estado") == "OK" for l in despacho_lineas_fudo(c.db, g))
+            estado = "REVISAR" if any(it.get("estado") == "REVISAR" for it in items.values()) else estado_final if todos else "ERROR"
+        c.db.execute("UPDATE fudo_stock_envios SET estado=?, items=?, error=?, actualizado=? WHERE despacho_id=?",
+                     (estado, json.dumps(items, ensure_ascii=False), " · ".join(errores), ahora(), g["id"]))
+        confirmar_tx(c.db)
+    return {"ok": not errores, "estado": estado, "error": " · ".join(errores)}
+
+
+@ruta("POST", r"/api/despachos/(\d+)/fudo-stock", "despachos", 2, accion="enviar_fudo")
+def despacho_fudo_stock(c, i):
+    c.sin_tienda()
+    g = row(c.db, "SELECT * FROM despachos WHERE id=?", int(i))
+    if not g:
+        raise ApiError(404, "Guía no encontrada.")
+    if g["estado"] != "VIGENTE":
+        raise ApiError(409, "Una guía anulada no suma stock en Fudo.")
+    envio = row(c.db, "SELECT * FROM fudo_stock_envios WHERE despacho_id=?", g["id"])
+    if envio and envio["estado"] == "ENVIADO":
+        raise ApiError(409, "El stock de esta guía ya se sumó en Fudo.")
+    if envio and envio["estado"] in ("ENVIANDO", "REVISAR"):
+        if not c.body.get("confirmar_reenvio"):
+            raise ApiError(409, "No se sabe si parte del stock de esta guía llegó a Fudo. Revisa esos insumos allá antes de reenviar.")
+        items = json.loads(envio["items"])
+        for it in items.values():
+            if it.get("estado") == "REVISAR":
+                it["estado"] = "REINTENTAR"
+        envio = {**envio, "items": json.dumps(items)}
+    return fudo_mover_stock(c, g, envio, 1, "ENVIADO")
+
+
+@ruta("POST", r"/api/despachos/(\d+)/fudo-stock/revertir", "despachos", 2, accion="anular_fudo")
+def despacho_fudo_stock_revertir(c, i):
+    c.sin_tienda()
+    g = row(c.db, "SELECT * FROM despachos WHERE id=?", int(i))
+    if not g:
+        raise ApiError(404, "Guía no encontrada.")
+    if g["estado"] != "ANULADO":
+        raise ApiError(409, "Primero anula la guía en este sistema.")
+    envio = row(c.db, "SELECT * FROM fudo_stock_envios WHERE despacho_id=?", g["id"])
+    if not envio:
+        raise ApiError(409, "Esta guía no tiene stock sumado en Fudo para revertir.")
+    items = json.loads(envio["items"])
+    if envio["estado"] in ("ENVIANDO", "REVISAR"):
+        if not c.body.get("confirmar_reenvio"):
+            raise ApiError(409, "No se sabe si parte del stock de esta guía cambió en Fudo. Revisa esos insumos allá antes de continuar.")
+        for it in items.values():  # confirmado en Fudo que lo incierto no se aplicó
+            if it.get("estado") == "REVISAR_REVERSO":
+                it["estado"] = "OK"
+            elif it.get("estado") in ("REVISAR", "REINTENTAR"):
+                it["estado"] = "DESCARTADO"
+    elif envio["estado"] not in ("ENVIADO", "ERROR"):
+        raise ApiError(409, "Esta guía no tiene stock sumado en Fudo para revertir.")
+    if not any(it.get("estado") == "OK" for it in items.values()):
+        c.db.execute("UPDATE fudo_stock_envios SET estado='REVERTIDO', items=?, error='', actualizado=? WHERE despacho_id=?", (json.dumps(items, ensure_ascii=False), ahora(), g["id"]))
+        return {"ok": True, "estado": "REVERTIDO", "error": ""}
+    return fudo_mover_stock(c, g, {**envio, "items": json.dumps(items)}, -1, "REVERTIDO")
 
 
 # ---------------------------------------------------------------- devoluciones a proveedores
@@ -1341,7 +2036,7 @@ def devoluciones_crear(c):
     return {"id": crear_devolucion(c.db, c.uid, c.body)}
 
 
-@ruta("POST", r"/api/devoluciones/(\d+)/anular", "devoluciones", 2)
+@ruta("POST", r"/api/devoluciones/(\d+)/anular", "devoluciones", 2, accion="anular_devoluciones")
 def devoluciones_anular(c, i):
     c.sin_tienda()
     anular(c.db, c.uid, "devoluciones", "DEVOLUCION", int(i))
@@ -1355,7 +2050,11 @@ def despachos_lista(c):
     d, h = c.rango(365)
     propia = c.user.get("tienda_id")
     return rows(c.db, f"""SELECT de.*, t.nombre tienda, u.nombre usuario,
-        (SELECT COUNT(*) FROM despacho_items i WHERE i.despacho_id=de.id) lineas
+        (SELECT COUNT(*) FROM despacho_items i WHERE i.despacho_id=de.id) lineas,
+        (SELECT COUNT(*) FROM despacho_items i JOIN fudo_equivalencias e ON e.articulo_id=i.articulo_id AND e.tienda_id=de.tienda_id WHERE i.despacho_id=de.id) fudo_stock_lineas,
+        COALESCE((SELECT estado FROM fudo_stock_envios f WHERE f.despacho_id=de.id),'') fudo_stock_estado,
+        COALESCE((SELECT error FROM fudo_stock_envios f WHERE f.despacho_id=de.id),'') fudo_stock_error,
+        COALESCE((SELECT manual FROM fudo_stock_envios f WHERE f.despacho_id=de.id),0) fudo_stock_manual
         FROM despachos de JOIN tiendas t ON t.id=de.tienda_id LEFT JOIN usuarios u ON u.id=de.usuario_id
         WHERE de.fecha BETWEEN ? AND ? {'AND de.tienda_id=' + str(int(propia)) if propia else ''}
         ORDER BY de.fecha DESC, de.id DESC LIMIT 500""", d, h)
@@ -1370,6 +2069,10 @@ def despachos_detalle(c, i):
     r["items"] = rows(c.db, "SELECT di.*, a.codigo, a.nombre, a.desechable, ca.punto_venta, ca.nombre categoria, u.abreviatura unidad FROM despacho_items di JOIN articulos a ON a.id=di.articulo_id "
                             "JOIN categorias ca ON ca.id=a.categoria_id JOIN unidades u ON u.id=a.unidad_id WHERE di.despacho_id=? "
                             "ORDER BY a.desechable, ca.punto_venta, ca.nombre, a.nombre", int(i))
+    envio = row(c.db, "SELECT estado, error, manual FROM fudo_stock_envios WHERE despacho_id=?", int(i)) or {}
+    r.update(fudo_stock_estado=envio.get("estado", ""), fudo_stock_error=envio.get("error", ""), fudo_stock_manual=envio.get("manual", 0),
+             fudo_stock_lineas=len(despacho_lineas_fudo(c.db, r)),
+             fudo_lista=bool(row(c.db, "SELECT 1 FROM fudo_tiendas WHERE tienda_id=? AND api_secret<>'' AND categoria_id<>''", r["tienda_id"])))
     return r
 
 
@@ -1379,7 +2082,7 @@ def despachos_crear(c):
     return {"id": crear_despacho(c.db, c.uid, c.body)}
 
 
-@ruta("POST", r"/api/despachos/(\d+)/anular", "despachos", 2)
+@ruta("POST", r"/api/despachos/(\d+)/anular", "despachos", 2, accion="anular_despachos")
 def despachos_anular(c, i):
     c.sin_tienda()
     anular(c.db, c.uid, "despachos", "DESPACHO", int(i))
@@ -1562,6 +2265,141 @@ def pos_stock(c):
         WHERE a.activo=1 AND (a.tipo='PRODUCTO' OR a.desechable=1) ORDER BY a.nombre""", tid)
 
 
+@ruta("GET", "/api/pos/movimientos", publica=True)
+def pos_movimientos(c):
+    """Historial de movimientos de los artículos de tienda (P o desechables) en la bodega de una tienda. Solo lectura."""
+    pos_autorizar(c)
+    tid = pos_tienda(c.db, c.q.get("tienda_id"))
+    d, h = fecha_valida(c.q.get("desde"), "La fecha desde"), fecha_valida(c.q.get("hasta"), "La fecha hasta")
+    if d > h:
+        raise ApiError(400, "La fecha desde no puede ser posterior a la fecha hasta.")
+    w, a = ["m.bodega_id=?", "substr(m.fecha,1,10) BETWEEN ? AND ?", "(ar.tipo='PRODUCTO' OR ar.desechable=1)"], [tid, d, h]
+    if c.q.get("articulo_id"):
+        w.append("m.articulo_id=?"); a.append(entero(c.q["articulo_id"], "el artículo"))
+    return rows(c.db, f"""SELECT m.id, m.fecha, m.articulo_id, ar.codigo, ar.nombre, un.abreviatura unidad, m.tipo, m.cantidad, m.saldo,
+        m.referencia, m.obs, t.nombre otra_tienda, u.nombre usuario, m.doc_tipo, m.doc_id
+        FROM movimientos m JOIN articulos ar ON ar.id=m.articulo_id JOIN unidades un ON un.id=ar.unidad_id
+        LEFT JOIN tiendas t ON t.id=m.tienda_destino_id LEFT JOIN usuarios u ON u.id=m.usuario_id
+        WHERE {' AND '.join(w)} ORDER BY m.id DESC LIMIT 1000""", *a)
+
+
+POS_DOCUMENTOS = {"DESPACHO": "despachos", "MERMA": "mermas", "SALIDA": "salidas_tienda", "SALIDA_INTERNA": "salidas_internas",
+                  "INVENTARIO": "inventarios", "POS": "pos_consumos", "POS_TRF": "pos_transferencias", "FUDO_VENTA": "fudo_sincronizaciones"}
+
+
+@ruta("GET", "/api/pos/documento", publica=True)
+def pos_documento(c):
+    """Documento que originó un movimiento de la tienda, en formato genérico. Solo si movió la bodega de esa tienda."""
+    pos_autorizar(c)
+    tid = pos_tienda(c.db, c.q.get("tienda_id"))
+    tipo = c.q.get("doc_tipo")
+    if tipo not in POS_DOCUMENTOS:
+        raise ApiError(400, "Tipo de documento no válido.")
+    did = entero(c.q.get("doc_id"), "el documento")
+    doc = row(c.db, f"SELECT * FROM {POS_DOCUMENTOS[tipo]} WHERE id=?", did)
+    movs = rows(c.db, """SELECT m.bodega_id, m.articulo_id, m.cantidad, ar.codigo, ar.nombre, un.abreviatura unidad FROM movimientos m
+        JOIN articulos ar ON ar.id=m.articulo_id JOIN unidades un ON un.id=ar.unidad_id
+        WHERE m.doc_tipo=? AND m.doc_id=? AND m.tipo<>'ANULACION' ORDER BY ar.nombre""", tipo, did)
+    propios = [m for m in movs if m["bodega_id"] == tid]
+    if not doc or not propios:
+        raise ApiError(404, "Documento no encontrado para esta tienda.")
+    nombre_tienda = lambda i: scalar(c.db, "SELECT nombre FROM tiendas WHERE id=?", i) or "Bodega central" if i else "Bodega central"
+    usuario = scalar(c.db, "SELECT nombre FROM usuarios WHERE id=?", doc.get("usuario_id")) if doc.get("usuario_id") else None
+    campos, obs = [], doc.get("obs") or ""
+    if tipo == "DESPACHO":
+        titulo = f"Guía de despacho N° {did:06d}"
+        campos = [["Desde", "Bodega central"], ["Hacia", nombre_tienda(doc["tienda_id"])], ["Transportista", doc["transportista"]], ["Patente", doc["patente"]]]
+    elif tipo == "MERMA":
+        titulo = f"Merma N° {did}"
+        campos = [["Bodega", nombre_tienda(doc["bodega_id"])], ["Motivo", scalar(c.db, "SELECT nombre FROM motivos_merma WHERE id=?", doc["motivo_id"])]]
+    elif tipo == "SALIDA":
+        titulo = f"Salida de tienda N° {did}"
+        campos = [["Tienda", nombre_tienda(doc["tienda_id"])], ["Motivo", {"VENTA": "Venta", "CONSUMO_INTERNO": "Consumo interno"}.get(doc["motivo"], doc["motivo"])]]
+    elif tipo == "SALIDA_INTERNA":
+        titulo = f"{'Devolución a bodega central' if doc['tipo'] == 'DEVOLUCION_TIENDA' else 'Consumo interno central'} N° {did}"
+        obs = doc["motivo"]
+        campos = [["Desde", nombre_tienda(doc["tienda_id"])], ["Hacia", "Bodega central"]] if doc["tipo"] == "DEVOLUCION_TIENDA" else []
+    elif tipo == "INVENTARIO":
+        titulo = f"Toma de inventario N° {did}"
+        campos = [["Bodega", nombre_tienda(doc["bodega_id"])], ["Cerrada", doc["cerrado"] or "—"]]
+    elif tipo == "FUDO_VENTA":
+        titulo = f"Ventas Fudo N° {did}"
+        campos = [["Tienda", nombre_tienda(doc["tienda_id"])], ["Sincronizada", doc["creado"]]]
+    elif tipo == "POS":
+        titulo = f"Venta POS · {doc['referencia']}"
+        obs = doc["detalle"]
+        campos = [["Referencia", doc["referencia"]], ["Tienda", nombre_tienda(doc["tienda_id"])], ["Recibida", doc["creado"]]]
+    else:
+        titulo = f"Transferencia POS · {doc['referencia']}"
+        obs = doc["detalle"]
+        campos = [["Referencia", doc["referencia"]], ["Tipo", "Envío" if doc["tipo"] == "SALIDA" else "Recepción"],
+                  ["Hacia" if doc["tipo"] == "SALIDA" else "Desde", nombre_tienda(doc["contraparte_id"])]]
+    if usuario:
+        campos.append(["Registrado por", usuario])
+    if doc.get("anulado"):
+        campos.append(["Anulado", doc["anulado"]])
+    estado = doc.get("estado") or "VIGENTE"
+    return {"doc_tipo": tipo, "doc_id": did, "titulo": titulo, "fecha": doc["fecha"], "estado": estado,
+            "campos": [[k, v] for k, v in campos if v not in (None, "")], "obs": obs or "",
+            "lineas": [{"codigo": m["codigo"], "nombre": m["nombre"], "unidad": m["unidad"], "cantidad": abs(m["cantidad"])} for m in propios],
+            # La contrapartida de la central (despacho, devolución) repite los mismos artículos: solo cuenta lo que no es de esta tienda.
+            "lineas_otras_bodegas": any(m["articulo_id"] not in {p["articulo_id"] for p in propios} or
+                                        (m["bodega_id"] not in (tid, CENTRAL)) for m in movs if m["bodega_id"] != tid)}
+
+
+@ruta("POST", "/api/pos/transferencias", publica=True)
+def pos_transferencia(c):
+    """Salida (descuenta) o entrada (suma) de una transferencia entre tiendas hecha en el POS. Idempotente; todo o nada."""
+    pos_autorizar(c)
+    d = c.body
+    ref = pos_referencia(d.get("referencia"))
+    previo = scalar(c.db, "SELECT id FROM pos_transferencias WHERE referencia=?", ref)
+    if previo:
+        return {"ok": True, "id": previo, "repetido": True}
+    tipo = d.get("tipo")
+    if tipo not in ("SALIDA", "ENTRADA"):
+        raise ApiError(400, "El tipo debe ser SALIDA o ENTRADA.")
+    tid = pos_tienda(c.db, d.get("tienda_id"))
+    otra = pos_tienda(c.db, d.get("contraparte_id"))
+    if otra == tid:
+        raise ApiError(400, "La tienda de origen y la de destino deben ser distintas.")
+    fecha = fecha_valida(d.get("fecha"))
+    detalle = txt(d.get("detalle"), "El detalle", False, 200)
+    items = d.get("items")
+    if not isinstance(items, list) or not items:
+        raise ApiError(400, "La transferencia no trae artículos.")
+    cantidades = {}
+    for i in items:
+        if not isinstance(i, dict):
+            raise ApiError(400, "Detalle inválido.")
+        aid = entero(i.get("articulo_id"), "el artículo en cada línea")
+        if aid in cantidades:
+            raise ApiError(400, f"El artículo {aid} viene repetido en la transferencia.")
+        cantidades[aid] = num(i.get("cantidad"), "La cantidad", 0, True)
+    for aid in cantidades:
+        if not row(c.db, "SELECT id FROM articulos WHERE id=? AND activo=1 AND (tipo='PRODUCTO' OR desechable=1)", aid):
+            raise ApiError(404, f"Artículo {aid} no encontrado o no se maneja en tiendas.")
+    tid_id = c.db.execute("INSERT INTO pos_transferencias(referencia,tipo,tienda_id,contraparte_id,fecha,detalle,creado) VALUES(?,?,?,?,?,?,?)",
+                          (ref, tipo, tid, otra, fecha, detalle, f"{datetime.now():%Y-%m-%d %H:%M:%S}")).lastrowid
+    signo = -1 if tipo == "SALIDA" else 1
+    for aid, cant in cantidades.items():
+        mover(c.db, aid, tid, signo * cant, "TRANSFERENCIA_" + tipo, None, fecha, "POS_TRF", tid_id, f"POS {ref}", destino=otra, obs=detalle)
+    return {"ok": True, "id": tid_id}
+
+
+@ruta("POST", "/api/pos/transferencias/anular", publica=True)
+def pos_transferencia_anular(c):
+    pos_autorizar(c)
+    ref = pos_referencia(c.body.get("referencia"))
+    t = row(c.db, "SELECT id, estado FROM pos_transferencias WHERE referencia=?", ref)
+    if not t:
+        raise ApiError(404, "No existe una transferencia del POS con esa referencia.")
+    if t["estado"] != "ANULADO":
+        anular(c.db, None, "pos_transferencias", "POS_TRF", t["id"])
+        c.db.execute("UPDATE pos_transferencias SET anulado=? WHERE id=?", (f"{datetime.now():%Y-%m-%d %H:%M:%S}", t["id"]))
+    return {"ok": True, "id": t["id"]}
+
+
 def pos_inventario_resultado(db, iid):
     return {"ok": True, "id": iid, "ajustes": rows(db, """SELECT x.articulo_id, x.stock_sistema, x.conteo, x.diferencia FROM inventario_items x
         JOIN articulos a ON a.id=x.articulo_id WHERE x.inventario_id=? ORDER BY a.nombre""", iid)}
@@ -1626,7 +2464,7 @@ def mermas_crear(c):
     return {"id": crear_merma(c.db, c.uid, c.body, c.bodega(c.body.get("bodega_id")))}
 
 
-@ruta("POST", r"/api/mermas/(\d+)/anular", "mermas", 2)
+@ruta("POST", r"/api/mermas/(\d+)/anular", "mermas", 2, accion="anular_mermas")
 def mermas_anular(c, i):
     m = row(c.db, "SELECT bodega_id FROM mermas WHERE id=?", int(i))
     if not m:
@@ -1694,7 +2532,7 @@ def inventarios_guardar(c, i):
     return {"ok": True}
 
 
-@ruta("POST", r"/api/inventarios/(\d+)/cerrar", "inventario", 2)
+@ruta("POST", r"/api/inventarios/(\d+)/cerrar", "inventario", 2, accion="cerrar_inventario")
 def inventarios_cerrar(c, i):
     inv = inventario_de(c, i)
     if inv["estado"] != "ABIERTO":
@@ -1716,7 +2554,7 @@ def inventarios_cerrar(c, i):
     return {"ok": True}
 
 
-@ruta("DELETE", r"/api/inventarios/(\d+)", "inventario", 2)
+@ruta("DELETE", r"/api/inventarios/(\d+)", "inventario", 2, accion="cerrar_inventario")
 def inventarios_borrar(c, i):
     inv = inventario_de(c, i)
     if inv["estado"] != "ABIERTO":
@@ -1899,6 +2737,27 @@ def reporte_mermas(c):
             "bodegas": rows(c.db, f"SELECT COALESCE(t.nombre,'Bodega central') nombre, COUNT(*) registros, SUM(m.cantidad*m.costo_unit) valor {base} GROUP BY m.bodega_id ORDER BY valor DESC", d, h)}
 
 
+@ruta("GET", "/api/reportes/stock-tiendas", "reportes")
+def reporte_stock_tiendas(c):
+    """Stock actual por bodega: una columna por bodega (central y cada tienda activa), filas por artículo agrupadas por categoría."""
+    c.sin_tienda()
+    db = c.db
+    bodegas = [{"id": CENTRAL, "nombre": "Bodega central"}] + rows(db, "SELECT id, nombre FROM tiendas WHERE activo=1 ORDER BY nombre")
+    filtro, args = "", []
+    tipo = (c.q.get("tipo") or "").upper()
+    if tipo in ("PRODUCTO", "SUBPRODUCTO", "INSUMO"):
+        filtro, args = " AND a.tipo=?", [tipo]
+    filas = rows(db, f"""SELECT a.id, a.codigo, a.nombre, a.tipo, a.desechable, a.costo, a.stock_minimo, u.abreviatura unidad, ca.nombre categoria, ca.punto_venta
+        FROM articulos a JOIN unidades u ON u.id=a.unidad_id JOIN categorias ca ON ca.id=a.categoria_id
+        WHERE a.activo=1{filtro} ORDER BY ca.nombre COLLATE NOCASE, a.nombre COLLATE NOCASE""", *args)
+    stock = {}
+    for s in rows(db, "SELECT articulo_id, bodega_id, cantidad FROM stock WHERE cantidad<>0"):
+        stock.setdefault(s["articulo_id"], {})[str(s["bodega_id"])] = s["cantidad"]
+    for f in filas:
+        f["stock"] = stock.get(f["id"], {})
+    return {"bodegas": bodegas, "filas": filas}
+
+
 @ruta("GET", "/api/reportes/cobertura", "reportes")
 def reporte_cobertura(c):
     """Días de stock central según el consumo real del período, y cantidad sugerida de reposición."""
@@ -1926,8 +2785,12 @@ def sembrar(db):
         db.execute("ALTER TABLE inventarios ADD COLUMN seccion TEXT NOT NULL DEFAULT ''")
     if "tipo_documento" not in [col[1] for col in db.execute("PRAGMA table_info(compras)")]:  # las compras anteriores quedan sin tipo: no se sabe cuál era
         db.execute("ALTER TABLE compras ADD COLUMN tipo_documento TEXT NOT NULL DEFAULT ''")
+    if "stock_modo" not in [col[1] for col in db.execute("PRAGMA table_info(fudo_tiendas)")]:  # SISTEMA: suma por API; MANUAL: se carga en el detalle del gasto en Fudo
+        db.execute("ALTER TABLE fudo_tiendas ADD COLUMN stock_modo TEXT NOT NULL DEFAULT 'SISTEMA'")
+    if "manual" not in [col[1] for col in db.execute("PRAGMA table_info(fudo_stock_envios)")]:
+        db.execute("ALTER TABLE fudo_stock_envios ADD COLUMN manual INTEGER NOT NULL DEFAULT 0")
     columnas_despacho = [col[1] for col in db.execute("PRAGMA table_info(despachos)")]
-    for col in ("fudo_estado", "fudo_gasto_id", "fudo_error"):  # bases creadas antes de la integración con Fudo
+    for col in ("fudo_estado", "fudo_gasto_id", "fudo_error", "fudo_pago"):  # bases creadas antes de la integración con Fudo (fudo_pago: id del pago, '' o REVISAR)
         if col not in columnas_despacho:
             db.execute(f"ALTER TABLE despachos ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
     if "punto_venta" not in [col[1] for col in db.execute("PRAGMA table_info(categorias)")]:  # bases creadas antes de este grupo
@@ -1953,6 +2816,14 @@ def sembrar(db):
             permisos.setdefault("devoluciones", PERFILES[p["nombre"]]["devoluciones"])
             db.execute("UPDATE perfiles SET permisos=? WHERE id=?", (json.dumps(permisos), p["id"]))
         db.execute("INSERT INTO config VALUES('permisos_devoluciones','1')")
+    if not scalar(db, "SELECT COUNT(*) FROM config WHERE clave='acciones_criticas'"):  # una sola vez: quien editaba el módulo conserva sus acciones
+        for p in rows(db, "SELECT * FROM perfiles"):
+            permisos = json.loads(p["permisos"])
+            for a, _, modulo in ACCIONES:
+                if (permisos.get(modulo) == 2) if modulo else any(permisos.get(m) == 2 for m in ("articulos", "recetas", "proveedores", "tiendas")):
+                    permisos["acc_" + a] = 1
+            db.execute("UPDATE perfiles SET permisos=? WHERE id=?", (json.dumps(permisos), p["id"]))
+        db.execute("INSERT INTO config VALUES('acciones_criticas','1')")
     if "de_productos" not in [col[1] for col in db.execute("PRAGMA table_info(categorias)")]:
         db.execute("ALTER TABLE categorias ADD COLUMN de_productos INTEGER NOT NULL DEFAULT 0")
     if not scalar(db, "SELECT COUNT(*) FROM config WHERE clave='categorias_productos'"):  # una sola vez: clasifica las categorías existentes
@@ -2069,6 +2940,8 @@ def usuario_de_cookie(db, handler):
         WHERE s.token=? AND s.expira>? AND u.activo=1""", token, time.time())
     if u:
         u["permisos"] = json.loads(u["permisos"])
+        if u["perfil"] == PERFIL_ADMIN:  # el Administrador siempre puede todas las acciones críticas
+            u["permisos"].update({"acc_" + a: 1 for a in ACCIONES_IDS})
         if u["perfil"] == PERFIL_ADMIN and not u["tienda_id"]:
             u["permisos"]["stock"] = 2
         u["_token"] = token
@@ -2146,7 +3019,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(body, dict):
                     raise ApiError(400, "Solicitud inválida.")
             user = usuario_de_cookie(db, self)
-            for m, patron, modulo, nivel, publica, fn in RUTAS:
+            for m, patron, modulo, nivel, publica, accion, fn in RUTAS:
                 coincide = patron.match(url.path)
                 if m != metodo or not coincide:
                     continue
@@ -2155,6 +3028,8 @@ class Handler(BaseHTTPRequestHandler):
                         raise ApiError(401, "Debes iniciar sesión.")
                     if modulo and user["permisos"].get(modulo, 0) < nivel:
                         raise ApiError(403, "Tu perfil no tiene acceso a esta acción.")
+                    if accion and not user["permisos"].get("acc_" + accion):
+                        raise ApiError(403, f"Tu perfil no tiene permiso para: {dict((a, n) for a, n, _ in ACCIONES)[accion]}.")
                 if metodo != "GET":
                     db.execute("BEGIN IMMEDIATE")
                     en_tx = True
