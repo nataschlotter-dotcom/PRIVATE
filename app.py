@@ -101,6 +101,9 @@ CREATE TABLE IF NOT EXISTS receta_items(receta_id INTEGER NOT NULL REFERENCES re
 CREATE TABLE IF NOT EXISTS compras(id INTEGER PRIMARY KEY, fecha TEXT NOT NULL, proveedor_id INTEGER NOT NULL REFERENCES proveedores(id),
   documento TEXT NOT NULL DEFAULT '', iva_pct REAL NOT NULL, neto REAL NOT NULL, iva REAL NOT NULL, total REAL NOT NULL,
   obs TEXT NOT NULL DEFAULT '', estado TEXT NOT NULL DEFAULT 'VIGENTE', usuario_id INTEGER REFERENCES usuarios(id), tipo_documento TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS compra_facturas(id INTEGER PRIMARY KEY, proveedor_id INTEGER NOT NULL REFERENCES proveedores(id), fecha TEXT NOT NULL,
+  documento TEXT NOT NULL, iva_pct REAL NOT NULL, neto REAL NOT NULL, iva REAL NOT NULL, total REAL NOT NULL, obs TEXT NOT NULL DEFAULT '',
+  estado TEXT NOT NULL DEFAULT 'VIGENTE', guias_anuladas TEXT NOT NULL DEFAULT '', usuario_id INTEGER REFERENCES usuarios(id), creado TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS compra_items(compra_id INTEGER NOT NULL REFERENCES compras(id), articulo_id INTEGER NOT NULL REFERENCES articulos(id),
   cantidad REAL NOT NULL, precio REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS devoluciones(id INTEGER PRIMARY KEY, fecha TEXT NOT NULL, proveedor_id INTEGER NOT NULL REFERENCES proveedores(id),
@@ -334,11 +337,14 @@ def lineas(items, nombre_precio=None):
     return out
 
 
+TIPOS_DOC_COMPRA = {"FACTURA": "Factura", "BOLETA": "Boleta", "GUIA": "Guía de despacho"}
+
+
 def crear_compra(db, uid, d):
     fecha = fecha_valida(d.get("fecha"))
     tipo_doc = d.get("tipo_documento")
-    if tipo_doc not in ("FACTURA", "BOLETA"):
-        raise ApiError(400, "Indica si el documento es factura o boleta.")
+    if tipo_doc not in TIPOS_DOC_COMPRA:
+        raise ApiError(400, "Indica si el documento es factura, boleta o guía de despacho.")
     prov = entero(d.get("proveedor_id"), "el proveedor")
     proveedor = row(db, "SELECT * FROM proveedores WHERE id=? AND activo=1", prov)
     if not proveedor:
@@ -351,7 +357,7 @@ def crear_compra(db, uid, d):
                      (fecha, prov, tipo_doc, txt(d.get("documento"), "El documento", False, 40), pct, neto, iva, round(neto + iva, 2),
                       txt(d.get("obs"), "La observación", False, 500), uid))
     cid = cur.lastrowid
-    ref = f"Compra #{cid} · {tipo_doc.capitalize()}" + (f" {d.get('documento')}" if d.get("documento") else "")
+    ref = f"Compra #{cid} · {TIPOS_DOC_COMPRA[tipo_doc]}" + (f" {d.get('documento')}" if d.get("documento") else "")
     for i in items:
         a = articulo(db, i["articulo_id"])
         if a["tipo"] != "INSUMO":
@@ -1041,17 +1047,90 @@ def produccion_anular(c, i):
 
 # ---------------------------------------------------------------- compras
 
+SQL_COMPRA = """SELECT co.*, p.nombre proveedor, p.rut, u.nombre usuario, f.documento factura_doc, f.fecha factura_fecha
+    FROM compras co JOIN proveedores p ON p.id=co.proveedor_id LEFT JOIN usuarios u ON u.id=co.usuario_id
+    LEFT JOIN compra_facturas f ON f.id=co.factura_id AND f.estado='VIGENTE'"""
+
+
 @ruta("GET", "/api/compras", "compras")
 def compras_lista(c):
     d, h = c.rango(365)
-    return rows(c.db, """SELECT co.*, p.nombre proveedor, p.rut, u.nombre usuario FROM compras co JOIN proveedores p ON p.id=co.proveedor_id
-        LEFT JOIN usuarios u ON u.id=co.usuario_id WHERE co.fecha BETWEEN ? AND ? ORDER BY co.fecha DESC, co.id DESC LIMIT 500""", d, h)
+    return rows(c.db, SQL_COMPRA + " WHERE co.fecha BETWEEN ? AND ? ORDER BY co.fecha DESC, co.id DESC LIMIT 500", d, h)
+
+
+# Guías de despacho de proveedor: ingresan el stock al recibirlas y quedan pendientes hasta que llega la factura, que las netea.
+# La factura no mueve stock ni se suma a los reportes de compras: las guías ya lo hicieron. Solo registra el documento y la diferencia.
+
+@ruta("GET", "/api/compras/guias-pendientes", "compras")
+def compras_guias_pendientes(c):
+    filtro, args = "", []
+    if c.q.get("proveedor_id"):
+        filtro, args = " AND co.proveedor_id=?", [entero(c.q["proveedor_id"], "el proveedor")]
+    return rows(c.db, SQL_COMPRA + f" WHERE co.tipo_documento='GUIA' AND co.estado='VIGENTE' AND co.factura_id IS NULL{filtro} ORDER BY co.fecha, co.id", *args)
+
+
+@ruta("GET", "/api/compras/facturas", "compras")
+def compras_facturas(c):
+    fs = rows(c.db, """SELECT f.*, p.nombre proveedor, p.rut, u.nombre usuario FROM compra_facturas f JOIN proveedores p ON p.id=f.proveedor_id
+        LEFT JOIN usuarios u ON u.id=f.usuario_id ORDER BY f.fecha DESC, f.id DESC LIMIT 500""")
+    for f in fs:
+        f["guias"] = rows(c.db, "SELECT id, fecha, documento, neto, total FROM compras WHERE factura_id=? ORDER BY fecha, id", f["id"]) if f["estado"] == "VIGENTE" \
+            else json.loads(f["guias_anuladas"] or "[]")
+        f["neto_guias"] = round(sum(g["neto"] for g in f["guias"]), 2)
+        f["diferencia"] = round(f["neto"] - f["neto_guias"], 2)
+    return fs
+
+
+@ruta("POST", "/api/compras/facturas", "compras", 2)
+def compras_factura_crear(c):
+    d, db = c.body, c.db
+    prov = entero(d.get("proveedor_id"), "el proveedor")
+    if not row(db, "SELECT id FROM proveedores WHERE id=?", prov):
+        raise ApiError(400, "Proveedor no válido.")
+    doc = txt(d.get("documento"), "El N° de factura", True, 40)
+    if row(db, "SELECT id FROM compra_facturas WHERE proveedor_id=? AND documento=? AND estado='VIGENTE'", prov, doc):
+        raise ApiError(409, f"La factura {doc} de este proveedor ya está registrada.")
+    ids = d.get("guias") or []
+    if not isinstance(ids, list) or not ids:
+        raise ApiError(400, "Marca al menos una guía de despacho para netear con la factura.")
+    ids = sorted({entero(x, "la guía") for x in ids})
+    guias = rows(db, f"SELECT * FROM compras WHERE id IN ({','.join('?' * len(ids))})", *ids)
+    for g in guias:
+        if g["proveedor_id"] != prov or g["tipo_documento"] != "GUIA":
+            raise ApiError(400, f"La compra #{g['id']} no es una guía de despacho de este proveedor.")
+        if g["estado"] != "VIGENTE":
+            raise ApiError(409, f"La guía de la compra #{g['id']} está anulada.")
+        if g["factura_id"]:
+            raise ApiError(409, f"La guía de la compra #{g['id']} ya fue neteada con otra factura.")
+    if len(guias) != len(ids):
+        raise ApiError(404, "Alguna de las guías no existe.")
+    neto_guias = round(sum(g["neto"] for g in guias), 2)
+    neto = neto_guias if d.get("neto") in (None, "") else num(d.get("neto"), "El neto de la factura")
+    pct = iva_actual(db)
+    iva = round(neto * pct / 100, 2)
+    fid = db.execute("INSERT INTO compra_facturas(proveedor_id,fecha,documento,iva_pct,neto,iva,total,obs,usuario_id,creado) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                     (prov, fecha_valida(d.get("fecha")), doc, pct, neto, iva, round(neto + iva, 2), txt(d.get("obs"), "La observación", False, 500), c.uid,
+                      datetime.now().strftime("%Y-%m-%d %H:%M:%S"))).lastrowid
+    db.execute(f"UPDATE compras SET factura_id=? WHERE id IN ({','.join('?' * len(ids))})", (fid, *ids))
+    return {"id": fid, "neto_guias": neto_guias, "diferencia": round(neto - neto_guias, 2)}
+
+
+@ruta("POST", r"/api/compras/facturas/(\d+)/anular", "compras", 2, accion="anular_compras")
+def compras_factura_anular(c, i):
+    f = row(c.db, "SELECT * FROM compra_facturas WHERE id=?", int(i))
+    if not f:
+        raise ApiError(404, "Factura no encontrada.")
+    if f["estado"] != "VIGENTE":
+        raise ApiError(409, "La factura ya está anulada.")
+    guias = rows(c.db, "SELECT id, fecha, documento, neto, total FROM compras WHERE factura_id=?", f["id"])
+    c.db.execute("UPDATE compra_facturas SET estado='ANULADA', guias_anuladas=? WHERE id=?", (json.dumps(guias), f["id"]))
+    c.db.execute("UPDATE compras SET factura_id=NULL WHERE factura_id=?", (f["id"],))
+    return {"ok": True}
 
 
 @ruta("GET", r"/api/compras/(\d+)", "compras")
 def compras_detalle(c, i):
-    r = row(c.db, "SELECT co.*, p.nombre proveedor, p.rut, u.nombre usuario FROM compras co JOIN proveedores p ON p.id=co.proveedor_id "
-                  "LEFT JOIN usuarios u ON u.id=co.usuario_id WHERE co.id=?", int(i))
+    r = row(c.db, SQL_COMPRA + " WHERE co.id=?", int(i))
     if not r:
         raise ApiError(404, "Compra no encontrada.")
     r["items"] = rows(c.db, "SELECT ci.*, a.codigo, a.nombre, u.abreviatura unidad FROM compra_items ci JOIN articulos a ON a.id=ci.articulo_id "
@@ -1066,6 +1145,9 @@ def compras_crear(c):
 
 @ruta("POST", r"/api/compras/(\d+)/anular", "compras", 2, accion="anular_compras")
 def compras_anular(c, i):
+    f = row(c.db, "SELECT f.documento FROM compras co JOIN compra_facturas f ON f.id=co.factura_id AND f.estado='VIGENTE' WHERE co.id=?", int(i))
+    if f:
+        raise ApiError(409, f"Esta guía ya fue neteada con la factura {f['documento']}. Anula primero esa factura en Guías por facturar.")
     anular(c.db, c.uid, "compras", "COMPRA", int(i))
     return {"ok": True}
 
@@ -2845,6 +2927,8 @@ def sembrar(db):
         db.execute("ALTER TABLE inventarios ADD COLUMN categorias TEXT NOT NULL DEFAULT ''")
     if "tipo_documento" not in [col[1] for col in db.execute("PRAGMA table_info(compras)")]:  # las compras anteriores quedan sin tipo: no se sabe cuál era
         db.execute("ALTER TABLE compras ADD COLUMN tipo_documento TEXT NOT NULL DEFAULT ''")
+    if "factura_id" not in [col[1] for col in db.execute("PRAGMA table_info(compras)")]:  # guía de despacho neteada con su factura (compra_facturas)
+        db.execute("ALTER TABLE compras ADD COLUMN factura_id INTEGER")
     if "stock_modo" not in [col[1] for col in db.execute("PRAGMA table_info(fudo_tiendas)")]:  # SISTEMA: suma por API; MANUAL: se carga en el detalle del gasto en Fudo
         db.execute("ALTER TABLE fudo_tiendas ADD COLUMN stock_modo TEXT NOT NULL DEFAULT 'SISTEMA'")
     if "manual" not in [col[1] for col in db.execute("PRAGMA table_info(fudo_stock_envios)")]:

@@ -479,9 +479,11 @@ Vistas.panel = async v => {
 /* ---------- Compras ---------- */
 let tabCompras = null;
 Vistas.compras = async v => {
-  const tabs = [...(can('compras') ? [['compras', 'Compras']] : []), ...(can('proveedores') ? [['proveedores', 'Proveedores'], ['iva', 'Valor IVA']] : [])];
+  const tabs = [...(can('compras') ? [['compras', 'Compras'], ['guias', 'Guías por facturar']] : []), ...(can('proveedores') ? [['proveedores', 'Proveedores'], ['iva', 'Valor IVA']] : [])];
   const t = tabs.some(x => x[0] === tabCompras) ? tabCompras : tabs[0][0];
-  v.innerHTML = cabecera('Compras', 'Compras de insumos a proveedores', t === 'compras' && can('compras', 2) ? '<button class="btn primario" id="nueva">Registrar compra</button>' : t === 'proveedores' && can('proveedores', 2) ? '<button class="btn primario" id="nuevo-p">Nuevo proveedor</button>' : '');
+  v.innerHTML = cabecera('Compras', 'Compras de insumos a proveedores', t === 'compras' && can('compras', 2) ? '<button class="btn primario" id="nueva">Registrar compra</button>'
+    : t === 'guias' && can('compras', 2) ? '<button class="btn primario" id="factura">Registrar factura</button>'
+    : t === 'proveedores' && can('proveedores', 2) ? '<button class="btn primario" id="nuevo-p">Nuevo proveedor</button>' : '');
   v.append(pestanas(tabs, t, k => { tabCompras = k; render(); }));
   const c = v.appendChild(Object.assign(document.createElement('div'), { className: 'tarjeta' }));
   if (t === 'compras') {
@@ -493,8 +495,12 @@ Vistas.compras = async v => {
       { t: 'N°', v: r => r.id }, { t: 'Fecha', v: r => r.fecha, h: r => fFecha(r.fecha) }, { t: 'Proveedor', v: r => r.proveedor }, { t: 'RUT', v: r => r.rut }, { t: 'Tipo', v: r => TIPOS_DOC[r.tipo_documento] || '—' }, { t: 'Documento', v: r => r.documento },
       { t: 'Neto', n: 1, v: r => r.neto, h: r => fPeso(r.neto) }, { t: 'IVA', n: 1, v: r => r.iva, h: r => fPeso(r.iva) }, { t: 'Total', n: 1, v: r => r.total, h: r => fPeso(r.total) },
       { t: 'Estado', v: r => r.estado, h: r => r.estado === 'ANULADO' ? etq('Anulada', 'mal') : etq('Vigente', 'bien') },
-      { t: '', h: r => `<div class="acciones">${accion('ver', 'Ver')}${r.estado !== 'ANULADO' && can('compras', 2) && puede('anular_compras') ? accion('anular', 'Anular', 'peligro') : ''}</div>` }] });
+      { t: 'Factura', v: r => r.tipo_documento !== 'GUIA' || r.estado === 'ANULADO' ? '' : r.factura_doc ? 'Factura ' + r.factura_doc : 'Pendiente de factura',
+        h: r => r.tipo_documento !== 'GUIA' || r.estado === 'ANULADO' ? '' : r.factura_doc ? etq('Factura ' + r.factura_doc, 'bien') : etq('Pendiente de factura', 'alerta') },
+      { t: '', h: r => `<div class="acciones">${accion('ver', 'Ver')}${r.estado !== 'ANULADO' && !r.factura_doc && can('compras', 2) && puede('anular_compras') ? accion('anular', 'Anular', 'peligro') : ''}</div>` }] });
     $('#nueva', v)?.addEventListener('click', nuevaCompra);
+  } else if (t === 'guias') {
+    await vistaGuiasPorFacturar(v, c);
   } else if (t === 'proveedores') {
     const filas = await api('GET', '/proveedores');
     const form = r => formulario(r ? 'Editar proveedor' : 'Nuevo proveedor', [
@@ -516,7 +522,69 @@ Vistas.compras = async v => {
     });
   }
 };
-const TIPOS_DOC = { FACTURA: 'Factura', BOLETA: 'Boleta' };
+const TIPOS_DOC = { FACTURA: 'Factura', BOLETA: 'Boleta', GUIA: 'Guía de despacho' };
+async function vistaGuiasPorFacturar(v, c) {
+  const [pend, facturas] = await Promise.all([api('GET', '/compras/guias-pendientes'), api('GET', '/compras/facturas')]);
+  c.innerHTML = `<h2>Guías de despacho pendientes de factura</h2><p class="nota">El stock de estas guías ya ingresó. Cuando llegue la factura, presiona <b>Registrar factura</b> y marca las guías que incluye: quedan neteadas, sin volver a sumar stock ni compras.</p><div></div>`;
+  tabla(c.lastElementChild, { filas: pend, csv: 'guias_por_facturar', vacio: 'No hay guías pendientes de factura.', acciones: { ver: r => verCompra(r.id), facturar: r => registrarFactura(r.proveedor_id) }, cols: [
+    { t: 'Compra', v: r => r.id }, { t: 'Fecha', v: r => r.fecha, h: r => fFecha(r.fecha) }, { t: 'Proveedor', v: r => r.proveedor }, { t: 'N° guía', v: r => r.documento },
+    { t: 'Neto', n: 1, v: r => r.neto, h: r => fPeso(r.neto) }, { t: 'Total', n: 1, v: r => r.total, h: r => fPeso(r.total) },
+    { t: 'Días', n: 1, v: r => Math.max(0, Math.round((new Date(hoy()) - new Date(r.fecha)) / 864e5)) },
+    { t: '', h: () => `<div class="acciones">${accion('ver', 'Ver')}${can('compras', 2) ? accion('facturar', 'Registrar factura') : ''}</div>` }] });
+  const c2 = v.appendChild(Object.assign(document.createElement('div'), { className: 'tarjeta' }));
+  c2.innerHTML = '<h2>Facturas que netean guías</h2><div></div>';
+  tabla(c2.lastElementChild, { filas: facturas, csv: 'facturas_guias', vacio: 'Aún no se registran facturas de guías.', acciones: {
+    anular: r => confirmar('Anular factura', `La factura ${r.documento} se anulará y sus guías volverán a quedar pendientes de factura. El stock no cambia.`, async () => { await api('POST', `/compras/facturas/${r.id}/anular`, {}); aviso('Factura anulada: sus guías quedaron pendientes.'); render(); }, 'Anular factura') }, cols: [
+    { t: 'Fecha', v: r => r.fecha, h: r => fFecha(r.fecha) }, { t: 'Proveedor', v: r => r.proveedor }, { t: 'N° factura', v: r => r.documento },
+    { t: 'Guías', v: r => r.guias.map(g => g.documento || '#' + g.id).join(', ') },
+    { t: 'Neto factura', n: 1, v: r => r.neto, h: r => fPeso(r.neto) }, { t: 'Neto guías', n: 1, v: r => r.neto_guias, h: r => fPeso(r.neto_guias) },
+    { t: 'Diferencia', n: 1, v: r => r.diferencia, h: r => Math.abs(r.diferencia) < 1 ? '<span class="tenue">—</span>' : `<span class="${r.diferencia > 0 ? 'neg' : 'pos'}">${r.diferencia > 0 ? '+' : ''}${fPeso(r.diferencia)}</span>` },
+    { t: 'Total', n: 1, v: r => r.total, h: r => fPeso(r.total) },
+    { t: 'Estado', v: r => r.estado, h: r => r.estado === 'VIGENTE' ? etq('Vigente', 'bien') : etq('Anulada', 'mal') },
+    { t: '', h: r => r.estado === 'VIGENTE' && can('compras', 2) && puede('anular_compras') ? `<div class="acciones">${accion('anular', 'Anular', 'peligro')}</div>` : '' }] });
+  $('#factura', v)?.addEventListener('click', () => registrarFactura(''));
+}
+function registrarFactura(provSel) {
+  const m = modal('Registrar factura de guías de despacho', `<form novalidate><div class="campos">
+    <label class="campo"><span>Proveedor</span><select name="proveedor_id">${opciones(S.cat.proveedores, provSel, 'Selecciona…')}</select></label>
+    <label class="campo"><span>Fecha de la factura</span><input type="date" name="fecha" value="${hoy()}"></label>
+    <label class="campo"><span>N° de factura</span><input name="documento" maxlength="40"></label>
+    <label class="campo"><span>Neto de la factura</span>${inputNum('', '', 2).replace('<input', '<input name="neto"')}<small>Se completa con la suma de las guías marcadas. Cámbialo si la factura dice otro monto.</small></label></div>
+    <h3 style="font-size:14px;margin:14px 0 6px">Guías que incluye la factura</h3><div class="fg-guias"><p class="tenue">Elige el proveedor.</p></div>
+    <div class="totales fg-tot"></div><div class="error" hidden></div>
+    <div class="modal-pie"><button type="button" class="btn cerrar2">Cancelar</button><button class="btn primario">Registrar factura</button></div></form>`, true);
+  const f = $('form', m.el);
+  let guias = [], netoTocado = false;
+  const marcadas = () => $$('.fg-guias input:checked', m.el).map(i => guias.find(g => g.id === Number(i.value)));
+  const totales = () => {
+    const ng = marcadas().reduce((s, g) => s + g.neto, 0);
+    if (!netoTocado) f.neto.value = ng ? fNum(ng, 0, 2) : '';
+    const n = aNum(f.neto.value) ?? ng, iva = (Number.isNaN(n) ? 0 : n) * S.cat.iva / 100, dif = (Number.isNaN(n) ? 0 : n) - ng;
+    $('.fg-tot', m.el).innerHTML = `<div><span>Neto guías marcadas</span><span>${fPeso(ng)}</span></div><div><span>Neto factura</span><span>${fPeso(n)}</span></div>
+      <div><span>IVA ${fNum(S.cat.iva, 0, 2)}%</span><span>${fPeso(iva)}</span></div><div class="total"><span>Total factura</span><span>${fPeso(n + iva)}</span></div>
+      ${Math.abs(dif) >= 1 ? `<div><span>Diferencia con las guías</span><span class="${dif > 0 ? 'neg' : 'pos'}">${dif > 0 ? '+' : ''}${fPeso(dif)}</span></div>` : ''}`;
+  };
+  const cargar = async () => {
+    const caja = $('.fg-guias', m.el);
+    if (!f.proveedor_id.value) { guias = []; caja.innerHTML = '<p class="tenue">Elige el proveedor.</p>'; totales(); return; }
+    guias = await api('GET', '/compras/guias-pendientes' + qs({ proveedor_id: f.proveedor_id.value }));
+    caja.innerHTML = guias.length ? `<div class="tabla-marco"><table><thead><tr><th></th><th>Fecha</th><th>N° guía</th><th>Compra</th><th class="n">Neto</th><th class="n">Total</th></tr></thead><tbody>
+      ${guias.map(g => `<tr><td><input type="checkbox" value="${g.id}" checked aria-label="Incluir guía ${esc(g.documento)}"></td><td>${fFecha(g.fecha)}</td><td>${esc(g.documento) || '—'}</td><td>#${g.id}</td><td class="n">${fPeso(g.neto)}</td><td class="n">${fPeso(g.total)}</td></tr>`).join('')}</tbody></table></div>`
+      : '<p class="tenue">Este proveedor no tiene guías pendientes de factura.</p>';
+    totales();
+  };
+  f.proveedor_id.addEventListener('change', () => { netoTocado = false; cargar(); });
+  $('.fg-guias', m.el).addEventListener('change', totales);
+  f.neto.addEventListener('input', () => { netoTocado = f.neto.value.trim() !== ''; totales(); });
+  $('.cerrar2', m.el).addEventListener('click', m.cerrar);
+  conEnvio(f, m, async () => {
+    const n = aNum(f.neto.value);
+    if (Number.isNaN(n)) throw new Error('El neto de la factura no es un número válido.');
+    const r = await api('POST', '/compras/facturas', { proveedor_id: f.proveedor_id.value, fecha: f.fecha.value, documento: f.documento.value, neto: n, guias: marcadas().map(g => g.id) });
+    aviso(Math.abs(r.diferencia) >= 1 ? `Factura registrada. Diferencia con las guías: ${fPeso(r.diferencia)}.` : 'Factura registrada: las guías quedaron neteadas.'); render();
+  });
+  cargar();
+}
 function nuevaCompra() {
   const activos = S.cat.proveedores.filter(p => p.activo);
   const m = modal('Registrar compra', `<form novalidate><div class="campos"><label class="campo"><span>Proveedor</span><select name="proveedor_id">${opciones(activos, '', 'Selecciona…')}</select></label>
@@ -534,12 +602,13 @@ function nuevaCompra() {
   conEnvio($('form', m.el), m, async () => {
     const f = $('form', m.el);
     await api('POST', '/compras', { proveedor_id: f.proveedor_id.value, fecha: f.fecha.value, tipo_documento: f.tipo_documento.value, documento: f.documento.value, items: ed.leer() });
-    aviso('Compra registrada: el stock aumentó.'); render();
+    aviso(f.tipo_documento.value === 'GUIA' ? 'Guía registrada: el stock aumentó. Queda pendiente de factura.' : 'Compra registrada: el stock aumentó.'); render();
   });
 }
 async function verCompra(id) {
   const c = await api('GET', `/compras/${id}`);
-  const m = modal(`Compra #${c.id}`, `<div class="guia-datos"><div><b>Proveedor:</b> ${esc(c.proveedor)}</div><div><b>RUT:</b> ${esc(c.rut)}</div><div><b>Fecha:</b> ${fFecha(c.fecha)}</div><div><b>Tipo de documento:</b> ${esc(TIPOS_DOC[c.tipo_documento]) || '—'}</div><div><b>Documento:</b> ${esc(c.documento) || '—'}</div><div><b>Registrada por:</b> ${esc(c.usuario)}</div></div>
+  const m = modal(`Compra #${c.id}`, `<div class="guia-datos"><div><b>Proveedor:</b> ${esc(c.proveedor)}</div><div><b>RUT:</b> ${esc(c.rut)}</div><div><b>Fecha:</b> ${fFecha(c.fecha)}</div><div><b>Tipo de documento:</b> ${esc(TIPOS_DOC[c.tipo_documento]) || '—'}</div><div><b>Documento:</b> ${esc(c.documento) || '—'}</div><div><b>Registrada por:</b> ${esc(c.usuario)}</div>
+    ${c.tipo_documento === 'GUIA' ? `<div><b>Factura:</b> ${c.factura_doc ? `${esc(c.factura_doc)} del ${fFecha(c.factura_fecha)}` : 'Pendiente'}</div>` : ''}</div>
     <div class="tabla-marco"><table><thead><tr><th>Código</th><th>Insumo</th><th class="n">Cantidad</th><th class="n">Precio neto</th><th class="n">Subtotal</th></tr></thead><tbody>${c.items.map(i => `<tr><td>${esc(i.codigo)}</td><td>${esc(i.nombre)}</td><td class="n">${fCant(i.cantidad)} ${esc(i.unidad)}</td><td class="n">${fPrecio(i.precio)}</td><td class="n">${fPeso(i.cantidad * i.precio)}</td></tr>`).join('')}</tbody></table></div>
     <div class="totales"><div><span>Neto</span><span>${fPeso(c.neto)}</span></div><div><span>IVA ${fNum(c.iva_pct, 0, 2)}%</span><span>${fPeso(c.iva)}</span></div><div class="total"><span>Total</span><span>${fPeso(c.total)}</span></div></div>`, true);
   return m;

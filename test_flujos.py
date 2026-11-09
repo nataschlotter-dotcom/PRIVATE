@@ -392,10 +392,10 @@ A("DELETE", f"/articulos/{ida}", esperado=409)
 assert {x["articulo_id"] for x in A("GET", f"/salidas-internas/stock?bodega={tienda}")} >= {ida, vaso}
 assert torta not in {x["articulo_id"] for x in A("GET", f"/salidas-internas/stock?bodega={tienda}")}
 
-# Compras: factura o boleta es obligatorio
+# Compras: el tipo de documento (factura, boleta o guía) es obligatorio
 s_doc = stock()[harina]
 A("POST", "/compras", {"proveedor_id": prov, "items": [{"articulo_id": harina, "cantidad": 1, "precio": 1}]}, 400)
-A("POST", "/compras", {"tipo_documento": "GUIA", "proveedor_id": prov, "items": [{"articulo_id": harina, "cantidad": 1, "precio": 1}]}, 400)
+A("POST", "/compras", {"tipo_documento": "NOTA", "proveedor_id": prov, "items": [{"articulo_id": harina, "cantidad": 1, "precio": 1}]}, 400)
 cb = A("POST", "/compras", {"tipo_documento": "BOLETA", "documento": "55", "proveedor_id": prov, "items": [{"articulo_id": harina, "cantidad": 1, "precio": 1200}]})["id"]
 assert A("GET", f"/compras/{cb}")["tipo_documento"] == "BOLETA" and any(x["tipo_documento"] == "BOLETA" for x in A("GET", "/compras"))
 assert any(x["referencia"] == f"Compra #{cb} · Boleta 55" for x in A("GET", "/movimientos?desde=2026-01-01&tipo=COMPRA"))
@@ -982,6 +982,33 @@ c.close()
 cats = [f["categoria"].lower() for f in st["filas"]]
 assert cats == sorted(cats)
 assert all(f["tipo"] == "INSUMO" for f in A("GET", "/reportes/stock-tiendas?tipo=insumo")["filas"])
+
+# Guía de despacho de proveedor: suma stock al recibirla, queda pendiente y se netea con la factura sin volver a sumar
+stock_antes = next(x for x in A("GET", "/articulos") if x["id"] == harina)["stock"]
+g1 = A("POST", "/compras", {"tipo_documento": "GUIA", "documento": "G-501", "proveedor_id": prov, "items": [{"articulo_id": harina, "cantidad": 2, "precio": 1000}]})["id"]
+g2 = A("POST", "/compras", {"tipo_documento": "GUIA", "documento": "G-502", "proveedor_id": prov, "items": [{"articulo_id": harina, "cantidad": 3, "precio": 1000}]})["id"]
+casi(next(x for x in A("GET", "/articulos") if x["id"] == harina)["stock"], stock_antes + 5)
+A("POST", "/compras", {"tipo_documento": "OTRO", "proveedor_id": prov, "items": [{"articulo_id": harina, "cantidad": 1, "precio": 1}]}, 400)
+assert {g1, g2} <= {r["id"] for r in A("GET", f"/compras/guias-pendientes?proveedor_id={prov}")}
+A("POST", "/compras/facturas", {"proveedor_id": prov, "documento": "F-900", "guias": []}, 400)
+A("POST", "/compras/facturas", {"proveedor_id": prov, "documento": "", "guias": [g1]}, 400)
+A("POST", "/compras/facturas", {"proveedor_id": prov, "documento": "F-900", "guias": [c1]}, 400)  # una factura no es guía
+fx = A("POST", "/compras/facturas", {"proveedor_id": prov, "documento": "F-900", "fecha": "2026-02-01", "neto": 5100, "guias": [g1, g2]})
+casi(fx["neto_guias"], 5000); casi(fx["diferencia"], 100)
+casi(next(x for x in A("GET", "/articulos") if x["id"] == harina)["stock"], stock_antes + 5)  # la factura no mueve stock
+assert not {g1, g2} & {r["id"] for r in A("GET", "/compras/guias-pendientes")}
+assert A("GET", f"/compras/{g1}")["factura_doc"] == "F-900"
+A("POST", "/compras/facturas", {"proveedor_id": prov, "documento": "F-901", "guias": [g1]}, 409)  # ya neteada
+A("POST", "/compras/facturas", {"proveedor_id": prov, "documento": "F-900", "guias": [g1]}, 409)  # factura repetida
+A("POST", f"/compras/{g1}/anular", {}, 409)  # no se anula una guía neteada
+fl = next(f for f in A("GET", "/compras/facturas") if f["id"] == fx["id"])
+assert fl["estado"] == "VIGENTE" and len(fl["guias"]) == 2 and abs(fl["diferencia"] - 100) < 0.01
+A("POST", f"/compras/facturas/{fx['id']}/anular", {})
+assert {g1, g2} <= {r["id"] for r in A("GET", "/compras/guias-pendientes")}
+assert len(next(f for f in A("GET", "/compras/facturas") if f["id"] == fx["id"])["guias"]) == 2  # conserva qué guías tenía
+A("POST", f"/compras/facturas/{fx['id']}/anular", {}, 409)
+A("POST", f"/compras/{g1}/anular", {})
+A("POST", f"/compras/{g2}/anular", {})
 
 # Datos de ejemplo: base nueva, y coherencia del historial
 os.environ["NS_DB"] = app.DB_PATH = os.path.join(tempfile.mkdtemp(), "demo.db")
