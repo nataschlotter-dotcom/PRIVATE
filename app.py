@@ -357,6 +357,10 @@ def crear_compra(db, uid, d):
                      (fecha, prov, tipo_doc, txt(d.get("documento"), "El documento", False, 40), pct, neto, iva, round(neto + iva, 2),
                       txt(d.get("obs"), "La observación", False, 500), uid))
     cid = cur.lastrowid
+    if tipo_doc == "GUIA" and not str(d.get("documento") or "").strip():
+        # Guía recibida sin número: se asigna uno automático y único, "SN-" + correlativo de la compra
+        d = {**d, "documento": f"SN-{cid:06d}"}
+        db.execute("UPDATE compras SET documento=? WHERE id=?", (d["documento"], cid))
     ref = f"Compra #{cid} · {TIPOS_DOC_COMPRA[tipo_doc]}" + (f" {d.get('documento')}" if d.get("documento") else "")
     for i in items:
         a = articulo(db, i["articulo_id"])

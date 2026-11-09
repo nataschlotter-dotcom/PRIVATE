@@ -988,6 +988,9 @@ stock_antes = next(x for x in A("GET", "/articulos") if x["id"] == harina)["stoc
 g1 = A("POST", "/compras", {"tipo_documento": "GUIA", "documento": "G-501", "proveedor_id": prov, "items": [{"articulo_id": harina, "cantidad": 2, "precio": 1000}]})["id"]
 g2 = A("POST", "/compras", {"tipo_documento": "GUIA", "documento": "G-502", "proveedor_id": prov, "items": [{"articulo_id": harina, "cantidad": 3, "precio": 1000}]})["id"]
 casi(next(x for x in A("GET", "/articulos") if x["id"] == harina)["stock"], stock_antes + 5)
+g3 = A("POST", "/compras", {"tipo_documento": "GUIA", "documento": "  ", "proveedor_id": prov, "items": [{"articulo_id": harina, "cantidad": 1, "precio": 1000}]})["id"]
+assert A("GET", f"/compras/{g3}")["documento"] == f"SN-{g3:06d}"  # guía sin número: se asigna uno automático
+A("POST", f"/compras/{g3}/anular", {})
 A("POST", "/compras", {"tipo_documento": "OTRO", "proveedor_id": prov, "items": [{"articulo_id": harina, "cantidad": 1, "precio": 1}]}, 400)
 assert {g1, g2} <= {r["id"] for r in A("GET", f"/compras/guias-pendientes?proveedor_id={prov}")}
 A("POST", "/compras/facturas", {"proveedor_id": prov, "documento": "F-900", "guias": []}, 400)

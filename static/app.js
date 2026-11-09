@@ -588,10 +588,11 @@ function registrarFactura(provSel) {
 function nuevaCompra() {
   const activos = S.cat.proveedores.filter(p => p.activo);
   const m = modal('Registrar compra', `<form novalidate><div class="campos"><label class="campo"><span>Proveedor</span><select name="proveedor_id">${opciones(activos, '', 'Selecciona…')}</select></label>
-    <label class="campo"><span>Fecha</span><input type="date" name="fecha" value="${hoy()}"></label><label class="campo"><span>Tipo de documento</span><select name="tipo_documento">${opciones(Object.entries(TIPOS_DOC).map(([id, nombre]) => ({ id, nombre })), '', 'Selecciona…')}</select></label><label class="campo"><span>N° de documento</span><input name="documento"></label></div>
+    <label class="campo"><span>Fecha</span><input type="date" name="fecha" value="${hoy()}"></label><label class="campo"><span>Tipo de documento</span><select name="tipo_documento">${opciones(Object.entries(TIPOS_DOC).map(([id, nombre]) => ({ id, nombre })), '', 'Selecciona…')}</select></label><label class="campo"><span>N° de documento</span><input name="documento"><small class="doc-ayuda" hidden>Si no tienes el número de la guía, déjalo vacío: se asigna uno automático (SN-…).</small></label></div>
     <h3 style="font-size:14px;margin:14px 0 6px">Detalle</h3><div id="lin"></div><div class="totales" id="tot"></div><div class="error" hidden></div>
     <div class="modal-pie"><button type="button" class="btn cerrar">Cancelar</button><button class="btn primario">Registrar compra</button></div></form>`, true);
   $$('.cerrar', m.el).forEach(b => b.addEventListener('click', m.cerrar));
+  $('select[name=tipo_documento]', m.el).addEventListener('change', e => { $('.doc-ayuda', m.el).hidden = e.target.value !== 'GUIA'; });
   const totales = () => {
     const n = ed ? ed.neto() : 0, i = n * S.cat.iva / 100;
     $('#tot', m.el).innerHTML = `<div><span>Neto</span><span>${fPeso(n)}</span></div><div><span>IVA ${fNum(S.cat.iva, 0, 2)}%</span><span>${fPeso(i)}</span></div><div class="total"><span>Total</span><span>${fPeso(n + i)}</span></div>`;
