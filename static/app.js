@@ -361,18 +361,43 @@ function editorLineas(caja, cfg) {
 }
 
 /* ---------- gráficos ---------- */
+// Colores por valor (tienda, producto, artículo, proveedor…): paleta categórica validada para daltonismo,
+// en orden fijo. Cada barra lleva su nombre y su valor escritos, así el color nunca es la única pista.
+const PALETA_SERIES = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300', '#6250d6', '#e34948'];
+const SIN_COLOR = '#a7abaf';  // del noveno en adelante: gris neutro (nunca se repite un color)
+function ordenEntidades() {
+  // Orden estable por identificador: el color sigue a la entidad, no a su lugar en el ranking.
+  const m = new Map([['Bodega central', 0]]);
+  const porId = l => [...(l || [])].sort((a, b) => a.id - b.id);
+  for (const lista of [S.cat?.tiendas, S.cat?.articulos, S.cat?.proveedores])
+    for (const x of porId(lista)) if (!m.has(x.nombre)) m.set(x.nombre, m.size);
+  return m;
+}
+function coloresDe(nombres) {
+  const orden = ordenEntidades();
+  const tiendas = new Set(['Bodega central', ...(S.cat?.tiendas || []).map(t => t.nombre)]);
+  const colores = new Map();
+  if (nombres.every(n => tiendas.has(n))) {  // tiendas y bodegas: siempre el mismo color en todos los gráficos
+    for (const n of nombres) colores.set(n, PALETA_SERIES[orden.get(n)] || SIN_COLOR);
+    return colores;
+  }
+  const unicos = [...new Set(nombres)].sort((a, b) => (orden.get(a) ?? 1e9) - (orden.get(b) ?? 1e9) || a.localeCompare(b, 'es'));
+  unicos.forEach((n, i) => colores.set(n, PALETA_SERIES[i] || SIN_COLOR));
+  return colores;
+}
 function barras(filas, et, val, fmt = fPeso) {
   if (!filas.length) return '<p class="vacio">Sin datos en el período.</p>';
   const max = Math.max(...filas.map(val), 1);
+  const colores = coloresDe(filas.map(r => String(et(r))));
   return `<div class="barras">${filas.map(r => `<div class="barra-fila" data-tip="${esc(et(r))}: ${esc(fmt(val(r)))}">
-    <span>${esc(et(r))}</span><span class="barra-pista"><i style="width:${(val(r) / max * 100).toFixed(1)}%"></i></span><b>${esc(fmt(val(r)))}</b></div>`).join('')}</div>`;
+    <span>${esc(et(r))}</span><span class="barra-pista"><i style="width:${(val(r) / max * 100).toFixed(1)}%;background:${colores.get(String(et(r)))}"></i></span><b>${esc(fmt(val(r)))}</b></div>`).join('')}</div>`;
 }
 function columnas(titulo, serie, k) {
   const max = Math.max(...serie.map(s => s[k]), 1);
   const mes = m => new Date(m + '-15').toLocaleDateString('es-CL', { month: 'short' }).replace('.', '');
   const ult = serie[serie.length - 1]?.[k] || 0;
   return `<div class="tarjeta"><h2>${esc(titulo)}</h2><div class="mini-tot">${fPeso(ult)}<small>mes en curso</small></div>
-    <div class="columnas" role="img" aria-label="${esc(titulo)} por mes">${serie.map(s => `<div class="columna" data-tip="${esc(mes(s.mes))} ${s.mes.slice(0, 4)}: ${fPeso(s[k])}"><i style="height:${(s[k] / max * 100).toFixed(1)}%"></i></div>`).join('')}</div>
+    <div class="columnas" role="img" aria-label="${esc(titulo)} por mes">${serie.map((s, i) => `<div class="columna" data-tip="${esc(mes(s.mes))} ${s.mes.slice(0, 4)}: ${fPeso(s[k])}"><i style="height:${(s[k] / max * 100).toFixed(1)}%;background:${PALETA_SERIES[i] || SIN_COLOR}"></i></div>`).join('')}</div>
     <div class="columnas-et">${serie.map(s => `<span>${esc(mes(s.mes))}</span>`).join('')}</div></div>`;
 }
 function linea(serie) {
@@ -387,8 +412,8 @@ function linea(serie) {
   const salto = Math.max(1, Math.ceil(serie.length / 6));
   return `<svg class="linea-svg" viewBox="0 0 ${W} ${H}" role="img" aria-label="Evolución del precio">
     ${marcas.map(v => `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="#e7e8e9"/><text x="${L - 8}" y="${y(v) + 4}" text-anchor="end">${fPrecio(Math.round(v * 100) / 100)}</text>`).join('')}
-    <polyline fill="none" stroke="#8e6f3e" stroke-width="2" stroke-linejoin="round" points="${serie.map((s, i) => `${x(i)},${y(s.precio)}`).join(' ')}"/>
-    ${serie.map((s, i) => `<g data-tip="${fFecha(s.fecha)}\n${fPrecio(s.precio)}\n${esc(s.proveedor)}"><circle cx="${x(i)}" cy="${y(s.precio)}" r="12" fill="transparent"/><circle cx="${x(i)}" cy="${y(s.precio)}" r="4" fill="#8e6f3e" stroke="#fff" stroke-width="2"/></g>`).join('')}
+    <polyline fill="none" stroke="#3a8f9e" stroke-width="2" stroke-linejoin="round" points="${serie.map((s, i) => `${x(i)},${y(s.precio)}`).join(' ')}"/>
+    ${serie.map((s, i) => `<g data-tip="${fFecha(s.fecha)}\n${fPrecio(s.precio)}\n${esc(s.proveedor)}"><circle cx="${x(i)}" cy="${y(s.precio)}" r="12" fill="transparent"/><circle cx="${x(i)}" cy="${y(s.precio)}" r="5" fill="${PALETA_SERIES[i] || SIN_COLOR}" stroke="#fff" stroke-width="2"/></g>`).join('')}
     ${serie.map((s, i) => i % salto === 0 ? `<text x="${x(i)}" y="${H - 6}" text-anchor="middle">${fFecha(s.fecha).slice(0, 5)}</text>` : '').join('')}
   </svg>`;
 }
