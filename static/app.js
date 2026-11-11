@@ -363,7 +363,8 @@ function editorLineas(caja, cfg) {
 /* ---------- gráficos ---------- */
 // Colores por valor (tienda, producto, artículo, proveedor…): paleta categórica validada para daltonismo,
 // en orden fijo. Cada barra lleva su nombre y su valor escritos, así el color nunca es la única pista.
-const PALETA_SERIES = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300', '#6250d6', '#e34948'];
+// Tonos suaves de la paleta (mismos colores, más claros y menos intensos); validada: se distinguen entre sí, también con daltonismo.
+const PALETA_SERIES = ['#528cd8', '#f18760', '#5dbd92', '#e0a448', '#eb92b1', '#4c9b47', '#7c76e1', '#e86e68'];
 const SIN_COLOR = '#a7abaf';  // del noveno en adelante: gris neutro (nunca se repite un color)
 function ordenEntidades() {
   // Orden estable por identificador: el color sigue a la entidad, no a su lugar en el ranking.
@@ -440,6 +441,8 @@ function pantallaAcceso() {
         username: f.username.value, password: f.password.value,
         ...(instalar ? { nombre: f.nombre.value, demo: f.demo.checked, clave: f.clave?.value } : {}),
       });
+      // cada usuario parte en su propia primera pantalla, no en la que dejó abierta otra persona en este navegador
+      history.replaceState(null, '', location.pathname + location.search);
       await iniciar();
     } catch (x) { err.textContent = x.message; err.hidden = false; b.disabled = false; if (instalar) b.textContent = 'Crear e ingresar'; }
   });
@@ -1898,9 +1901,11 @@ async function render() {
   if (!Vistas[m] || !(PERMISO_RUTA[m] || [m]).some(x => can(x))) {
     m = primeraRuta();
     if (!m) { $('#vista').innerHTML = cabecera('Sin accesos', 'Tu perfil aún no tiene módulos asignados.'); return; }
-    if (location.hash !== '#/' + m) { location.hash = '#/' + m; return; }
+    // se corrige la dirección sin disparar 'hashchange' (eso contaría como si el usuario hubiera elegido una opción)
+    if (location.hash !== '#/' + m) history.replaceState(null, '', '#/' + m);
   }
-  $$('.nav a').forEach(a => { const on = a.dataset.m === m; a.classList.toggle('activo', on); if (on) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current'); });
+  // Al entrar al sistema el menú queda sin marcar hasta que el usuario elige una opción
+  $$('.nav a').forEach(a => { const on = !S.menuSinMarca && a.dataset.m === m; a.classList.toggle('activo', on); if (on) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current'); });
   $('#lateral').classList.remove('abierto');
   const destino = document.createElement('div');
   try {
@@ -1915,8 +1920,15 @@ async function iniciar() {
   S.estado = await api('GET', '/estado');
   S.usuario = S.estado.usuario; S.modulos = S.estado.modulos; S.acciones = S.estado.acciones || []; S.logo = S.estado.logo;
   if (!S.usuario) return pantallaAcceso();
+  S.menuSinMarca = true;  // recién ingresado: ninguna opción del menú aparece marcada
   marco();
+  $('#lateral .nav').addEventListener('click', e => {
+    const a = e.target.closest('a[data-m]');
+    if (!a) return;
+    S.menuSinMarca = false;
+    if (a.getAttribute('href') === location.hash) { e.preventDefault(); render(); }  // misma pantalla: solo se marca
+  });
   render();
 }
-addEventListener('hashchange', render);
+addEventListener('hashchange', () => { S.menuSinMarca = false; render(); });
 iniciar().catch(x => { app.innerHTML = `<div class="acceso"><div class="tarjeta">${esc(x.message)}</div></div>`; });
