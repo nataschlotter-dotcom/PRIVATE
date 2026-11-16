@@ -295,11 +295,12 @@ def costo_de(a):
 
 
 def mover(db, art_id, bodega, delta, tipo, uid, fecha, doc_tipo=None, doc_id=None, ref="", proveedor=None, destino=None,
-          motivo=None, costo=None, obs=""):
-    """Único punto que modifica stock: garantiza saldo no negativo y deja rastro en el historial."""
+          motivo=None, costo=None, obs="", negativo=False):
+    """Único punto que modifica stock: garantiza saldo no negativo (salvo negativo=True, solo para las ventas del POS,
+    que ya se cobraron y se cuadran después con un despacho o un inventario) y deja rastro en el historial."""
     a = articulo(db, art_id)
     nuevo = round(stock_de(db, bodega, art_id) + delta, 5)
-    if nuevo < 0:
+    if nuevo < 0 and not negativo:
         raise ApiError(409, f"Stock insuficiente de {a['nombre']}: hay {stock_de(db, bodega, art_id):g} {a['unidad']} "
                             f"y se necesitan {abs(delta):g} {a['unidad']}.")
     db.execute("INSERT INTO stock(bodega_id,articulo_id,cantidad) VALUES(?,?,?) "
@@ -2318,7 +2319,8 @@ def pos_consumo(c):
     cid = c.db.execute("INSERT INTO pos_consumos(referencia,tienda_id,fecha,detalle,creado) VALUES(?,?,?,?,?)",
                        (ref, tid, fecha, detalle, f"{datetime.now():%Y-%m-%d %H:%M:%S}")).lastrowid
     for aid, cant in cantidades.items():
-        mover(c.db, aid, tid, -cant, "VENTA", None, fecha, "POS", cid, f"POS {ref}", obs=detalle)
+        # La venta ya se cobró en el POS: se descuenta aunque falte stock (queda negativo hasta reponer o hacer inventario)
+        mover(c.db, aid, tid, -cant, "VENTA", None, fecha, "POS", cid, f"POS {ref}", obs=detalle, negativo=True)
     return {"ok": True, "id": cid}
 
 

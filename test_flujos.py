@@ -812,10 +812,24 @@ r1 = P("POST", "/pos/consumos", venta, token=clave)
 casi(stock(tienda)[con_stock], st[con_stock] - 1)
 assert P("POST", "/pos/consumos", venta, token=clave)["id"] == r1["id"]  # repetido: no descuenta de nuevo
 casi(stock(tienda)[con_stock], st[con_stock] - 1)
-# Stock insuficiente: nada se descuenta (todo o nada)
-P("POST", "/pos/consumos", {**venta, "referencia": "POS-test-2", "items": [{"articulo_id": con_stock, "cantidad": 0.5}, {"articulo_id": con_stock if otro is None else otro, "cantidad": 99999}]}, token=clave, esperado=409)
+# Stock insuficiente: la venta ya se cobró, se descuenta igual y queda negativo; al anularla vuelve todo
+falta = con_stock if otro is None else otro
+st_falta = stock(tienda).get(falta, 0)
+P("POST", "/pos/consumos", {**venta, "referencia": "POS-test-2", "items": [{"articulo_id": con_stock, "cantidad": 0.5}, {"articulo_id": falta, "cantidad": 99999}]}, token=clave)
+assert stock(tienda)[falta] < 0
+P("POST", "/pos/consumos/anular", {"referencia": "POS-test-2"}, token=clave)
 casi(stock(tienda)[con_stock], st[con_stock] - 1)
-P("POST", "/pos/consumos/anular", {"referencia": "POS-test-2"}, token=clave, esperado=404)
+casi(stock(tienda).get(falta, 0), st_falta)
+# Los demás movimientos siguen sin poder dejar el stock negativo (ej. una salida manual de la tienda)
+_c = app.conectar()
+try:
+    app.mover(_c, falta, tienda, -99999, "MERMA", None, "2026-11-04")
+    raise AssertionError("mover sin negativo=True debió rechazar el stock negativo")
+except app.ApiError:
+    pass
+finally:
+    _c.rollback()
+    _c.close()
 P("POST", "/pos/consumos", {**venta, "referencia": "POS-test-3", "tienda_id": 999999}, token=clave, esperado=404)
 P("POST", "/pos/consumos", {**venta, "referencia": "POS-test-3", "items": [{"articulo_id": 999999, "cantidad": 1}]}, token=clave, esperado=404)
 P("POST", "/pos/consumos", {**venta, "referencia": "POS-test-3", "items": [{"articulo_id": con_stock, "cantidad": 0}]}, token=clave, esperado=400)
@@ -825,7 +839,7 @@ P("POST", "/pos/consumos/anular", {"referencia": "POS-test-1"}, token=clave)
 casi(stock(tienda)[con_stock], st[con_stock])
 P("POST", "/pos/consumos/anular", {"referencia": "POS-test-1"}, token=clave)  # ya anulado: 200 sin devolver dos veces
 casi(stock(tienda)[con_stock], st[con_stock])
-assert A("GET", "/config/pos")["consumos"] == 1
+assert A("GET", "/config/pos")["consumos"] == 2  # POS-test-1 y POS-test-2 (con stock negativo)
 # Stock de tienda y toma de inventario desde el POS
 st_pos = {x["articulo_id"]: x for x in P("GET", f"/pos/stock?tienda_id={tienda}", token=clave)}
 assert set(st_pos) == set(arts_pos)  # todos los de tienda, con 0 si no hay fila
