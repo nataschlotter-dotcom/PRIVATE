@@ -845,6 +845,10 @@ assert A("GET", "/config/pos")["consumos"] == 2  # POS-test-1 y POS-test-2 (con 
 st_pos = {x["articulo_id"]: x for x in P("GET", f"/pos/stock?tienda_id={tienda}", token=clave)}
 assert set(st_pos) == set(arts_pos)  # todos los de tienda, con 0 si no hay fila
 casi(st_pos[con_stock]["cantidad"], st[con_stock])
+c_cat = app.conectar()
+cats_sis = {r[0]: r[1] for r in c_cat.execute("SELECT a.id, c.nombre FROM articulos a JOIN categorias c ON c.id=a.categoria_id")}
+c_cat.close()
+assert all(x["categoria"] == cats_sis[aid] for aid, x in st_pos.items())  # el POS filtra el stock por categoría
 P("GET", "/pos/stock?tienda_id=999999", token=clave, esperado=404)
 P("GET", f"/pos/stock?tienda_id={tienda}", token="mala", esperado=401)
 sin_fila = next((aid for aid in arts_pos if aid not in st), None)

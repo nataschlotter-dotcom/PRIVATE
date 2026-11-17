@@ -2350,8 +2350,10 @@ def pos_tienda(db, valor):
 def pos_stock(c):
     pos_autorizar(c)
     tid = pos_tienda(c.db, c.q.get("tienda_id"))
-    return rows(c.db, """SELECT a.id articulo_id, a.codigo, a.nombre, a.tipo, u.abreviatura unidad, COALESCE(s.cantidad,0) cantidad, a.stock_minimo
-        FROM articulos a JOIN unidades u ON u.id=a.unidad_id LEFT JOIN stock s ON s.articulo_id=a.id AND s.bodega_id=?
+    return rows(c.db, """SELECT a.id articulo_id, a.codigo, a.nombre, a.tipo, u.abreviatura unidad, COALESCE(s.cantidad,0) cantidad, a.stock_minimo,
+        COALESCE(cat.nombre, '') categoria
+        FROM articulos a JOIN unidades u ON u.id=a.unidad_id LEFT JOIN categorias cat ON cat.id=a.categoria_id
+        LEFT JOIN stock s ON s.articulo_id=a.id AND s.bodega_id=?
         WHERE a.activo=1 AND (a.tipo='PRODUCTO' OR a.desechable=1) ORDER BY a.nombre""", tid)
 
 
