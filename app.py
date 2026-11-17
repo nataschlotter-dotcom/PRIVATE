@@ -2283,9 +2283,11 @@ def pos_tiendas(c):
 
 @ruta("GET", "/api/pos/articulos", publica=True)
 def pos_articulos(c):
-    """Lo que se maneja con stock en tienda: productos e insumos de punto de venta / desechables."""
+    """Lo que se maneja con stock en tienda: productos e insumos de punto de venta / desechables.
+    Incluye el costo unitario (el mismo con que se valoriza el consumo: costo promedio, o el precio si no tiene) para los informes del POS."""
     pos_autorizar(c)
-    return rows(c.db, """SELECT a.id, a.codigo, a.nombre, a.tipo, u.abreviatura unidad FROM articulos a JOIN unidades u ON u.id=a.unidad_id
+    return rows(c.db, """SELECT a.id, a.codigo, a.nombre, a.tipo, u.abreviatura unidad,
+        CASE WHEN a.costo>0 THEN a.costo ELSE a.precio END costo FROM articulos a JOIN unidades u ON u.id=a.unidad_id
         WHERE a.activo=1 AND (a.tipo='PRODUCTO' OR a.desechable=1) ORDER BY a.nombre""")
 
 

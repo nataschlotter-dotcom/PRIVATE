@@ -803,6 +803,7 @@ assert P("GET", "/pos/ping", token=clave)["ok"] is True
 assert tienda in [t["id"] for t in P("GET", "/pos/tiendas", token=clave)]
 arts_pos = {x["id"]: x for x in P("GET", "/pos/articulos", token=clave)}
 assert vaso in arts_pos and harina not in arts_pos
+assert all(isinstance(x["costo"], (int, float)) and x["costo"] >= 0 for x in arts_pos.values())  # costo para el CMV del POS
 st = stock(tienda)
 con_stock = next(aid for aid, q in st.items() if q >= 2 and aid in arts_pos)
 otro = next((aid for aid in arts_pos if aid != con_stock), None)
