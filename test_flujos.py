@@ -849,6 +849,27 @@ c_cat = app.conectar()
 cats_sis = {r[0]: r[1] for r in c_cat.execute("SELECT a.id, c.nombre FROM articulos a JOIN categorias c ON c.id=a.categoria_id")}
 c_cat.close()
 assert all(x["categoria"] == cats_sis[aid] for aid, x in st_pos.items())  # el POS filtra el stock por categoría
+# Despachos que la tienda recibe en el POS: la central descuenta al despachar, la tienda suma al recibir y lo que falta vuelve a la central
+c_rp = app.conectar(); c_rp.execute("UPDATE tiendas SET recibe_pos=1 WHERE id=?", (tienda,)); c_rp.commit(); c_rp.close()
+c0, t0 = stock().get(vaso, 0), stock(tienda).get(vaso, 0)
+gr = A("POST", "/despachos", {"tienda_id": tienda, "items": [{"articulo_id": vaso, "cantidad": 4}]})["id"]
+casi(stock()[vaso], c0 - 4); casi(stock(tienda).get(vaso, 0), t0)  # en camino: todavía no está en la tienda
+assert A("GET", f"/despachos/{gr}")["recepcion"] == "EN_CAMINO"
+lista_rp = P("GET", f"/pos/despachos?tienda_id={tienda}", token=clave)
+assert lista_rp["recibe_pos"] and gr in [x["id"] for x in lista_rp["guias"] if x["recepcion"] == "EN_CAMINO"]
+assert [i["cantidad"] for x in lista_rp["guias"] if x["id"] == gr for i in x["items"]] == [4]
+rec = {"referencia": "POSREC-1", "tienda_id": tienda, "despacho_id": gr, "responsable": "Ana", "obs": "una caja abierta",
+       "items": [{"articulo_id": vaso, "recibido": 3}]}
+P("POST", "/pos/despachos/recibir", {**rec, "items": [{"articulo_id": vaso, "recibido": 5}]}, token=clave, esperado=400)  # más de lo despachado
+P("POST", "/pos/despachos/recibir", rec, token=clave)
+P("POST", "/pos/despachos/recibir", rec, token=clave)  # repetido (reintento del POS): no suma dos veces
+casi(stock(tienda)[vaso], t0 + 3); casi(stock()[vaso], c0 - 3)  # lo que no llegó volvió a la central
+P("POST", "/pos/despachos/recibir", {**rec, "referencia": "POSREC-2"}, token=clave, esperado=409)  # ya recibida
+g_r = A("GET", f"/despachos/{gr}")
+assert g_r["recepcion"] == "RECIBIDA" and g_r["items"][0]["recibido"] == 3 and g_r["recibido_por"] == "Ana"
+assert [x["faltantes"] for x in A("GET", "/despachos?desde=2000-01-01") if x["id"] == gr] == [1]
+A("POST", f"/despachos/{gr}/anular", {}); casi(stock(tienda).get(vaso, 0), t0); casi(stock()[vaso], c0)  # anularla deja todo como antes
+c_rp = app.conectar(); c_rp.execute("UPDATE tiendas SET recibe_pos=0 WHERE id=?", (tienda,)); c_rp.commit(); c_rp.close()
 P("GET", "/pos/stock?tienda_id=999999", token=clave, esperado=404)
 P("GET", f"/pos/stock?tienda_id={tienda}", token="mala", esperado=401)
 sin_fila = next((aid for aid in arts_pos if aid not in st), None)

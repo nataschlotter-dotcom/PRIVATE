@@ -10,6 +10,7 @@ const TIPOS_MOV = {
   CONSUMO_INTERNO: ['Consumo interno', ''], ANULACION: ['Anulación', 'alerta'], AJUSTE_ADMIN: ['Actualización de stock', 'dorada'], DEVOLUCION_PROVEEDOR: ['Devolución a proveedor', 'alerta'],
   DEVOLUCION_TIENDA: ['Devolución de tienda', 'alerta'], RECEPCION_CENTRAL: ['Recepción en central', 'bien'], CONSUMO_CENTRAL: ['Consumo interno central', ''],
   VENTA_FUDO: ['Ventas en Fudo', ''], TRANSFERENCIA_SALIDA: ['Transferencia enviada a otra tienda', ''], TRANSFERENCIA_ENTRADA: ['Transferencia recibida de otra tienda', 'bien'],
+  FALTANTE_DESPACHO: ['Faltante de despacho (vuelve a la central)', 'alerta'],
 };
 const NAV = [
   ['', [['panel', 'Panel de inicio']]],
@@ -905,6 +906,7 @@ Vistas.tiendas = async v => {
   const form = r => formulario(r ? 'Editar tienda' : 'Nueva tienda', [
     { k: 'nombre', t: 'Nombre del local', todo: 1 }, { k: 'direccion', t: 'Dirección', todo: 1 }, { k: 'comuna', t: 'Comuna' },
     { k: 'region', t: 'Región', tipo: 'select', vacio: 'Selecciona…', op: REGIONES.map(x => ({ id: x, nombre: x })) },
+    { k: 'recibe_pos', t: 'Recibe los despachos en el POS: la mercadería entra a su stock cuando la tienda la recibe (mientras tanto, la guía queda "en camino")', tipo: 'check', todo: 1 },
     ...(r ? [{ k: 'activo', t: 'Tienda activa', tipo: 'check', todo: 1 }] : [])], r, async d => {
       await api(r ? 'PUT' : 'POST', '/tiendas' + (r ? '/' + r.id : ''), d); aviso('Tienda guardada.'); render();
     });
@@ -913,6 +915,7 @@ Vistas.tiendas = async v => {
   const c = v.appendChild(Object.assign(document.createElement('div'), { className: 'tarjeta' }));
   tabla(c, { filas, csv: 'tiendas', vacio: 'Aún no hay tiendas.', acciones: { editar: form }, cols: [
     { t: 'Nombre del local', v: r => r.nombre }, { t: 'Dirección', v: r => r.direccion }, { t: 'Comuna', v: r => r.comuna }, { t: 'Región', v: r => r.region },
+    { t: 'Recepción', v: r => r.recibe_pos ? 'En el POS' : 'Al despachar' },
     { t: 'Estado', v: r => r.activo ? 'Activa' : 'Inactiva', h: r => r.activo ? etq('Activa', 'bien') : etq('Inactiva') },
     { t: '', h: () => can('tiendas', 2) ? `<div class="acciones">${accion('editar', 'Editar')}</div>` : '' }] });
 };
@@ -1548,7 +1551,9 @@ Vistas.despachos = async v => {
     anular: r => confirmar('Anular guía', `Se devolverá a la bodega central lo despachado en la guía ${String(r.id).padStart(6, '0')}. Requiere que la tienda aún tenga ese stock.`, async () => { await api('POST', `/despachos/${r.id}/anular`, {}); aviso('Guía anulada.'); render(); }, 'Anular guía') }, cols: [
     { t: 'Guía', v: r => String(r.id).padStart(6, '0') }, { t: 'Fecha', v: r => r.fecha, h: r => fFecha(r.fecha) }, { t: 'Tienda', v: r => r.tienda }, { t: 'Líneas', n: 1, v: r => r.lineas },
     { t: 'Neto', n: 1, v: r => r.neto, h: r => fPeso(r.neto) }, { t: 'Total', n: 1, v: r => r.total, h: r => fPeso(r.total) }, { t: 'Transportista', v: r => r.transportista },
-    { t: 'Estado', v: r => r.estado, h: r => r.estado === 'ANULADO' ? etq('Anulada', 'mal') : etq('Emitida', 'bien') },
+    { t: 'Estado', v: r => r.estado === 'ANULADO' ? 'Anulada' : r.recepcion === 'EN_CAMINO' ? 'En camino' : r.recepcion === 'RECIBIDA' ? 'Recibida' : 'Emitida',
+      h: r => r.estado === 'ANULADO' ? etq('Anulada', 'mal') : r.recepcion === 'EN_CAMINO' ? etq('En camino', 'alerta')
+        : r.recepcion === 'RECIBIDA' ? etq(r.faltantes ? 'Recibida con faltantes' : 'Recibida', r.faltantes ? 'alerta' : 'bien') : etq('Emitida', 'bien') },
     ...(S.usuario.tienda_id ? [] : [{ t: 'Fudo', v: r => r.fudo_estado, h: estadoFudo }, { t: 'Stock Fudo', v: r => r.fudo_stock_estado, h: estadoStockFudo }]),
     { t: '', h: r => `<div class="acciones">${accion('ver', 'Ver guía')}${crea ? accionStockFudo(r) : ''}${crea && puede('enviar_fudo') && r.estado === 'VIGENTE' && !r.fudo_estado ? accion('fudo', 'Enviar a Fudo') : ''}${crea && puede('enviar_fudo') && r.estado === 'VIGENTE' && ['ENVIANDO', 'REVISAR'].includes(r.fudo_estado) ? accion('fudorev', 'Revisar Fudo') : ''}${crea && puede('anular_fudo') && r.estado === 'ANULADO' && r.fudo_estado === 'ENVIADO' ? accion('fudoanula', 'Anular en Fudo', 'peligro') : ''}${r.estado === 'VIGENTE' && crea && puede('anular_despachos') ? accion('anular', 'Anular', 'peligro') : ''}</div>` }] });
   $('#n', v)?.addEventListener('click', async () => {
@@ -1568,7 +1573,9 @@ Vistas.despachos = async v => {
     const f = $('form', m.el);
     conEnvio(f, m, async () => {
       const r = await api('POST', '/despachos', { tienda_id: f.tienda_id.value, fecha: f.fecha.value, transportista: f.transportista.value, patente: f.patente.value, obs: f.obs.value, items: ed.leer() });
-      aviso('Guía emitida: stock de la tienda actualizado.'); render(); verGuia(r.id);
+      const t = S.cat.tiendas.find(x => String(x.id) === String(f.tienda_id.value));
+      aviso(t && t.recibe_pos ? 'Guía emitida: va en camino; entra al stock de la tienda cuando la reciban en el POS.' : 'Guía emitida: stock de la tienda actualizado.');
+      render(); verGuia(r.id);
     });
   });
 };
@@ -1578,7 +1585,10 @@ async function verGuia(id) {
   const m = modal(`Guía ${num}`, `<div class="guia-cab"><div class="guia-marca"><img src="${esc(logo())}" alt=""><div><strong>Nata &amp; Schlott</strong><span class="tenue">Sistema de producción y logística</span></div></div>
     <div class="guia-num"><span>Guía de despacho interna</span><strong>N° ${num}</strong>${g.estado === 'ANULADO' ? etq('ANULADA', 'mal') : ''}</div></div>
     <div class="guia-datos"><div><b>Fecha:</b> ${fFecha(g.fecha)}</div><div><b>Origen:</b> Bodega central</div><div><b>Destino:</b> ${esc(g.tienda)}</div><div><b>Dirección:</b> ${esc(g.direccion)}</div><div><b>Comuna:</b> ${esc(g.comuna)}</div><div><b>Región:</b> ${esc(g.region)}</div><div><b>Transportista:</b> ${esc(g.transportista) || '—'}</div><div><b>Patente:</b> ${esc(g.patente) || '—'}</div><div><b>Emitida por:</b> ${esc(g.usuario)}</div></div>
-    <div class="tabla-marco"><table><thead><tr><th>Código</th><th>Descripción</th><th class="n">Cantidad</th><th>Unidad</th><th class="n">Precio</th><th class="n">Subtotal</th></tr></thead><tbody>${[...new Set(g.items.map(grupoDespacho))].map(titulo => { const its = g.items.filter(i => grupoDespacho(i) === titulo); return `<tr><td colspan="6"><b>${esc(titulo)}</b></td></tr>` + its.map(i => `<tr><td>${esc(i.codigo)}</td><td>${esc(i.nombre)}</td><td class="n">${fCant(i.cantidad)}</td><td>${esc(i.unidad)}</td><td class="n">${fPrecio(i.precio)}</td><td class="n">${fPeso(i.cantidad * i.precio)}</td></tr>`).join(''); }).join('')}</tbody></table></div>
+    ${g.recepcion === 'EN_CAMINO' ? `<p>${etq('En camino', 'alerta')} Entra al stock de ${esc(g.tienda)} cuando la reciban en el POS.</p>` : ''}
+    ${g.recepcion === 'RECIBIDA' ? `<p>${etq('Recibida', 'bien')} en el POS el ${fFecha((g.recibido || '').slice(0, 10))} ${(g.recibido || '').slice(11, 16)}${g.recibido_por ? ' por ' + esc(g.recibido_por) : ''}.
+      ${g.items.some(i => i.recibido !== null && i.recibido < i.cantidad) ? 'Lo que no llegó volvió a la bodega central.' : ''}${g.obs_recepcion ? ` <b>Observación:</b> ${esc(g.obs_recepcion)}` : ''}</p>` : ''}
+    <div class="tabla-marco"><table><thead><tr><th>Código</th><th>Descripción</th><th class="n">Cantidad</th>${g.recepcion === 'RECIBIDA' ? '<th class="n">Recibido</th>' : ''}<th>Unidad</th><th class="n">Precio</th><th class="n">Subtotal</th></tr></thead><tbody>${[...new Set(g.items.map(grupoDespacho))].map(titulo => { const its = g.items.filter(i => grupoDespacho(i) === titulo); return `<tr><td colspan="${g.recepcion === 'RECIBIDA' ? 7 : 6}"><b>${esc(titulo)}</b></td></tr>` + its.map(i => `<tr><td>${esc(i.codigo)}</td><td>${esc(i.nombre)}</td><td class="n">${fCant(i.cantidad)}</td>${g.recepcion === 'RECIBIDA' ? `<td class="n">${i.recibido !== null && i.recibido < i.cantidad ? `<b class="neg">${fCant(i.recibido)}</b>` : fCant(i.recibido ?? i.cantidad)}</td>` : ''}<td>${esc(i.unidad)}</td><td class="n">${fPrecio(i.precio)}</td><td class="n">${fPeso(i.cantidad * i.precio)}</td></tr>`).join(''); }).join('')}</tbody></table></div>
     <div class="totales"><div><span>Neto</span><span>${fPeso(g.neto)}</span></div><div><span>IVA ${fNum(g.iva_pct, 0, 2)}%</span><span>${fPeso(g.iva)}</span></div><div class="total"><span>Total</span><span>${fPeso(g.total)}</span></div></div>
     ${g.obs ? `<p><b>Observación:</b> ${esc(g.obs)}</p>` : ''}<div class="firmas"><div>Entrega</div><div>Recibe conforme</div></div>
     <p class="legal">Documento de control interno. No reemplaza la guía de despacho electrónica exigida por el SII.</p>

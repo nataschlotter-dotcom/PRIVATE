@@ -472,11 +472,53 @@ def crear_despacho(db, uid, d):
                      (fecha, tienda_id, txt(d.get("transportista"), "El transportista", False, 100), txt(d.get("patente"), "La patente", False, 12).upper(),
                       txt(d.get("obs"), "La observación", False, 500), pct, neto, iva, round(neto + iva, 2), uid)).lastrowid
     ref = f"Guía {did:06d}"
+    # Una tienda que recibe en el POS: la central descuenta ahora y la guía queda "en camino";
+    # el stock entra a la tienda cuando la reciben en el POS (recibir_despacho). Si no, entra al despachar, como siempre.
+    en_pos = bool(tienda.get("recibe_pos"))
+    if en_pos:
+        db.execute("UPDATE despachos SET recepcion='EN_CAMINO' WHERE id=?", (did,))
     for a, c in detalle:
-        db.execute("INSERT INTO despacho_items VALUES(?,?,?,?)", (did, a["id"], c, a["precio"]))
+        db.execute("INSERT INTO despacho_items(despacho_id,articulo_id,cantidad,precio) VALUES(?,?,?,?)", (did, a["id"], c, a["precio"]))
         mover(db, a["id"], CENTRAL, -c, "DESPACHO", uid, fecha, "DESPACHO", did, ref, destino=tienda_id)
-        mover(db, a["id"], tienda_id, c, "RECEPCION_TIENDA", uid, fecha, "DESPACHO", did, ref, destino=tienda_id)
+        if not en_pos:
+            mover(db, a["id"], tienda_id, c, "RECEPCION_TIENDA", uid, fecha, "DESPACHO", did, ref, destino=tienda_id)
     return did
+
+
+def recibir_despacho(db, did, tienda_id, recibidos, responsable, obs, referencia):
+    """La tienda recibe en el POS una guía en camino: entra a su stock lo que llegó; lo que faltó vuelve a la central
+    (movimiento FALTANTE_DESPACHO) y queda anotado. Idempotente por referencia; todo o nada."""
+    g = row(db, "SELECT * FROM despachos WHERE id=? AND tienda_id=?", did, tienda_id)
+    if not g:
+        raise ApiError(404, "Guía no encontrada para esta tienda.")
+    if g["recepcion"] == "RECIBIDA":
+        if g["referencia_recepcion"] == referencia:
+            return
+        raise ApiError(409, "Esta guía ya fue recibida.")
+    if g["estado"] != "VIGENTE":
+        raise ApiError(409, "La guía está anulada: no se puede recibir.")
+    if g["recepcion"] != "EN_CAMINO":
+        raise ApiError(409, "Esta guía ya entró al stock de la tienda al despacharla.")
+    items = rows(db, "SELECT di.rowid rid, di.*, a.nombre FROM despacho_items di JOIN articulos a ON a.id=di.articulo_id WHERE di.despacho_id=?", did)
+    hoy = date.today().isoformat()
+    ref = f"Guía {did:06d}"
+    for i in items:
+        rec = recibidos.get(i["articulo_id"], i["cantidad"])
+        if rec < 0:
+            raise ApiError(400, "Lo recibido no puede ser negativo.")
+        if rec > i["cantidad"] + 1e-9:
+            raise ApiError(400, f"De {i['nombre']} se despacharon {i['cantidad']:g}: no se puede recibir más. Si llegó de más, avisa a la central.")
+    for i in items:
+        rec = round(recibidos.get(i["articulo_id"], i["cantidad"]), 5)
+        db.execute("UPDATE despacho_items SET recibido=? WHERE rowid=?", (rec, i["rid"]))
+        if rec > 0:
+            mover(db, i["articulo_id"], tienda_id, rec, "RECEPCION_TIENDA", None, hoy, "DESPACHO", did, ref, destino=tienda_id, obs="Recibido en el POS")
+        falta = round(i["cantidad"] - rec, 5)
+        if falta > 0:
+            mover(db, i["articulo_id"], CENTRAL, falta, "FALTANTE_DESPACHO", None, hoy, "DESPACHO", did, ref, destino=tienda_id,
+                  obs="No llegó a la tienda: vuelve a la central")
+    db.execute("UPDATE despachos SET recepcion='RECIBIDA', recibido=?, recibido_por=?, obs_recepcion=?, referencia_recepcion=? WHERE id=?",
+               (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), responsable, obs, referencia, did))
 
 
 def crear_merma(db, uid, d, bodega):
@@ -792,7 +834,8 @@ crud_simple("categorias", "articulos", [("nombre", nombre_campo), ("de_productos
 crud_simple("unidades", "articulos", [("nombre", nombre_campo), ("abreviatura", lambda v: txt(v, "La abreviatura", True, 12))])
 crud_simple("motivos_merma", "mermas", [("nombre", nombre_campo)])
 crud_simple("tiendas", "tiendas", [("nombre", nombre_campo), ("direccion", lambda v: txt(v, "La dirección", True, 200)),
-                                   ("comuna", lambda v: txt(v, "La comuna", True, 80)), ("region", lambda v: txt(v, "La región", True, 80))])
+                                   ("comuna", lambda v: txt(v, "La comuna", True, 80)), ("region", lambda v: txt(v, "La región", True, 80)),
+                                   ("recibe_pos", lambda v: 1 if v else 0)])  # recibe los despachos en el POS (entran al recibir)
 
 
 @ruta("PUT", "/api/config/iva", "proveedores", 2)
@@ -2138,6 +2181,7 @@ def despachos_lista(c):
     propia = c.user.get("tienda_id")
     return rows(c.db, f"""SELECT de.*, t.nombre tienda, u.nombre usuario,
         (SELECT COUNT(*) FROM despacho_items i WHERE i.despacho_id=de.id) lineas,
+        (SELECT COUNT(*) FROM despacho_items i WHERE i.despacho_id=de.id AND i.recibido IS NOT NULL AND i.recibido < i.cantidad) faltantes,
         (SELECT COUNT(*) FROM despacho_items i JOIN fudo_equivalencias e ON e.articulo_id=i.articulo_id AND e.tienda_id=de.tienda_id WHERE i.despacho_id=de.id) fudo_stock_lineas,
         COALESCE((SELECT estado FROM fudo_stock_envios f WHERE f.despacho_id=de.id),'') fudo_stock_estado,
         COALESCE((SELECT error FROM fudo_stock_envios f WHERE f.despacho_id=de.id),'') fudo_stock_error,
@@ -2355,6 +2399,45 @@ def pos_stock(c):
         FROM articulos a JOIN unidades u ON u.id=a.unidad_id LEFT JOIN categorias cat ON cat.id=a.categoria_id
         LEFT JOIN stock s ON s.articulo_id=a.id AND s.bodega_id=?
         WHERE a.activo=1 AND (a.tipo='PRODUCTO' OR a.desechable=1) ORDER BY a.nombre""", tid)
+
+
+@ruta("GET", "/api/pos/despachos", publica=True)
+def pos_despachos(c):
+    """Guías de la central a una tienda que recibe en el POS: las en camino y las recibidas de los últimos 60 días."""
+    pos_autorizar(c)
+    tid = pos_tienda(c.db, c.q.get("tienda_id"))
+    desde = (date.today() - timedelta(days=60)).isoformat()
+    guias = rows(c.db, """SELECT d.id, d.fecha, d.transportista, d.patente, d.obs, d.recepcion, d.recibido, d.recibido_por, d.obs_recepcion,
+        u.nombre usuario FROM despachos d LEFT JOIN usuarios u ON u.id=d.usuario_id
+        WHERE d.tienda_id=? AND d.estado='VIGENTE' AND (d.recepcion='EN_CAMINO' OR (d.recepcion='RECIBIDA' AND d.fecha>=?))
+        ORDER BY d.recepcion='EN_CAMINO' DESC, d.fecha DESC, d.id DESC LIMIT 100""", tid, desde)
+    for g in guias:
+        g["items"] = rows(c.db, """SELECT di.articulo_id, a.codigo, a.nombre, un.abreviatura unidad, COALESCE(ca.nombre,'') categoria,
+            di.cantidad, di.recibido FROM despacho_items di JOIN articulos a ON a.id=di.articulo_id JOIN unidades un ON un.id=a.unidad_id
+            LEFT JOIN categorias ca ON ca.id=a.categoria_id WHERE di.despacho_id=? ORDER BY ca.nombre, a.nombre""", g["id"])
+    recibe = scalar(c.db, "SELECT recibe_pos FROM tiendas WHERE id=?", tid)
+    return {"recibe_pos": bool(recibe), "guias": guias}
+
+
+@ruta("POST", "/api/pos/despachos/recibir", publica=True)
+def pos_despacho_recibir(c):
+    """Recepción en el POS de una guía en camino. Idempotente por referencia."""
+    pos_autorizar(c)
+    d = c.body
+    ref = pos_referencia(d.get("referencia"))
+    tid = pos_tienda(c.db, d.get("tienda_id"))
+    did = entero(d.get("despacho_id"), "la guía")
+    items = d.get("items")
+    if not isinstance(items, list):
+        raise ApiError(400, "Detalle inválido.")
+    recibidos = {}
+    for i in items:
+        if not isinstance(i, dict):
+            raise ApiError(400, "Detalle inválido.")
+        recibidos[entero(i.get("articulo_id"), "el artículo")] = num(i.get("recibido"), "Lo recibido")
+    recibir_despacho(c.db, did, tid, recibidos, txt(d.get("responsable"), "El responsable", False, 100),
+                     txt(d.get("obs"), "La observación", False, 300), ref)
+    return {"ok": True, "despacho_id": did}
 
 
 @ruta("GET", "/api/pos/movimientos", publica=True)
@@ -2947,6 +3030,15 @@ def sembrar(db):
     for col in ("fudo_estado", "fudo_gasto_id", "fudo_error", "fudo_pago"):  # bases creadas antes de la integración con Fudo (fudo_pago: id del pago, '' o REVISAR)
         if col not in columnas_despacho:
             db.execute(f"ALTER TABLE despachos ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+    # Recepción en el POS: recepcion = '' (entró al despachar, como siempre), 'EN_CAMINO' o 'RECIBIDA'
+    for col, tipo in (("recepcion", "TEXT NOT NULL DEFAULT ''"), ("recibido", "TEXT"), ("recibido_por", "TEXT NOT NULL DEFAULT ''"),
+                      ("obs_recepcion", "TEXT NOT NULL DEFAULT ''"), ("referencia_recepcion", "TEXT")):
+        if col not in columnas_despacho:
+            db.execute(f"ALTER TABLE despachos ADD COLUMN {col} {tipo}")
+    if "recibido" not in [col[1] for col in db.execute("PRAGMA table_info(despacho_items)")]:
+        db.execute("ALTER TABLE despacho_items ADD COLUMN recibido REAL")
+    if "recibe_pos" not in [col[1] for col in db.execute("PRAGMA table_info(tiendas)")]:  # la tienda recibe los despachos en el POS
+        db.execute("ALTER TABLE tiendas ADD COLUMN recibe_pos INTEGER NOT NULL DEFAULT 0")
     if "punto_venta" not in [col[1] for col in db.execute("PRAGMA table_info(categorias)")]:  # bases creadas antes de este grupo
         db.execute("ALTER TABLE categorias ADD COLUMN punto_venta INTEGER NOT NULL DEFAULT 0")
     db.execute("INSERT OR IGNORE INTO config VALUES('iva','19')")
