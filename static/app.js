@@ -1275,7 +1275,12 @@ Vistas.bodegas = async v => {
   tabla($('#tb', c), { filas, csv: 'bodega', vacio: 'Sin artículos.', cols: [
     { t: 'Código', v: r => r.codigo }, { t: 'Artículo', v: r => r.nombre }, { t: 'Clasificación', v: r => claseArticulo(r) }, { t: 'Categoría', v: r => r.categoria },
     { t: 'Stock', n: 1, v: r => r.cantidad, h: r => `${fCant(r.cantidad)} ${esc(r.unidad)}${r.cantidad <= 0 ? ' ' + etq('Sin stock', 'mal') : bodegaSel === 0 && r.cantidad < r.stock_minimo ? ' ' + etq('Bajo mínimo', 'mal') : ''}` },
-    { t: 'Precio', n: 1, v: r => r.precio, h: r => fPrecio(r.precio) }, { t: 'Valor a costo', n: 1, v: r => r.cantidad * r.costo, h: r => fPeso(r.cantidad * r.costo) }] });
+    { t: 'Precio', n: 1, v: r => r.precio, h: r => fPrecio(r.precio) },
+    // costo promedio (sin IVA) con que se valoriza el stock; se marca cuando está muy lejos del precio (costo inicial que nunca se recalculó)
+    { t: 'Costo unitario', n: 1, v: r => r.costo, h: r => !r.costo ? etq('Sin costo', 'alerta')
+      : `${fPrecio(r.costo)} <small class="tenue">/ ${esc(r.unidad)}</small>${r.precio && (r.costo < r.precio * 0.5 || r.costo > r.precio * 2) ? ' ' + `<span title="El costo está muy lejos del precio: probablemente es el costo inicial del artículo y no se ha recalculado con una compra o producción.">${etq('Revisar', 'alerta')}</span>` : ''}` },
+    { t: 'Valor a costo', n: 1, v: r => r.cantidad * r.costo, h: r => fPeso(r.cantidad * r.costo) }] });
+  $('#tb', c).insertAdjacentHTML('beforebegin', '<p class="nota">Valor a costo = Stock × Costo unitario. El costo unitario es el costo promedio sin IVA y se recalcula solo con cada compra o producción: editar el precio del artículo no lo cambia. <b>Revisar</b> marca los costos muy distintos del precio.</p>');
   $('#sal', c)?.addEventListener('click', () => formulario('Registrar venta o consumo', [
     { k: 'articulo_id', t: 'Artículo', tipo: 'select', vacio: 'Selecciona…', todo: 1, op: filas.filter(a => a.cantidad > 0).map(a => ({ id: a.articulo_id, nombre: `${a.codigo} · ${a.nombre} (${fCant(a.cantidad)} ${a.unidad})` })) },
     { k: 'cantidad', t: 'Cantidad', tipo: 'num' }, { k: 'motivo', t: 'Motivo', tipo: 'select', op: [{ id: 'VENTA', nombre: 'Venta' }, { id: 'CONSUMO_INTERNO', nombre: 'Consumo interno' }] },
