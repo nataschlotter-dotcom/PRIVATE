@@ -555,7 +555,9 @@ def crear_merma(db, uid, d, bodega):
     return mid
 
 
-def anular(db, uid, tabla, doc_tipo, doc_id):
+def anular(db, uid, tabla, doc_tipo, doc_id, negativo=False):
+    """negativo=True solo para lo que viene del POS (ventas y cambios ya ocurridos en la tienda): su anulación
+    se aplica aunque el stock de la tienda quede negativo, igual que la venta."""
     doc = row(db, f"SELECT * FROM {tabla} WHERE id=?", doc_id)
     if not doc:
         raise ApiError(404, "Documento no encontrado.")
@@ -564,7 +566,7 @@ def anular(db, uid, tabla, doc_tipo, doc_id):
     hoy = date.today().isoformat()
     for m in rows(db, "SELECT * FROM movimientos WHERE doc_tipo=? AND doc_id=? AND tipo<>'ANULACION'", doc_tipo, doc_id):
         mover(db, m["articulo_id"], m["bodega_id"], -m["cantidad"], "ANULACION", uid, hoy, doc_tipo, doc_id, "Anula " + m["referencia"],
-              proveedor=m["proveedor_id"], destino=m["tienda_destino_id"], motivo=m["motivo_id"], costo=m["costo_unit"])
+              proveedor=m["proveedor_id"], destino=m["tienda_destino_id"], motivo=m["motivo_id"], costo=m["costo_unit"], negativo=negativo)
     db.execute(f"UPDATE {tabla} SET estado='ANULADO' WHERE id=?", (doc_id,))
     if doc_tipo == "COMPRA":
         ids = [r["articulo_id"] for r in rows(db, "SELECT articulo_id FROM compra_items WHERE compra_id=?", doc_id)]
@@ -2436,6 +2438,37 @@ def pos_cambio(c):
     return {"ok": True, "id": cid}
 
 
+@ruta("POST", "/api/pos/ventas/borrar", publica=True)
+def pos_ventas_borrar(c):
+    """Mantención (lo pide el administrador del POS al borrar ventas): elimina los consumos y cambios del POS con esas
+    referencias y TODOS sus movimientos (ventas, entradas/salidas por cambio y sus anulaciones). El stock de cada tienda
+    se devuelve (como si esas ventas no hubieran existido) y se recalcula el saldo del historial de esos artículos.
+    Las referencias que no existen se ignoran (se puede repetir sin efecto)."""
+    pos_autorizar(c)
+    refs = c.body.get("referencias")
+    if not isinstance(refs, list) or len(refs) > 20000:
+        raise ApiError(400, "Las referencias no son válidas.")
+    refs = {pos_referencia(r) for r in refs}
+    docs = [r for r in (row(c.db, "SELECT id FROM pos_consumos WHERE referencia=?", ref) for ref in refs) if r]
+    tocados, movs = {}, 0
+    for d in docs:
+        for m in rows(c.db, "SELECT bodega_id, articulo_id, cantidad FROM movimientos WHERE doc_tipo='POS' AND doc_id=?", d["id"]):
+            k = (m["bodega_id"], m["articulo_id"])
+            tocados[k] = round(tocados.get(k, 0) + m["cantidad"], 5)
+            movs += 1
+        c.db.execute("DELETE FROM movimientos WHERE doc_tipo='POS' AND doc_id=?", (d["id"],))
+        c.db.execute("DELETE FROM pos_consumos WHERE id=?", (d["id"],))
+    for (bodega, aid), delta in tocados.items():
+        nuevo = round(stock_de(c.db, bodega, aid) - delta, 5)
+        c.db.execute("INSERT INTO stock(bodega_id,articulo_id,cantidad) VALUES(?,?,?) "
+                     "ON CONFLICT(bodega_id,articulo_id) DO UPDATE SET cantidad=excluded.cantidad", (bodega, aid, nuevo))
+        saldo = nuevo  # el historial que queda vuelve a cuadrar: saldo de cada movimiento, desde el último hacia atrás
+        for m in rows(c.db, "SELECT id, cantidad FROM movimientos WHERE bodega_id=? AND articulo_id=? ORDER BY id DESC", bodega, aid):
+            c.db.execute("UPDATE movimientos SET saldo=? WHERE id=?", (round(saldo, 5), m["id"]))
+            saldo -= m["cantidad"]
+    return {"ok": True, "documentos": len(docs), "movimientos": movs, "articulos": len(tocados)}
+
+
 @ruta("POST", "/api/pos/consumos/anular", publica=True)
 def pos_consumo_anular(c):
     pos_autorizar(c)
@@ -2444,7 +2477,8 @@ def pos_consumo_anular(c):
     if not cons:
         raise ApiError(404, "No existe un consumo del POS con esa referencia.")
     if cons["estado"] != "ANULADO":
-        anular(c.db, None, "pos_consumos", "POS", cons["id"])
+        # la venta (o el cambio) ya ocurrió en la tienda: se revierte aunque el stock quede negativo (ej. revertir una entrada por cambio)
+        anular(c.db, None, "pos_consumos", "POS", cons["id"], negativo=True)
         c.db.execute("UPDATE pos_consumos SET anulado=? WHERE id=?", (f"{datetime.now():%Y-%m-%d %H:%M:%S}", cons["id"]))
     return {"ok": True, "id": cons["id"]}
 

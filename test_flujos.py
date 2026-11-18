@@ -858,6 +858,31 @@ tipos_c = {(m["tipo"], m["articulo_id"]): m["cantidad"] for m in P("GET", f"/pos
 assert tipos_c == {("ENTRADA_CAMBIO", con_stock): 1, ("SALIDA_CAMBIO", otro): -2}, tipos_c
 P("POST", "/pos/consumos/anular", {"referencia": "POS-test-3-C1"}, token=clave)  # si se anula la venta, el cambio se revierte
 casi(stock(tienda)[con_stock], s_c[con_stock]); casi(stock(tienda).get(otro, 0), s_c.get(otro, 0))
+# Revertir un cambio aunque la tienda ya haya quedado en negativo (ej. vendió lo que entró por el cambio): no se bloquea
+P("POST", "/pos/cambios", {**cambio, "referencia": "POS-test-4-C1"}, token=clave)
+gasto = s_c[con_stock] + 1 + 5  # vende todo lo que hay y 5 más: queda en -5
+P("POST", "/pos/consumos", {**venta, "referencia": "POS-test-5", "items": [{"articulo_id": con_stock, "cantidad": gasto}]}, token=clave)
+casi(stock(tienda)[con_stock], -5)
+P("POST", "/pos/consumos/anular", {"referencia": "POS-test-4-C1"}, token=clave)  # quita la entrada del cambio: queda en -6
+casi(stock(tienda)[con_stock], -6)
+P("POST", "/pos/consumos/anular", {"referencia": "POS-test-5"}, token=clave)
+casi(stock(tienda)[con_stock], s_c[con_stock]); casi(stock(tienda).get(otro, 0), s_c.get(otro, 0))
+# Borrar ventas del POS (mantención): se eliminan sus movimientos y el stock vuelve a como estaba antes de esas ventas
+s_b = stock(tienda)
+P("POST", "/pos/consumos", {**venta, "referencia": "POS-del-1", "items": [{"articulo_id": con_stock, "cantidad": 2}]}, token=clave)
+P("POST", "/pos/cambios", {**cambio, "referencia": "POS-del-1-C1"}, token=clave)
+P("POST", "/pos/consumos/anular", {"referencia": "POS-del-1-C1"}, token=clave)
+P("POST", "/pos/cambios", {**cambio, "referencia": "POS-del-1-C2"}, token=clave)
+casi(stock(tienda)[con_stock], s_b[con_stock] - 2 + 1)
+r_b = P("POST", "/pos/ventas/borrar", {"referencias": ["POS-del-1", "POS-del-1-C1", "POS-del-1-C2", "POS-no-existe"]}, token=clave)
+assert r_b["documentos"] == 3 and r_b["movimientos"] == 1 + 4 + 2, r_b
+casi(stock(tienda)[con_stock], s_b[con_stock]); casi(stock(tienda).get(otro, 0), s_b.get(otro, 0))
+movs_b = P("GET", f"/pos/movimientos?tienda_id={tienda}&desde=2000-01-01&hasta=2100-01-01", token=clave)
+assert not [m for m in movs_b if "POS-del-1" in (m["referencia"] or "")]
+ult = next(m for m in movs_b if m["articulo_id"] == con_stock)  # el más reciente: su saldo cuadra con el stock
+casi(ult["saldo"], s_b[con_stock])
+assert P("POST", "/pos/ventas/borrar", {"referencias": ["POS-del-1"]}, token=clave)["documentos"] == 0  # repetir no hace nada
+P("POST", "/pos/ventas/borrar", {"referencias": ["POS-del-1"]}, token="mala", esperado=401)
 # Stock de tienda y toma de inventario desde el POS
 st_pos = {x["articulo_id"]: x for x in P("GET", f"/pos/stock?tienda_id={tienda}", token=clave)}
 assert set(st_pos) == set(arts_pos)  # todos los de tienda, con 0 si no hay fila
