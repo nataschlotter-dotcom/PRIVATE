@@ -11,6 +11,7 @@ const TIPOS_MOV = {
   DEVOLUCION_TIENDA: ['Devolución de tienda', 'alerta'], RECEPCION_CENTRAL: ['Recepción en central', 'bien'], CONSUMO_CENTRAL: ['Consumo interno central', ''],
   VENTA_FUDO: ['Ventas en Fudo', ''], TRANSFERENCIA_SALIDA: ['Transferencia enviada a otra tienda', ''], TRANSFERENCIA_ENTRADA: ['Transferencia recibida de otra tienda', 'bien'],
   FALTANTE_DESPACHO: ['Faltante de despacho (vuelve a la central)', 'alerta'],
+  ENTRADA_CAMBIO: ['Entrada por cambio de producto (POS)', 'bien'], SALIDA_CAMBIO: ['Salida por cambio de producto (POS)', ''],
 };
 const NAV = [
   ['', [['panel', 'Panel de inicio']]],
@@ -487,8 +488,8 @@ Vistas.panel = async v => {
   const d = await api('GET', '/reportes/panel'), k = d.kpis;
   const kpi = (t, val, sub = '', cl = '') => `<div class="kpi ${cl}"><span>${esc(t)}</span><strong>${val}</strong><small>${esc(sub)}</small></div>`;
   v.innerHTML = cabecera('Panel de inicio', `Últimos 30 días: ${fFecha(d.desde)} al ${fFecha(d.hasta)}`) + `<div class="kpis">
-    ${kpi('Inventario en bodega central', fPeso(k.valor_central), 'valorizado a costo')}
-    ${kpi('Inventario en tiendas', fPeso(k.valor_tiendas), 'valorizado a costo')}
+    ${kpi('Inventario en bodega central', fPeso(k.valor_central), 'al último precio de compra')}
+    ${kpi('Inventario en tiendas', fPeso(k.valor_tiendas), 'al último precio de compra')}
     ${kpi('Compras netas', fPeso(k.compras), 'sin IVA')}
     ${kpi('Costo de producción', fPeso(k.produccion_costo), `${fNum(k.lotes)} lotes`)}
     ${kpi('Despachado a tiendas', fPeso(k.despachos), `${fNum(k.guias)} guías`)}
@@ -1276,11 +1277,10 @@ Vistas.bodegas = async v => {
     { t: 'Código', v: r => r.codigo }, { t: 'Artículo', v: r => r.nombre }, { t: 'Clasificación', v: r => claseArticulo(r) }, { t: 'Categoría', v: r => r.categoria },
     { t: 'Stock', n: 1, v: r => r.cantidad, h: r => `${fCant(r.cantidad)} ${esc(r.unidad)}${r.cantidad <= 0 ? ' ' + etq('Sin stock', 'mal') : bodegaSel === 0 && r.cantidad < r.stock_minimo ? ' ' + etq('Bajo mínimo', 'mal') : ''}` },
     { t: 'Precio', n: 1, v: r => r.precio, h: r => fPrecio(r.precio) },
-    // costo promedio (sin IVA) con que se valoriza el stock; se marca cuando está muy lejos del precio (costo inicial que nunca se recalculó)
-    { t: 'Costo unitario', n: 1, v: r => r.costo, h: r => !r.costo ? etq('Sin costo', 'alerta')
-      : `${fPrecio(r.costo)} <small class="tenue">/ ${esc(r.unidad)}</small>${r.precio && (r.costo < r.precio * 0.5 || r.costo > r.precio * 2) ? ' ' + `<span title="El costo está muy lejos del precio: probablemente es el costo inicial del artículo y no se ha recalculado con una compra o producción.">${etq('Revisar', 'alerta')}</span>` : ''}` },
+    // costo unitario vigente (sin IVA): insumos al último precio de compra; productos y subproductos según su receta a esos precios
+    { t: 'Costo unitario', n: 1, v: r => r.costo, h: r => !r.costo ? etq('Sin costo', 'alerta') : `${fPrecio(r.costo)} <small class="tenue">/ ${esc(r.unidad)}</small>` },
     { t: 'Valor a costo', n: 1, v: r => r.cantidad * r.costo, h: r => fPeso(r.cantidad * r.costo) }] });
-  $('#tb', c).insertAdjacentHTML('beforebegin', '<p class="nota">Valor a costo = Stock × Costo unitario. El costo unitario es el costo promedio sin IVA y se recalcula solo con cada compra o producción: editar el precio del artículo no lo cambia. <b>Revisar</b> marca los costos muy distintos del precio.</p>');
+  $('#tb', c).insertAdjacentHTML('beforebegin', '<p class="nota">Valor a costo = Stock × Costo unitario (sin IVA). Insumos: al <b>último precio de compra</b> a proveedores. Productos y subproductos: el costo de su receta con los ingredientes a su último precio de compra (sin receta: su costo de producción). <b>Sin costo</b> = el artículo nunca tuvo precio.</p>');
   $('#sal', c)?.addEventListener('click', () => formulario('Registrar venta o consumo', [
     { k: 'articulo_id', t: 'Artículo', tipo: 'select', vacio: 'Selecciona…', todo: 1, op: filas.filter(a => a.cantidad > 0).map(a => ({ id: a.articulo_id, nombre: `${a.codigo} · ${a.nombre} (${fCant(a.cantidad)} ${a.unidad})` })) },
     { k: 'cantidad', t: 'Cantidad', tipo: 'num' }, { k: 'motivo', t: 'Motivo', tipo: 'select', op: [{ id: 'VENTA', nombre: 'Venta' }, { id: 'CONSUMO_INTERNO', nombre: 'Consumo interno' }] },
@@ -1723,7 +1723,7 @@ const REP = {
     const valTiendas = d.filas.reduce((s, r) => s + tiendas.reduce((t, b) => t + valorFila(r, b), 0), 0);
     kpis([['Artículos', fNum(d.filas.length), 'activos del tipo elegido'], ['Con stock en tiendas', fNum(d.filas.filter(r => tiendas.some(b => cant(r, b))).length)],
       ['Valor en tiendas', fPeso(valTiendas), 'a costo'], ['Valor en bodega central', fPeso(d.filas.reduce((s, r) => s + valorFila(r, { id: 0 }), 0)), 'a costo']]);
-    const c = tarjeta(`<h2>Stock por tienda</h2><p class="nota">Stock actual del sistema por bodega. Las filas se agrupan por categoría.${enValor ? ' Valor = cantidad × costo actual del artículo.' : ''}</p>
+    const c = tarjeta(`<h2>Stock por tienda</h2><p class="nota">Stock actual del sistema por bodega. Las filas se agrupan por categoría.${enValor ? ' Valor = cantidad × costo unitario (insumos al último precio de compra; productos según su receta a esos precios).' : ''}</p>
       <div class="filtros"><label>Tipo<select id="st-tipo">${[['', 'Todos'], ['PRODUCTO', 'Productos'], ['SUBPRODUCTO', 'Subproductos'], ['INSUMO', 'Insumos']].map(([k, t]) => `<option value="${k}" ${k === stockRep.tipo ? 'selected' : ''}>${t}</option>`).join('')}</select></label>
       <label>Mostrar<select id="st-ver"><option value="cantidad">Cantidades</option><option value="valor" ${enValor ? 'selected' : ''}>Valor a costo</option></select></label>
       <label class="check"><input type="checkbox" id="st-central" ${stockRep.central ? 'checked' : ''}> Incluir bodega central</label>

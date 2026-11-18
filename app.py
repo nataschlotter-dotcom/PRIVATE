@@ -291,7 +291,26 @@ def articulo(db, art_id):
 
 
 def costo_de(a):
+    """Costo promedio ponderado guardado en el artículo (o su precio si no tiene). Solo se usa para mantener ese promedio:
+    para valorizar se usa costo_teorico (último precio de compra / receta a últimos precios)."""
     return a["costo"] or a["precio"] or 0
+
+
+def valor_por_bodega(db):
+    """{bodega_id: valor del stock} con el costo vigente (último precio de compra / receta a últimos precios)."""
+    memo, out = {}, {}
+    for s in rows(db, "SELECT bodega_id, articulo_id, cantidad FROM stock WHERE cantidad<>0"):
+        out[s["bodega_id"]] = out.get(s["bodega_id"], 0) + s["cantidad"] * costo_teorico(db, s["articulo_id"], memo)
+    return {k: round(v, 2) for k, v in out.items()}
+
+
+def valorizar(db, filas, clave="articulo_id"):
+    """Pone en cada fila el costo unitario vigente del artículo (campo "costo"): los insumos al último precio de compra;
+    productos y subproductos según su receta valorizada a los últimos precios de compra."""
+    memo = {}
+    for f in filas:
+        f["costo"] = costo_teorico(db, f[clave], memo)
+    return filas
 
 
 def mover(db, art_id, bodega, delta, tipo, uid, fecha, doc_tipo=None, doc_id=None, ref="", proveedor=None, destino=None,
@@ -308,7 +327,7 @@ def mover(db, art_id, bodega, delta, tipo, uid, fecha, doc_tipo=None, doc_id=Non
     db.execute("INSERT INTO movimientos(fecha,articulo_id,bodega_id,tipo,cantidad,saldo,costo_unit,proveedor_id,tienda_destino_id,"
                "motivo_id,doc_tipo,doc_id,referencia,obs,usuario_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                (f"{fecha} {datetime.now():%H:%M:%S}", art_id, bodega, tipo, round(delta, 5), nuevo,
-                costo if costo is not None else costo_de(a), proveedor, destino, motivo, doc_tipo, doc_id, ref, obs, uid))
+                costo if costo is not None else costo_teorico(db, art_id), proveedor, destino, motivo, doc_tipo, doc_id, ref, obs, uid))
 
 
 def actualizar_cpp(db, art_id, cantidad, costo_unit):
@@ -441,7 +460,8 @@ def crear_produccion(db, uid, d):
             faltantes.append(f"{i['nombre']}: faltan {round(req - hay, 5):g} {i['unidad']}")
     if faltantes:
         raise ApiError(409, "No hay stock suficiente para producir. " + "; ".join(faltantes) + ".")
-    total = round(sum(i["cantidad"] * factor * (i["costo"] or i["precio"] or 0) for i in r["items"]), 2)
+    memo = {}  # ingredientes al último precio de compra (subproductos: su receta a últimos precios)
+    total = round(sum(i["cantidad"] * factor * costo_teorico(db, i["articulo_id"], memo) for i in r["items"]), 2)
     pid = db.execute("INSERT INTO producciones(fecha,articulo_id,cantidad,costo_total,obs,usuario_id) VALUES(?,?,?,?,?,?)",
                      (fecha, art_id, cantidad, total, txt(d.get("obs"), "La observación", False, 500), uid)).lastrowid
     ref = f"Producción #{pid}"
@@ -530,7 +550,7 @@ def crear_merma(db, uid, d, bodega):
         raise ApiError(400, "Motivo de merma no válido.")
     obs = txt(d.get("obs"), "La observación", False, 500)
     mid = db.execute("INSERT INTO mermas(fecha,articulo_id,bodega_id,cantidad,costo_unit,motivo_id,obs,usuario_id) VALUES(?,?,?,?,?,?,?,?)",
-                     (fecha, a["id"], bodega, cantidad, costo_de(a), motivo, obs, uid)).lastrowid
+                     (fecha, a["id"], bodega, cantidad, costo_teorico(db, a["id"]), motivo, obs, uid)).lastrowid
     mover(db, a["id"], bodega, -cantidad, "MERMA", uid, fecha, "MERMA", mid, f"Merma #{mid}", motivo=motivo, obs=obs)
     return mid
 
@@ -557,11 +577,11 @@ def anular(db, uid, tabla, doc_tipo, doc_id):
 
 def articulos_de_bodega(db, bodega, seccion=""):
     filtro = f"AND {SECCIONES[seccion]}" if seccion else "" if bodega == CENTRAL else "AND (a.tipo='PRODUCTO' OR a.desechable=1)"
-    return rows(db, f"""SELECT a.id articulo_id, a.codigo, a.nombre, a.tipo, a.desechable, a.stock_minimo, a.precio, a.costo,
+    return valorizar(db, rows(db, f"""SELECT a.id articulo_id, a.codigo, a.nombre, a.tipo, a.desechable, a.stock_minimo, a.precio, a.costo,
         c.punto_venta, c.id categoria_id, c.nombre categoria, u.abreviatura unidad, COALESCE(s.cantidad,0) cantidad
         FROM articulos a JOIN categorias c ON c.id=a.categoria_id JOIN unidades u ON u.id=a.unidad_id
         LEFT JOIN stock s ON s.articulo_id=a.id AND s.bodega_id=?
-        WHERE a.activo=1 {filtro} ORDER BY a.tipo, a.nombre""", bodega)
+        WHERE a.activo=1 {filtro} ORDER BY a.tipo, a.nombre""", bodega))
 
 
 # ---------------------------------------------------------------- enrutador
@@ -1266,7 +1286,7 @@ def salidas_internas_crear(c):
         a = articulo(c.db, i["articulo_id"])
         if not a["desechable"] or scalar(c.db, "SELECT punto_venta FROM categorias WHERE id=?", a["categoria_id"]):
             raise ApiError(400, f"{a['nombre']} no corresponde: aquí solo se registran desechables y aseo.")
-        c.db.execute("INSERT INTO salida_interna_items VALUES(?,?,?,?)", (sid, a["id"], i["cantidad"], costo_de(a)))
+        c.db.execute("INSERT INTO salida_interna_items VALUES(?,?,?,?)", (sid, a["id"], i["cantidad"], costo_teorico(c.db, a["id"])))
         if tienda:
             mover(c.db, a["id"], tienda, -i["cantidad"], "DEVOLUCION_TIENDA", c.uid, fecha, "SALIDA_INTERNA", sid, ref, obs=motivo)
             mover(c.db, a["id"], CENTRAL, i["cantidad"], "RECEPCION_CENTRAL", c.uid, fecha, "SALIDA_INTERNA", sid, ref, obs=motivo)
@@ -2226,9 +2246,12 @@ def despachos_anular(c, i):
 def bodegas_resumen(c):
     propia = c.user.get("tienda_id")
     out = rows(c.db, f"""SELECT t.id, t.nombre, t.comuna,
-        COALESCE(SUM(CASE WHEN s.cantidad>0 THEN 1 ELSE 0 END),0) articulos, COALESCE(SUM(s.cantidad*a.costo),0) valor
-        FROM tiendas t LEFT JOIN stock s ON s.bodega_id=t.id LEFT JOIN articulos a ON a.id=s.articulo_id
+        COALESCE(SUM(CASE WHEN s.cantidad>0 THEN 1 ELSE 0 END),0) articulos
+        FROM tiendas t LEFT JOIN stock s ON s.bodega_id=t.id
         WHERE t.activo=1 {'AND t.id=' + str(int(propia)) if propia else ''} GROUP BY t.id ORDER BY t.nombre""")
+    valores = valor_por_bodega(c.db)
+    for t in out:
+        t["valor"] = valores.get(t["id"], 0)
     return out
 
 
@@ -2328,11 +2351,11 @@ def pos_tiendas(c):
 @ruta("GET", "/api/pos/articulos", publica=True)
 def pos_articulos(c):
     """Lo que se maneja con stock en tienda: productos e insumos de punto de venta / desechables.
-    Incluye el costo unitario (el mismo con que se valoriza el consumo: costo promedio, o el precio si no tiene) para los informes del POS."""
+    Incluye el costo unitario vigente (insumos al último precio de compra; productos según su receta a últimos precios),
+    el mismo con que se valoriza el consumo, para el CMV de los informes del POS."""
     pos_autorizar(c)
-    return rows(c.db, """SELECT a.id, a.codigo, a.nombre, a.tipo, u.abreviatura unidad,
-        CASE WHEN a.costo>0 THEN a.costo ELSE a.precio END costo FROM articulos a JOIN unidades u ON u.id=a.unidad_id
-        WHERE a.activo=1 AND (a.tipo='PRODUCTO' OR a.desechable=1) ORDER BY a.nombre""")
+    return valorizar(c.db, rows(c.db, """SELECT a.id, a.codigo, a.nombre, a.tipo, u.abreviatura unidad FROM articulos a JOIN unidades u ON u.id=a.unidad_id
+        WHERE a.activo=1 AND (a.tipo='PRODUCTO' OR a.desechable=1) ORDER BY a.nombre"""), clave="id")
 
 
 @ruta("POST", "/api/pos/consumos", publica=True)
@@ -2367,6 +2390,49 @@ def pos_consumo(c):
     for aid, cant in cantidades.items():
         # La venta ya se cobró en el POS: se descuenta aunque falte stock (queda negativo hasta reponer o hacer inventario)
         mover(c.db, aid, tid, -cant, "VENTA", None, fecha, "POS", cid, f"POS {ref}", obs=detalle, negativo=True)
+    return {"ok": True, "id": cid}
+
+
+@ruta("POST", "/api/pos/cambios", publica=True)
+def pos_cambio(c):
+    """Cambio de producto hecho en el POS después de pagar: lo devuelto vuelve a la tienda (ENTRADA_CAMBIO) y lo nuevo
+    sale (SALIDA_CAMBIO). La venta original no se toca. Idempotente por referencia; todo o nada.
+    Se guarda como un consumo del POS, así que /api/pos/consumos/anular también lo revierte (si se anula la venta)."""
+    pos_autorizar(c)
+    d = c.body
+    ref = pos_referencia(d.get("referencia"))
+    previo = row(c.db, "SELECT id, estado FROM pos_consumos WHERE referencia=?", ref)
+    if previo:
+        return {"ok": True, "id": previo["id"], "estado": previo["estado"], "repetido": True}
+    tid = entero(d.get("tienda_id"), "la tienda")
+    if not row(c.db, "SELECT id FROM tiendas WHERE id=?", tid):
+        raise ApiError(404, "Tienda no encontrada.")
+    fecha = fecha_valida(d.get("fecha"))
+    detalle = txt(d.get("detalle"), "El detalle", False, 200)
+
+    def leer(clave):
+        out = {}
+        lista = d.get(clave) or []
+        if not isinstance(lista, list):
+            raise ApiError(400, "Detalle inválido.")
+        for i in lista:
+            if not isinstance(i, dict):
+                raise ApiError(400, "Detalle inválido.")
+            aid = entero(i.get("articulo_id"), "el artículo en cada línea")
+            out[aid] = round(out.get(aid, 0) + num(i.get("cantidad"), "La cantidad", 0, True), 5)
+        return out
+    entradas, salidas = leer("entradas"), leer("salidas")
+    if not entradas and not salidas:
+        raise ApiError(400, "El cambio no trae artículos.")
+    for aid in set(entradas) | set(salidas):
+        if not row(c.db, "SELECT id FROM articulos WHERE id=? AND activo=1", aid):
+            raise ApiError(404, f"Artículo {aid} no encontrado o inactivo.")
+    cid = c.db.execute("INSERT INTO pos_consumos(referencia,tienda_id,fecha,detalle,creado) VALUES(?,?,?,?,?)",
+                       (ref, tid, fecha, detalle, f"{datetime.now():%Y-%m-%d %H:%M:%S}")).lastrowid
+    for aid, cant in entradas.items():  # lo que el cliente devolvió vuelve al stock de la tienda
+        mover(c.db, aid, tid, cant, "ENTRADA_CAMBIO", None, fecha, "POS", cid, f"POS {ref}", obs=detalle)
+    for aid, cant in salidas.items():  # lo que se le entregó a cambio sale (como una venta: puede quedar negativo)
+        mover(c.db, aid, tid, -cant, "SALIDA_CAMBIO", None, fecha, "POS", cid, f"POS {ref}", obs=detalle, negativo=True)
     return {"ok": True, "id": cid}
 
 
@@ -2713,6 +2779,7 @@ def inventarios_detalle(c, i):
         ca.id categoria_id, ca.nombre categoria, ca.punto_venta
         FROM inventario_items x JOIN articulos a ON a.id=x.articulo_id JOIN unidades u ON u.id=a.unidad_id JOIN categorias ca ON ca.id=a.categoria_id
         LEFT JOIN stock s ON s.articulo_id=a.id AND s.bodega_id=? WHERE x.inventario_id=? ORDER BY ca.nombre COLLATE NOCASE, a.nombre COLLATE NOCASE""", inv["bodega_id"], int(i))
+    valorizar(c.db, inv["items"])  # diferencias valorizadas al último precio de compra
     return inv
 
 
@@ -2878,12 +2945,13 @@ def reporte_panel(c):
     desp = row(db, "SELECT COALESCE(SUM(neto),0) valor, COUNT(*) guias FROM despachos WHERE estado='VIGENTE' AND fecha BETWEEN ? AND ?", desde, hasta)
     merma = scalar(db, "SELECT SUM(cantidad*costo_unit) FROM mermas WHERE estado='VIGENTE' AND fecha BETWEEN ? AND ?", desde, hasta)
     alertas = alertas_stock(db)
+    valores = valor_por_bodega(db)  # inventario valorizado al último precio de compra
     alzas = sorted((v for v in variacion_precios(db, desde, hasta) if v["variacion"] > 0), key=lambda v: -v["variacion"])[:5]
     return {
         "desde": desde, "hasta": hasta,
         "kpis": {
-            "valor_central": scalar(db, "SELECT SUM(s.cantidad*a.costo) FROM stock s JOIN articulos a ON a.id=s.articulo_id WHERE s.bodega_id=0"),
-            "valor_tiendas": scalar(db, "SELECT SUM(s.cantidad*a.costo) FROM stock s JOIN articulos a ON a.id=s.articulo_id WHERE s.bodega_id<>0"),
+            "valor_central": valores.get(CENTRAL, 0),
+            "valor_tiendas": round(sum(v for b, v in valores.items() if b != CENTRAL), 2),
             "compras": compras, "produccion_costo": prod["costo"], "lotes": prod["lotes"],
             "despachos": desp["valor"], "guias": desp["guias"], "mermas": merma, "merma_pct": (merma / compras * 100) if compras else 0,
             "alertas": len(alertas),
@@ -2986,6 +3054,7 @@ def reporte_stock_tiendas(c):
     stock = {}
     for s in rows(db, "SELECT articulo_id, bodega_id, cantidad FROM stock WHERE cantidad<>0"):
         stock.setdefault(s["articulo_id"], {})[str(s["bodega_id"])] = s["cantidad"]
+    valorizar(db, filas, clave="id")  # "Valor a costo": al último precio de compra
     for f in filas:
         f["stock"] = stock.get(f["id"], {})
     return {"bodegas": bodegas, "filas": filas}
@@ -3001,6 +3070,7 @@ def reporte_cobertura(c):
         COALESCE((SELECT -SUM(m.cantidad) FROM movimientos m WHERE m.articulo_id=a.id AND m.bodega_id=0 AND m.cantidad<0
           AND m.tipo IN ('CONSUMO_PRODUCCION','DESPACHO','MERMA','CONSUMO_CENTRAL') AND substr(m.fecha,1,10) BETWEEN ? AND ?),0) salidas
         FROM articulos a JOIN unidades u ON u.id=a.unidad_id LEFT JOIN stock s ON s.articulo_id=a.id AND s.bodega_id=0 WHERE a.activo=1 ORDER BY a.nombre""", d, h)
+    valorizar(c.db, out, clave="id")  # la reposición sugerida se valoriza al último precio de compra
     for r in out:
         r["consumo_diario"] = r["salidas"] / dias
         r["dias"] = (r["stock"] / r["consumo_diario"]) if r["consumo_diario"] else None

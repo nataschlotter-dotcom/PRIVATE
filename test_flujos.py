@@ -164,6 +164,9 @@ casi(d["neto"], 15000); casi(d["iva"], 2850); casi(d["total"], 17850)
 A("POST", "/compras", {"tipo_documento": "FACTURA", "proveedor_id": prov, "fecha": "2026-01-20", "items": [{"articulo_id": harina, "cantidad": 10, "precio": 1200}]})
 a = next(x for x in A("GET", "/articulos") if x["id"] == harina)
 casi(a["precio"], 1200); casi(a["costo"], 1100); casi(a["stock"], 20); casi(a["stock_minimo"], 1234.56789)
+# el inventario se valoriza al último precio de compra (1.200), no al costo promedio (1.100)
+casi(next(x for x in A("GET", "/bodegas/stock?bodega=0") if x["articulo_id"] == harina)["costo"], 1200)
+casi(A("GET", "/reportes/panel")["kpis"]["valor_central"], sum(x["cantidad"] * x["costo"] for x in A("GET", "/bodegas/stock?bodega=0")))
 A("POST", "/compras", {"tipo_documento": "FACTURA", "proveedor_id": prov, "items": [{"articulo_id": torta, "cantidad": 1, "precio": 1}]}, 400)  # solo insumos
 A("POST", "/compras", {"tipo_documento": "FACTURA", "proveedor_id": prov, "items": [{"articulo_id": harina, "cantidad": -1, "precio": 1}]}, 400)
 A("POST", "/compras", {"tipo_documento": "FACTURA", "proveedor_id": prov, "items": []}, 400)
@@ -183,6 +186,7 @@ A("POST", "/produccion", {"articulo_id": torta, "cantidad": 2}, 409)
 assert base not in stock() or stock()[base] == 0
 p1 = A("POST", "/produccion", {"articulo_id": base, "cantidad": 4})["id"]
 s = stock(); casi(s[harina], 18); casi(s[base], 4)
+c_p = app.conectar(); casi(c_p.execute("SELECT costo_total FROM producciones WHERE id=?", (p1,)).fetchone()[0], 2 * 1200); c_p.close()  # al último precio
 A("POST", "/produccion", {"articulo_id": torta, "cantidad": 2})
 s = stock(); casi(s[base], 3); casi(s[torta], 2)
 costo_receta = lambda: next(r for r in A("GET", "/recetas") if r["articulo_id"] == torta)["costo_unit"]
@@ -841,6 +845,19 @@ casi(stock(tienda)[con_stock], st[con_stock])
 P("POST", "/pos/consumos/anular", {"referencia": "POS-test-1"}, token=clave)  # ya anulado: 200 sin devolver dos veces
 casi(stock(tienda)[con_stock], st[con_stock])
 assert A("GET", "/config/pos")["consumos"] == 2  # POS-test-1 y POS-test-2 (con stock negativo)
+# Cambio de producto en el POS: lo devuelto entra (ENTRADA_CAMBIO) y lo nuevo sale (SALIDA_CAMBIO); se revierte como un consumo
+s_c = stock(tienda)
+cambio = {"referencia": "POS-test-3-C1", "tienda_id": tienda, "fecha": "2026-11-04", "detalle": "Cambio en venta POS N° 3",
+          "entradas": [{"articulo_id": con_stock, "cantidad": 1}], "salidas": [{"articulo_id": otro, "cantidad": 2}]}
+P("POST", "/pos/cambios", {**cambio, "entradas": [], "salidas": []}, token=clave, esperado=400)
+P("POST", "/pos/cambios", cambio, token=clave)
+P("POST", "/pos/cambios", cambio, token=clave)  # repetido: no mueve dos veces
+casi(stock(tienda)[con_stock], s_c[con_stock] + 1); casi(stock(tienda).get(otro, 0), s_c.get(otro, 0) - 2)
+tipos_c = {(m["tipo"], m["articulo_id"]): m["cantidad"] for m in P("GET", f"/pos/movimientos?tienda_id={tienda}&desde=2026-01-01&hasta=2100-01-01", token=clave)
+           if m["referencia"] == "POS POS-test-3-C1"}
+assert tipos_c == {("ENTRADA_CAMBIO", con_stock): 1, ("SALIDA_CAMBIO", otro): -2}, tipos_c
+P("POST", "/pos/consumos/anular", {"referencia": "POS-test-3-C1"}, token=clave)  # si se anula la venta, el cambio se revierte
+casi(stock(tienda)[con_stock], s_c[con_stock]); casi(stock(tienda).get(otro, 0), s_c.get(otro, 0))
 # Stock de tienda y toma de inventario desde el POS
 st_pos = {x["articulo_id"]: x for x in P("GET", f"/pos/stock?tienda_id={tienda}", token=clave)}
 assert set(st_pos) == set(arts_pos)  # todos los de tienda, con 0 si no hay fila
