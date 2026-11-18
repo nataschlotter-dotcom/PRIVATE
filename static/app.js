@@ -65,10 +65,18 @@ document.addEventListener('focusout', e => {
 });
 const inputNum = (cls, v, dec = 5, min = 0) => `<input class="num ${cls}" inputmode="decimal" autocomplete="off" data-dec="${dec}" data-min="${min}" value="${v === null || v === undefined || v === '' ? '' : fNum(v, min, dec)}">`;
 
+/* Zona horaria del dispositivo: las fechas y horas se registran según ella (nombre y, de respaldo, diferencia con UTC en minutos) */
+function zonaHoraria() {
+  const z = {};
+  try { const n = Intl.DateTimeFormat().resolvedOptions().timeZone; if (n) z['X-Zona-Horaria'] = n; } catch (e) { /* navegador antiguo */ }
+  z['X-Zona-Offset'] = String(new Date().getTimezoneOffset());
+  return z;
+}
+
 async function api(metodo, ruta, cuerpo) {
   const r = await fetch('/api' + ruta, {
     method: metodo, credentials: 'same-origin',
-    headers: cuerpo !== undefined ? { 'Content-Type': 'application/json' } : {},
+    headers: { ...zonaHoraria(), ...(cuerpo !== undefined ? { 'Content-Type': 'application/json' } : {}) },
     body: cuerpo !== undefined ? JSON.stringify(cuerpo) : undefined,
   });
   const d = await r.json().catch(() => ({}));
