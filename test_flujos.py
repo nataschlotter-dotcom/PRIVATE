@@ -867,6 +867,21 @@ P("POST", "/pos/consumos/anular", {"referencia": "POS-test-4-C1"}, token=clave) 
 casi(stock(tienda)[con_stock], -6)
 P("POST", "/pos/consumos/anular", {"referencia": "POS-test-5"}, token=clave)
 casi(stock(tienda)[con_stock], s_c[con_stock]); casi(stock(tienda).get(otro, 0), s_c.get(otro, 0))
+# Fecha y hora de la tienda: los movimientos quedan con la hora en que ocurrió la venta / el cambio / la anulación
+# (fecha_hora del POS), no con la hora en que llegó al sistema (ej. una venta hecha sin internet que se envía después)
+assert app.fecha_hora_valida("2026-11-03T21:15") == "2026-11-03 21:15:00" and app.fecha_hora_valida("mañana") is None
+P("POST", "/pos/consumos", {**venta, "referencia": "POS-hora-1", "fecha": "2026-11-04", "fecha_hora": "2026-11-03 21:15:07",
+                            "items": [{"articulo_id": con_stock, "cantidad": 1}]}, token=clave)
+P("POST", "/pos/cambios", {**cambio, "referencia": "POS-hora-1-C1", "fecha_hora": "2026-11-03 21:40:00"}, token=clave)
+P("POST", "/pos/consumos/anular", {"referencia": "POS-hora-1-C1", "fecha_hora": "2026-11-03 22:05:30"}, token=clave)
+P("POST", "/pos/consumos/anular", {"referencia": "POS-hora-1", "fecha_hora": "2026-11-03 22:06:00"}, token=clave)
+horas = {(m["referencia"], m["tipo"]): m["fecha"] for m in P("GET", f"/pos/movimientos?tienda_id={tienda}&desde=2026-11-03&hasta=2026-11-03", token=clave)}
+assert horas[("POS POS-hora-1", "VENTA")] == "2026-11-03 21:15:07", horas
+assert horas[("POS POS-hora-1-C1", "ENTRADA_CAMBIO")] == "2026-11-03 21:40:00", horas
+assert horas[("Anula POS POS-hora-1-C1", "ANULACION")] == "2026-11-03 22:05:30", horas
+assert horas[("Anula POS POS-hora-1", "ANULACION")] == "2026-11-03 22:06:00", horas
+casi(stock(tienda)[con_stock], s_c[con_stock])
+
 # Borrar ventas del POS (mantención): se eliminan sus movimientos y el stock vuelve a como estaba antes de esas ventas
 s_b = stock(tienda)
 P("POST", "/pos/consumos", {**venta, "referencia": "POS-del-1", "items": [{"articulo_id": con_stock, "cantidad": 2}]}, token=clave)
@@ -954,6 +969,10 @@ casi(stock(tienda)[con_stock], base1 - 0.25)
 P("POST", "/pos/transferencias", {**trf, "referencia": "POSTRF-test-1-E", "tipo": "ENTRADA", "tienda_id": tienda2, "contraparte_id": tienda,
                                   "items": [{"articulo_id": con_stock, "cantidad": 0.2}]}, token=clave)
 casi(stock(tienda2)[con_stock], base2 + 0.2)  # llegó menos: el faltante no entra
+P("POST", "/pos/transferencias", {**trf, "referencia": "POSTRF-hora-S", "fecha_hora": "2026-11-06 08:05:09"}, token=clave)
+P("POST", "/pos/transferencias/anular", {"referencia": "POSTRF-hora-S", "fecha_hora": "2026-11-06 08:30:00"}, token=clave)
+horas_t = {m["tipo"]: m["fecha"] for m in P("GET", f"/pos/movimientos?tienda_id={tienda}&desde=2026-11-06&hasta=2026-11-06", token=clave)}
+assert horas_t == {"TRANSFERENCIA_SALIDA": "2026-11-06 08:05:09", "ANULACION": "2026-11-06 08:30:00"}, horas_t
 movs = A("GET", f"/movimientos?desde=2026-11-05&hasta=2026-11-05&bodega={tienda2}")
 assert any(m["tipo"] == "TRANSFERENCIA_ENTRADA" for m in (movs if isinstance(movs, list) else movs.get("filas", [])))
 P("POST", "/pos/transferencias/anular", {"referencia": "POSTRF-test-2-S"}, token=clave, esperado=404)
@@ -1094,6 +1113,28 @@ assert len(next(f for f in A("GET", "/compras/facturas") if f["id"] == fx["id"])
 A("POST", f"/compras/facturas/{fx['id']}/anular", {}, 409)
 A("POST", f"/compras/{g1}/anular", {})
 A("POST", f"/compras/{g2}/anular", {})
+
+# Zona horaria del dispositivo: por nombre o, de respaldo, por la diferencia con UTC
+from datetime import datetime as _dt, timedelta as _td, timezone as _tz  # noqa: E402
+assert app.zona_dispositivo("", "") is None and app.zona_dispositivo("../../etc/passwd", "x") is None
+assert app.zona_dispositivo(None, "99999") is None
+assert app.zona_dispositivo("Zona/Inexistente", "180").utcoffset(None) == _td(hours=-3)
+if app.ZoneInfo:
+    assert str(app.zona_dispositivo("Asia/Tokyo", "")) == "Asia/Tokyo"
+
+
+def zona_por_http(offset):
+    conn = http.client.HTTPConnection("127.0.0.1", PUERTO)
+    conn.request("GET", "/api/estado", headers={"Cookie": A.cookie, "X-Zona-Offset": offset})
+    conn.getresponse().read()
+    return app.hoy_d(), app.ahora_dt()  # sin solicitud en curso: usa la zona del último dispositivo
+
+
+este, h_este = zona_por_http("-840")   # UTC+14
+oeste, _ = zona_por_http("660")        # UTC-11: siempre un día antes
+assert (este - oeste).days == 1, (este, oeste)
+assert abs((h_este - (_dt.now(_tz.utc) + _td(hours=14)).replace(tzinfo=None)).total_seconds()) < 60
+zona_por_http("180")
 
 # Datos de ejemplo: base nueva, y coherencia del historial
 os.environ["NS_DB"] = app.DB_PATH = os.path.join(tempfile.mkdtemp(), "demo.db")

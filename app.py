@@ -20,7 +20,7 @@ import time
 import unicodedata
 import urllib.error
 import urllib.request
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -41,6 +41,46 @@ FUDO_TIMEOUT = 20
 SESION_HORAS = 12
 MAX_BODY = 5 * 1024 * 1024
 MAX_LOGO = 2 * 1024 * 1024
+
+# ---- Zona horaria: la del dispositivo que hace cada solicitud (el navegador la manda en X-Zona-Horaria / X-Zona-Offset;
+# el POS manda la suya). Las tareas sin dispositivo usan la del último que se conectó; sin ninguno, America/Santiago.
+try:
+    from zoneinfo import ZoneInfo
+    _ZONA_DEFECTO = ZoneInfo("America/Santiago")
+except Exception:  # sin base de zonas (Windows sin tzdata): hora local del computador
+    ZoneInfo = None
+    _ZONA_DEFECTO = None
+_ZONA = threading.local()
+_ZONA_ULTIMA = [_ZONA_DEFECTO]
+_NOMBRE_ZONA = re.compile(r"[A-Za-z0-9_+\-]+(/[A-Za-z0-9_+\-]+){0,2}")
+
+
+def zona_dispositivo(nombre, offset):
+    """Zona por nombre (ej. America/Santiago) o, si el servidor no la conoce, por la diferencia con UTC en minutos
+    (getTimezoneOffset de JavaScript). None si no viene o no es válida."""
+    nombre = (nombre or "").strip()
+    if ZoneInfo and nombre and len(nombre) <= 64 and _NOMBRE_ZONA.fullmatch(nombre):
+        try:
+            return ZoneInfo(nombre)
+        except Exception:
+            pass
+    try:
+        minutos = int(str(offset).strip())
+    except (TypeError, ValueError):
+        return None
+    if -14 * 60 <= minutos <= 14 * 60:
+        return timezone(timedelta(minutes=-minutos))
+    return None
+
+
+def ahora_dt():
+    """Fecha y hora local (sin zona) según la zona del dispositivo de la solicitud."""
+    z = getattr(_ZONA, "tz", None) or _ZONA_ULTIMA[0]
+    return datetime.now(z).replace(tzinfo=None) if z else datetime.now()
+
+
+def hoy_d():
+    return ahora_dt().date()
 
 MODULOS = [
     ("panel", "Panel de inicio"), ("compras", "Compras"), ("devoluciones", "Devoluciones a proveedores"), ("proveedores", "Proveedores e IVA"),
@@ -230,7 +270,7 @@ def entero(v, nombre):
 
 def fecha_valida(v, nombre="la fecha"):
     if not v:
-        return date.today().isoformat()
+        return hoy_d().isoformat()
     try:
         return date.fromisoformat(str(v)[:10]).isoformat()
     except ValueError:
@@ -313,10 +353,32 @@ def valorizar(db, filas, clave="articulo_id"):
     return filas
 
 
+def fecha_hora_valida(v):
+    """'AAAA-MM-DD HH:MM[:SS]' (o con T) -> 'AAAA-MM-DD HH:MM:SS'; None si no viene o no es válida.
+    Es la fecha y hora en que ocurrió la transacción en el POS (hora local de la tienda)."""
+    if not v:
+        return None
+    try:
+        return datetime.fromisoformat(str(v).strip()[:19].replace("T", " ")).strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def fecha_pos(d):
+    """(fecha, cuando) de una transacción del POS: 'cuando' es la fecha y hora en que ocurrió en la tienda (fecha_hora);
+    si el POS no la manda (versión antigua), la fecha del documento con la hora de ahora."""
+    cuando = fecha_hora_valida(d.get("fecha_hora"))
+    if cuando:
+        return cuando[:10], cuando
+    fecha = fecha_valida(d.get("fecha"))
+    return fecha, fecha
+
+
 def mover(db, art_id, bodega, delta, tipo, uid, fecha, doc_tipo=None, doc_id=None, ref="", proveedor=None, destino=None,
           motivo=None, costo=None, obs="", negativo=False):
     """Único punto que modifica stock: garantiza saldo no negativo (salvo negativo=True, solo para las ventas del POS,
-    que ya se cobraron y se cuadran después con un despacho o un inventario) y deja rastro en el historial."""
+    que ya se cobraron y se cuadran después con un despacho o un inventario) y deja rastro en el historial.
+    fecha: 'AAAA-MM-DD' (se registra con la hora actual del dispositivo) o 'AAAA-MM-DD HH:MM:SS' (hora en que ocurrió)."""
     a = articulo(db, art_id)
     nuevo = round(stock_de(db, bodega, art_id) + delta, 5)
     if nuevo < 0 and not negativo:
@@ -326,7 +388,7 @@ def mover(db, art_id, bodega, delta, tipo, uid, fecha, doc_tipo=None, doc_id=Non
                "ON CONFLICT(bodega_id,articulo_id) DO UPDATE SET cantidad=excluded.cantidad", (bodega, art_id, nuevo))
     db.execute("INSERT INTO movimientos(fecha,articulo_id,bodega_id,tipo,cantidad,saldo,costo_unit,proveedor_id,tienda_destino_id,"
                "motivo_id,doc_tipo,doc_id,referencia,obs,usuario_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-               (f"{fecha} {datetime.now():%H:%M:%S}", art_id, bodega, tipo, round(delta, 5), nuevo,
+               (fecha if len(str(fecha)) > 10 else f"{fecha} {ahora_dt():%H:%M:%S}", art_id, bodega, tipo, round(delta, 5), nuevo,
                 costo if costo is not None else costo_teorico(db, art_id), proveedor, destino, motivo, doc_tipo, doc_id, ref, obs, uid))
 
 
@@ -505,7 +567,7 @@ def crear_despacho(db, uid, d):
     return did
 
 
-def recibir_despacho(db, did, tienda_id, recibidos, responsable, obs, referencia):
+def recibir_despacho(db, did, tienda_id, recibidos, responsable, obs, referencia, cuando=None):
     """La tienda recibe en el POS una guía en camino: entra a su stock lo que llegó; lo que faltó vuelve a la central
     (movimiento FALTANTE_DESPACHO) y queda anotado. Idempotente por referencia; todo o nada."""
     g = row(db, "SELECT * FROM despachos WHERE id=? AND tienda_id=?", did, tienda_id)
@@ -520,7 +582,7 @@ def recibir_despacho(db, did, tienda_id, recibidos, responsable, obs, referencia
     if g["recepcion"] != "EN_CAMINO":
         raise ApiError(409, "Esta guía ya entró al stock de la tienda al despacharla.")
     items = rows(db, "SELECT di.rowid rid, di.*, a.nombre FROM despacho_items di JOIN articulos a ON a.id=di.articulo_id WHERE di.despacho_id=?", did)
-    hoy = date.today().isoformat()
+    hoy = cuando or ahora_dt().strftime("%Y-%m-%d %H:%M:%S")  # hora en que se recibió en la tienda
     ref = f"Guía {did:06d}"
     for i in items:
         rec = recibidos.get(i["articulo_id"], i["cantidad"])
@@ -538,7 +600,7 @@ def recibir_despacho(db, did, tienda_id, recibidos, responsable, obs, referencia
             mover(db, i["articulo_id"], CENTRAL, falta, "FALTANTE_DESPACHO", None, hoy, "DESPACHO", did, ref, destino=tienda_id,
                   obs="No llegó a la tienda: vuelve a la central")
     db.execute("UPDATE despachos SET recepcion='RECIBIDA', recibido=?, recibido_por=?, obs_recepcion=?, referencia_recepcion=? WHERE id=?",
-               (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), responsable, obs, referencia, did))
+               (hoy, responsable, obs, referencia, did))
 
 
 def crear_merma(db, uid, d, bodega):
@@ -555,15 +617,16 @@ def crear_merma(db, uid, d, bodega):
     return mid
 
 
-def anular(db, uid, tabla, doc_tipo, doc_id, negativo=False):
+def anular(db, uid, tabla, doc_tipo, doc_id, negativo=False, cuando=None):
     """negativo=True solo para lo que viene del POS (ventas y cambios ya ocurridos en la tienda): su anulación
-    se aplica aunque el stock de la tienda quede negativo, igual que la venta."""
+    se aplica aunque el stock de la tienda quede negativo, igual que la venta.
+    cuando: fecha y hora en que se anuló en el POS (si no, la hora actual del dispositivo)."""
     doc = row(db, f"SELECT * FROM {tabla} WHERE id=?", doc_id)
     if not doc:
         raise ApiError(404, "Documento no encontrado.")
     if doc["estado"] == "ANULADO":
         raise ApiError(409, "El documento ya está anulado.")
-    hoy = date.today().isoformat()
+    hoy = cuando or ahora_dt().strftime("%Y-%m-%d %H:%M:%S")
     for m in rows(db, "SELECT * FROM movimientos WHERE doc_tipo=? AND doc_id=? AND tipo<>'ANULACION'", doc_tipo, doc_id):
         mover(db, m["articulo_id"], m["bodega_id"], -m["cantidad"], "ANULACION", uid, hoy, doc_tipo, doc_id, "Anula " + m["referencia"],
               proveedor=m["proveedor_id"], destino=m["tienda_destino_id"], motivo=m["motivo_id"], costo=m["costo_unit"], negativo=negativo)
@@ -928,7 +991,7 @@ def config_respaldo(c):
             copia.execute("UPDATE fudo_tiendas SET api_key='', api_secret=''")
         copia.execute("VACUUM")
         copia.close()
-        return Archivo(f"nata_schlott_{datetime.now():%Y%m%d_%H%M}.db", ruta_copia.read_bytes())
+        return Archivo(f"nata_schlott_{ahora_dt():%Y%m%d_%H%M}.db", ruta_copia.read_bytes())
 
 
 # ---------------------------------------------------------------- artículos
@@ -1180,7 +1243,7 @@ def compras_factura_crear(c):
     iva = round(neto * pct / 100, 2)
     fid = db.execute("INSERT INTO compra_facturas(proveedor_id,fecha,documento,iva_pct,neto,iva,total,obs,usuario_id,creado) VALUES(?,?,?,?,?,?,?,?,?,?)",
                      (prov, fecha_valida(d.get("fecha")), doc, pct, neto, iva, round(neto + iva, 2), txt(d.get("obs"), "La observación", False, 500), c.uid,
-                      datetime.now().strftime("%Y-%m-%d %H:%M:%S"))).lastrowid
+                      ahora_dt().strftime("%Y-%m-%d %H:%M:%S"))).lastrowid
     db.execute(f"UPDATE compras SET factura_id=? WHERE id IN ({','.join('?' * len(ids))})", (fid, *ids))
     return {"id": fid, "neto_guias": neto_guias, "diferencia": round(neto - neto_guias, 2)}
 
@@ -1488,7 +1551,7 @@ def fudo_gasto(g, cfg, proveedor_id, medio_id):
     relaciones = {"expenseCategory": {"data": {"id": cfg["categoria_id"], "type": "ExpenseCategory"}},
                   "provider": {"data": {"id": proveedor_id, "type": "Provider"}},
                   "paymentMethod": {"data": {"id": medio_id, "type": "PaymentMethod"}}}
-    desc = f"{datetime.now():%d-%m-%Y %H:%M} · Guía N° {g['id']:06d}"  # comentario: fecha y hora del envío y número de guía
+    desc = f"{ahora_dt():%d-%m-%Y %H:%M} · Guía N° {g['id']:06d}"  # comentario: fecha y hora del envío y número de guía
     return {"data": {"type": "Expense", "attributes": {
         "amount": round(g["total"] if cfg["monto"] == "TOTAL" else g["neto"]), "date": g["fecha"][:10], "paymentDate": g["fecha"][:10],
         "useInCashCount": False, "receiptNumber": num_guia, "description": desc[:255]}, "relationships": relaciones}}
@@ -1631,7 +1694,7 @@ FUDO_STOCK_LOCK = threading.Lock()  # lectura y escritura de stock en Fudo no so
 
 
 def ahora():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return ahora_dt().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def confirmar_tx(db):
@@ -2272,7 +2335,7 @@ def actualizar_stock(c):
     d = c.body
     bodega, motivo = c.bodega(d.get("bodega_id")), txt(d.get("motivo"), "el motivo", True, 200)
     permitidos = {a["articulo_id"] for a in articulos_de_bodega(c.db, bodega)}
-    fecha, n = date.today().isoformat(), 0
+    fecha, n = hoy_d().isoformat(), 0
     for it in d.get("items") or []:
         aid = entero(it.get("articulo_id"), "el artículo")
         if aid not in permitidos:
@@ -2373,7 +2436,7 @@ def pos_consumo(c):
     tienda = row(c.db, "SELECT id, nombre FROM tiendas WHERE id=?", tid)
     if not tienda:
         raise ApiError(404, "Tienda no encontrada.")
-    fecha = fecha_valida(d.get("fecha"))
+    fecha, cuando = fecha_pos(d)
     detalle = txt(d.get("detalle"), "El detalle", False, 200)
     items = d.get("items")
     if not isinstance(items, list) or not items:
@@ -2388,10 +2451,10 @@ def pos_consumo(c):
         if not row(c.db, "SELECT id FROM articulos WHERE id=? AND activo=1", aid):
             raise ApiError(404, f"Artículo {aid} no encontrado o inactivo.")
     cid = c.db.execute("INSERT INTO pos_consumos(referencia,tienda_id,fecha,detalle,creado) VALUES(?,?,?,?,?)",
-                       (ref, tid, fecha, detalle, f"{datetime.now():%Y-%m-%d %H:%M:%S}")).lastrowid
+                       (ref, tid, fecha, detalle, f"{ahora_dt():%Y-%m-%d %H:%M:%S}")).lastrowid
     for aid, cant in cantidades.items():
         # La venta ya se cobró en el POS: se descuenta aunque falte stock (queda negativo hasta reponer o hacer inventario)
-        mover(c.db, aid, tid, -cant, "VENTA", None, fecha, "POS", cid, f"POS {ref}", obs=detalle, negativo=True)
+        mover(c.db, aid, tid, -cant, "VENTA", None, cuando, "POS", cid, f"POS {ref}", obs=detalle, negativo=True)
     return {"ok": True, "id": cid}
 
 
@@ -2409,7 +2472,7 @@ def pos_cambio(c):
     tid = entero(d.get("tienda_id"), "la tienda")
     if not row(c.db, "SELECT id FROM tiendas WHERE id=?", tid):
         raise ApiError(404, "Tienda no encontrada.")
-    fecha = fecha_valida(d.get("fecha"))
+    fecha, cuando = fecha_pos(d)
     detalle = txt(d.get("detalle"), "El detalle", False, 200)
 
     def leer(clave):
@@ -2430,11 +2493,11 @@ def pos_cambio(c):
         if not row(c.db, "SELECT id FROM articulos WHERE id=? AND activo=1", aid):
             raise ApiError(404, f"Artículo {aid} no encontrado o inactivo.")
     cid = c.db.execute("INSERT INTO pos_consumos(referencia,tienda_id,fecha,detalle,creado) VALUES(?,?,?,?,?)",
-                       (ref, tid, fecha, detalle, f"{datetime.now():%Y-%m-%d %H:%M:%S}")).lastrowid
+                       (ref, tid, fecha, detalle, f"{ahora_dt():%Y-%m-%d %H:%M:%S}")).lastrowid
     for aid, cant in entradas.items():  # lo que el cliente devolvió vuelve al stock de la tienda
-        mover(c.db, aid, tid, cant, "ENTRADA_CAMBIO", None, fecha, "POS", cid, f"POS {ref}", obs=detalle)
+        mover(c.db, aid, tid, cant, "ENTRADA_CAMBIO", None, cuando, "POS", cid, f"POS {ref}", obs=detalle)
     for aid, cant in salidas.items():  # lo que se le entregó a cambio sale (como una venta: puede quedar negativo)
-        mover(c.db, aid, tid, -cant, "SALIDA_CAMBIO", None, fecha, "POS", cid, f"POS {ref}", obs=detalle, negativo=True)
+        mover(c.db, aid, tid, -cant, "SALIDA_CAMBIO", None, cuando, "POS", cid, f"POS {ref}", obs=detalle, negativo=True)
     return {"ok": True, "id": cid}
 
 
@@ -2478,8 +2541,9 @@ def pos_consumo_anular(c):
         raise ApiError(404, "No existe un consumo del POS con esa referencia.")
     if cons["estado"] != "ANULADO":
         # la venta (o el cambio) ya ocurrió en la tienda: se revierte aunque el stock quede negativo (ej. revertir una entrada por cambio)
-        anular(c.db, None, "pos_consumos", "POS", cons["id"], negativo=True)
-        c.db.execute("UPDATE pos_consumos SET anulado=? WHERE id=?", (f"{datetime.now():%Y-%m-%d %H:%M:%S}", cons["id"]))
+        cuando = fecha_hora_valida(c.body.get("fecha_hora")) or f"{ahora_dt():%Y-%m-%d %H:%M:%S}"  # hora en que se anuló en el POS
+        anular(c.db, None, "pos_consumos", "POS", cons["id"], negativo=True, cuando=cuando)
+        c.db.execute("UPDATE pos_consumos SET anulado=? WHERE id=?", (cuando, cons["id"]))
     return {"ok": True, "id": cons["id"]}
 
 
@@ -2506,7 +2570,7 @@ def pos_despachos(c):
     """Guías de la central a una tienda que recibe en el POS: las en camino y las recibidas de los últimos 60 días."""
     pos_autorizar(c)
     tid = pos_tienda(c.db, c.q.get("tienda_id"))
-    desde = (date.today() - timedelta(days=60)).isoformat()
+    desde = (hoy_d() - timedelta(days=60)).isoformat()
     guias = rows(c.db, """SELECT d.id, d.fecha, d.transportista, d.patente, d.obs, d.recepcion, d.recibido, d.recibido_por, d.obs_recepcion,
         u.nombre usuario FROM despachos d LEFT JOIN usuarios u ON u.id=d.usuario_id
         WHERE d.tienda_id=? AND d.estado='VIGENTE' AND (d.recepcion='EN_CAMINO' OR (d.recepcion='RECIBIDA' AND d.fecha>=?))
@@ -2536,7 +2600,7 @@ def pos_despacho_recibir(c):
             raise ApiError(400, "Detalle inválido.")
         recibidos[entero(i.get("articulo_id"), "el artículo")] = num(i.get("recibido"), "Lo recibido")
     recibir_despacho(c.db, did, tid, recibidos, txt(d.get("responsable"), "El responsable", False, 100),
-                     txt(d.get("obs"), "La observación", False, 300), ref)
+                     txt(d.get("obs"), "La observación", False, 300), ref, fecha_hora_valida(d.get("fecha_hora")))
     return {"ok": True, "despacho_id": did}
 
 
@@ -2638,7 +2702,7 @@ def pos_transferencia(c):
     otra = pos_tienda(c.db, d.get("contraparte_id"))
     if otra == tid:
         raise ApiError(400, "La tienda de origen y la de destino deben ser distintas.")
-    fecha = fecha_valida(d.get("fecha"))
+    fecha, cuando = fecha_pos(d)
     detalle = txt(d.get("detalle"), "El detalle", False, 200)
     items = d.get("items")
     if not isinstance(items, list) or not items:
@@ -2655,10 +2719,10 @@ def pos_transferencia(c):
         if not row(c.db, "SELECT id FROM articulos WHERE id=? AND activo=1 AND (tipo='PRODUCTO' OR desechable=1)", aid):
             raise ApiError(404, f"Artículo {aid} no encontrado o no se maneja en tiendas.")
     tid_id = c.db.execute("INSERT INTO pos_transferencias(referencia,tipo,tienda_id,contraparte_id,fecha,detalle,creado) VALUES(?,?,?,?,?,?,?)",
-                          (ref, tipo, tid, otra, fecha, detalle, f"{datetime.now():%Y-%m-%d %H:%M:%S}")).lastrowid
+                          (ref, tipo, tid, otra, fecha, detalle, f"{ahora_dt():%Y-%m-%d %H:%M:%S}")).lastrowid
     signo = -1 if tipo == "SALIDA" else 1
     for aid, cant in cantidades.items():
-        mover(c.db, aid, tid, signo * cant, "TRANSFERENCIA_" + tipo, None, fecha, "POS_TRF", tid_id, f"POS {ref}", destino=otra, obs=detalle)
+        mover(c.db, aid, tid, signo * cant, "TRANSFERENCIA_" + tipo, None, cuando, "POS_TRF", tid_id, f"POS {ref}", destino=otra, obs=detalle)
     return {"ok": True, "id": tid_id}
 
 
@@ -2670,8 +2734,9 @@ def pos_transferencia_anular(c):
     if not t:
         raise ApiError(404, "No existe una transferencia del POS con esa referencia.")
     if t["estado"] != "ANULADO":
-        anular(c.db, None, "pos_transferencias", "POS_TRF", t["id"])
-        c.db.execute("UPDATE pos_transferencias SET anulado=? WHERE id=?", (f"{datetime.now():%Y-%m-%d %H:%M:%S}", t["id"]))
+        cuando = fecha_hora_valida(c.body.get("fecha_hora")) or f"{ahora_dt():%Y-%m-%d %H:%M:%S}"
+        anular(c.db, None, "pos_transferencias", "POS_TRF", t["id"], cuando=cuando)
+        c.db.execute("UPDATE pos_transferencias SET anulado=? WHERE id=?", (cuando, t["id"]))
     return {"ok": True, "id": t["id"]}
 
 
@@ -2690,7 +2755,7 @@ def pos_inventario(c):
     if previo:
         return {**pos_inventario_resultado(c.db, previo), "repetido": True}
     tid = pos_tienda(c.db, d.get("tienda_id"))
-    fecha = fecha_valida(d.get("fecha"))
+    fecha, cuando = fecha_pos(d)
     responsable = txt(d.get("responsable"), "El responsable", False, 100)
     obs = txt(d.get("obs"), "La observación", False, 300)
     items = d.get("items")
@@ -2716,9 +2781,10 @@ def pos_inventario(c):
         dif = round(conteo - actual, 5)
         c.db.execute("INSERT INTO inventario_items(inventario_id,articulo_id,stock_sistema,conteo,diferencia) VALUES(?,?,?,?,?)", (iid, aid, actual, conteo, dif))
         if dif:
-            mover(c.db, aid, tid, dif, "INVENTARIO", None, fecha, "INVENTARIO", iid, f"Toma de inventario POS #{iid}",
+            mover(c.db, aid, tid, dif, "INVENTARIO", None, cuando, "INVENTARIO", iid, f"Toma de inventario POS #{iid}",
                   obs=f"Conteo físico: {conteo:g}; sistema: {actual:g}")
-    c.db.execute("UPDATE inventarios SET estado='CERRADO', cerrado=? WHERE id=?", (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), iid))
+    c.db.execute("UPDATE inventarios SET estado='CERRADO', cerrado=? WHERE id=?",
+                 (cuando if len(cuando) > 10 else ahora_dt().strftime("%Y-%m-%d %H:%M:%S"), iid))
     c.db.execute("INSERT INTO pos_inventarios(referencia,inventario_id) VALUES(?,?)", (ref, iid))
     return pos_inventario_resultado(c.db, iid)
 
@@ -2875,7 +2941,7 @@ def inventarios_cerrar(c, i):
     contados = rows(c.db, "SELECT * FROM inventario_items WHERE inventario_id=? AND conteo IS NOT NULL", inv["id"])
     if not contados:
         raise ApiError(400, "Ingresa al menos un conteo antes de cerrar.")
-    hoy = inv["fecha"] or date.today().isoformat()  # el ajuste queda con la fecha de la toma
+    hoy = inv["fecha"] or hoy_d().isoformat()  # el ajuste queda con la fecha de la toma
     for x in contados:
         # La diferencia se calcula contra el stock al cierre, por si hubo movimientos durante el conteo.
         actual = stock_de(c.db, inv["bodega_id"], x["articulo_id"])
@@ -2884,7 +2950,7 @@ def inventarios_cerrar(c, i):
                      (actual, dif, inv["id"], x["articulo_id"]))
         mover(c.db, x["articulo_id"], inv["bodega_id"], dif, "INVENTARIO", c.uid, hoy, "INVENTARIO", inv["id"],
               f"Toma de inventario #{inv['id']}", obs=f"Conteo físico: {x['conteo']:g}; sistema: {actual:g}")
-    c.db.execute("UPDATE inventarios SET estado='CERRADO', cerrado=? WHERE id=?", (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), inv["id"]))
+    c.db.execute("UPDATE inventarios SET estado='CERRADO', cerrado=? WHERE id=?", (ahora_dt().strftime("%Y-%m-%d %H:%M:%S"), inv["id"]))
     return {"ok": True}
 
 
@@ -2930,7 +2996,7 @@ def movimientos(c):
 # ---------------------------------------------------------------- reportes
 
 def serie_mensual(db, meses=6):
-    hoy = date.today().replace(day=1)
+    hoy = hoy_d().replace(day=1)
     claves = []
     y, m = hoy.year, hoy.month
     for _ in range(meses):
@@ -3195,7 +3261,7 @@ def sembrar(db):
 def cargar_demo(db, uid):
     """Datos ficticios: pasan por las mismas funciones que la operación real para que el historial sea consistente."""
     rnd = random.Random(7)
-    hoy = date.today()
+    hoy = hoy_d()
     ids = lambda t: {r["nombre"]: r["id"] for r in rows(db, f"SELECT id,nombre FROM {t}")}
     cat, uni, mot = ids("categorias"), {r["abreviatura"]: r["id"] for r in rows(db, "SELECT * FROM unidades")}, ids("motivos_merma")
     tiendas = [db.execute("INSERT INTO tiendas(nombre,direccion,comuna,region) VALUES(?,?,?,?)", t).lastrowid for t in (
@@ -3355,6 +3421,10 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         if not url.path.startswith("/api/"):
             return self.estatico(url.path) if metodo == "GET" else self.responder(405, b"", "text/plain")
+        zona = zona_dispositivo(self.headers.get("X-Zona-Horaria"), self.headers.get("X-Zona-Offset"))
+        _ZONA.tz = zona
+        if zona is not None:
+            _ZONA_ULTIMA[0] = zona
         db = conectar()
         en_tx = False
         try:
@@ -3415,6 +3485,7 @@ class Handler(BaseHTTPRequestHandler):
             traceback.print_exc()
             self.json(500, {"error": "Ocurrió un error interno. Revisa la consola del servidor."})
         finally:
+            _ZONA.tz = None
             db.close()
 
 
