@@ -352,6 +352,7 @@ P("POST", "/login", {"username": "prod1", "password": "prueba-segura-3"})
 assert "password" not in json.dumps(A("GET", "/usuarios"))
 assert "_token" not in json.dumps(T("GET", "/estado"))
 P("GET", "/compras", esperado=403); P("POST", "/usuarios", {}, 403); P("GET", "/reportes/rendimiento", esperado=403); P("GET", "/reportes/stock-tiendas", esperado=403)
+P("GET", "/informes/inventario", esperado=403); P("GET", "/informes/compras?formato=xlsx", esperado=403)  # informes: requieren Reportes
 P("GET", "/produccion"); P("GET", "/produccion/recetas")
 T("GET", "/compras", esperado=403); T("GET", "/usuarios", esperado=403); T("POST", "/despachos", {}, 403)
 T("GET", "/stock/central", esperado=403)
@@ -1084,6 +1085,63 @@ cats = [f["categoria"].lower() for f in st["filas"]]
 assert cats == sorted(cats)
 assert all(f["tipo"] == "INSUMO" for f in A("GET", "/reportes/stock-tiendas?tipo=insumo")["filas"])
 
+# Informes: pantalla (JSON) y Excel (.xlsx)
+import io, zipfile, xml.dom.minidom
+hoy_s = app.hoy_d().isoformat()
+rango_inf = f"?desde=2000-01-01&hasta={hoy_s}"
+for tipo in ("ventas", "inventario", "produccion", "compras"):
+    inf = A("GET", f"/informes/{tipo}{rango_inf}")
+    assert inf["titulo"] and inf["resumen"] and inf["hojas"] and all(h["columnas"] for h in inf["hojas"]), tipo
+    assert all(set(h["totales"]) <= {c["k"] for c in h["columnas"]} for h in inf["hojas"]), tipo
+A("GET", "/informes/ventas?desde=2026-02-01&hasta=2026-01-01", esperado=400)
+A("GET", "/informes/otro", esperado=404)
+c = app.conectar()
+# Ventas: el consumo por ventas del POS y de Fudo coincide con los movimientos
+vt = A("GET", f"/informes/ventas{rango_inf}")
+esperado = c.execute("SELECT COALESCE(SUM(-cantidad*costo_unit),0) FROM movimientos WHERE doc_tipo IN ('POS','FUDO_VENTA') OR (doc_tipo='SALIDA' AND tipo='VENTA')").fetchone()[0]
+casi(sum(r["valor"] for r in vt["hojas"][0]["filas"]), round(esperado, 2))
+assert vt["resumen"][1]["v"] == c.execute("SELECT COUNT(*) FROM pos_consumos WHERE estado='VIGENTE'").fetchone()[0]
+# Inventario a hoy = stock actual; antes de cualquier movimiento no hay stock
+inv = A("GET", f"/informes/inventario{rango_inf}")
+actual = {(r[0], r[1]): r[2] for r in c.execute("SELECT bodega_id, articulo_id, cantidad FROM stock WHERE abs(cantidad)>1e-9")}
+cod = {r[0]: r[1] for r in c.execute("SELECT id, codigo FROM articulos")}
+nombres = {0: "Bodega central", **{r[0]: r[1] for r in c.execute("SELECT id, nombre FROM tiendas WHERE activo=1")}}
+detalle = {(d["bodega"], d["codigo"]): d["stock"] for d in inv["hojas"][1]["filas"]}
+assert detalle == {(nombres[b], cod[a]): s for (b, a), s in actual.items() if b in nombres}
+assert not A("GET", "/informes/inventario?desde=1999-01-01&hasta=1999-12-31")["hojas"][1]["filas"]
+# Kardex de un artículo: el saldo final de cada bodega es su stock a la fecha
+kx = A("GET", f"/informes/inventario{rango_inf}&articulo={harina}")
+kardex = next(h for h in kx["hojas"] if h["nombre"] == "Kardex")["filas"]
+for nb in {k["bodega"] for k in kardex}:
+    ultimo = [k for k in kardex if k["bodega"] == nb][-1]
+    bid = next(b for b, n in nombres.items() if n == nb)
+    casi(ultimo["saldo"], app.stock_a_fecha(c, bid, harina, hoy_s))
+assert all(k["bodega"] for k in kardex) and kardex[0]["tipo"] == "Saldo inicial"
+assert all(h["nombre"] != "Kardex" for h in inv["hojas"])  # sin artículo no hay kardex
+# Compras: el neto por insumo coincide con las compras vigentes; filtrar por artículo deja solo ese
+cp = A("GET", f"/informes/compras{rango_inf}")
+casi(sum(r["neto"] for r in cp["hojas"][0]["filas"]),
+     round(c.execute("SELECT SUM(ci.cantidad*ci.precio) FROM compra_items ci JOIN compras co ON co.id=ci.compra_id WHERE co.estado='VIGENTE'").fetchone()[0], 2))
+assert {r["codigo"] for r in A("GET", f"/informes/compras{rango_inf}&articulo={harina}")["hojas"][0]["filas"]} == {cod[harina]}
+c.close()
+# Excel: libro válido, con hoja Resumen y una por tabla, encabezados y totales con fórmula
+hc = http.client.HTTPConnection("127.0.0.1", PUERTO)
+hc.request("GET", f"/api/informes/compras{rango_inf}&formato=xlsx", headers={"Cookie": A.cookie})
+rx = hc.getresponse()
+datos_x = rx.read()
+assert rx.status == 200 and rx.getheader("Content-Type").startswith("application/vnd.openxmlformats"), rx.status
+assert rx.getheader("Content-Disposition").endswith('.xlsx"')
+zx = zipfile.ZipFile(io.BytesIO(datos_x))
+assert zx.testzip() is None
+libro = xml.dom.minidom.parseString(zx.read("xl/workbook.xml"))
+hojas_x = [s.getAttribute("name") for s in libro.getElementsByTagName("sheet")]
+assert hojas_x == ["Resumen", "Por insumo y proveedor", "Variación de precios", "Guías por facturar"], hojas_x
+for i in range(1, len(hojas_x) + 1):
+    xml.dom.minidom.parseString(zx.read(f"xl/worksheets/sheet{i}.xml"))  # XML bien formado
+hoja2 = zx.read("xl/worksheets/sheet2.xml").decode()
+assert "Insumo" in hoja2 and "SUM(" in hoja2 and cod[harina] in hoja2
+hc.close()
+
 # Guía de despacho de proveedor: suma stock al recibirla, queda pendiente y se netea con la factura sin volver a sumar
 stock_antes = next(x for x in A("GET", "/articulos") if x["id"] == harina)["stock"]
 g1 = A("POST", "/compras", {"tipo_documento": "GUIA", "documento": "G-501", "proveedor_id": prov, "items": [{"articulo_id": harina, "cantidad": 2, "precio": 1000}]})["id"]
@@ -1132,7 +1190,8 @@ def zona_por_http(offset):
 
 este, h_este = zona_por_http("-840")   # UTC+14
 oeste, _ = zona_por_http("660")        # UTC-11: siempre un día antes
-assert (este - oeste).days == 1, (este, oeste)
+_utc = _dt.now(_tz.utc)  # a 25 h: según la hora UTC quedan a 1 o 2 días; cada una debe ser la fecha de su zona
+assert este == (_utc + _td(hours=14)).date() and oeste == (_utc - _td(hours=11)).date(), (este, oeste)
 assert abs((h_este - (_dt.now(_tz.utc) + _td(hours=14)).replace(tzinfo=None)).total_seconds()) < 60
 zona_por_http("180")
 

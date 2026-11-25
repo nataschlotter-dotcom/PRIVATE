@@ -285,3 +285,4 @@ body:not(:has(#lateral)) #ay-boton, body:not(:has(#lateral)) .ay-panel { display
 .ay-form input { flex: 1; min-width: 0; }
 @media (max-width: 600px) { .ay-panel { right: 16px; left: 16px; width: auto; bottom: 76px; } #ay-boton { right: 16px; bottom: 16px; } }
 @media print { #ay-boton, .ay-panel { display: none !important; } }
+.inf-totales { margin-top: 8px; font-size: 13px; color: var(--tinta-2); }

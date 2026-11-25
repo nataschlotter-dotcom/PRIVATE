@@ -204,8 +204,8 @@ CREATE INDEX IF NOT EXISTS ix_precios ON historial_precios(articulo_id, fecha);
 
 
 class Archivo:
-    def __init__(self, nombre, contenido):
-        self.nombre, self.contenido = nombre, contenido
+    def __init__(self, nombre, contenido, tipo="application/octet-stream"):
+        self.nombre, self.contenido, self.tipo = nombre, contenido, tipo
 
 
 class ApiError(Exception):
@@ -3020,6 +3020,379 @@ def alertas_stock(db):
         ORDER BY COALESCE(s.cantidad,0)/a.stock_minimo""")
 
 
+# ---------------------------------------------------------------- informes (pantalla con filtros + Excel)
+# Cada informe devuelve {"resumen", "grafico", "hojas", "nota"}; las "hojas" son tablas (columnas con tipo y filas)
+# que la pantalla muestra y que /api/informes/<tipo>?formato=xlsx entrega como libro de Excel, una hoja por tabla.
+
+TIPOS_MOV_NOMBRE = {
+    "COMPRA": "Compra", "PRODUCCION": "Producción", "CONSUMO_PRODUCCION": "Consumo en producción", "DESPACHO": "Despacho",
+    "RECEPCION_TIENDA": "Recepción en tienda", "MERMA": "Merma", "INVENTARIO": "Toma de inventario", "VENTA": "Venta (POS)",
+    "CONSUMO_INTERNO": "Consumo interno", "ANULACION": "Anulación", "AJUSTE_ADMIN": "Actualización de stock",
+    "DEVOLUCION_PROVEEDOR": "Devolución a proveedor", "DEVOLUCION_TIENDA": "Devolución de tienda", "RECEPCION_CENTRAL": "Recepción en central",
+    "CONSUMO_CENTRAL": "Consumo interno central", "VENTA_FUDO": "Ventas en Fudo", "TRANSFERENCIA_SALIDA": "Transferencia enviada",
+    "TRANSFERENCIA_ENTRADA": "Transferencia recibida", "FALTANTE_DESPACHO": "Faltante de despacho",
+    "ENTRADA_CAMBIO": "Entrada por cambio (POS)", "SALIDA_CAMBIO": "Salida por cambio (POS)",
+}
+
+
+def filtros_informe(c):
+    c.sin_tienda()
+    d, h = c.rango(30)
+    if d > h:
+        raise ApiError(400, "La fecha 'desde' es posterior a 'hasta'.")
+    t = c.q.get("tienda")
+    return {"desde": d, "hasta": h, "tienda": None if t in (None, "") else c.bodega(t),
+            "categoria": entero(c.q["categoria"], "la categoría") if c.q.get("categoria") else None,
+            "articulo": entero(c.q["articulo"], "el artículo") if c.q.get("articulo") else None}
+
+
+def filtro_articulo(f, alias="a"):
+    w, args = "", []
+    if f["categoria"]:
+        w, args = w + f" AND {alias}.categoria_id=?", args + [f["categoria"]]
+    if f["articulo"]:
+        w, args = w + f" AND {alias}.id=?", args + [f["articulo"]]
+    return w, args
+
+
+def nombre_bodega(db, b):
+    return "Bodega central" if b == CENTRAL else (scalar(db, "SELECT nombre FROM tiendas WHERE id=?", b) or f"Tienda {b}")
+
+
+def hoja(nombre, columnas, filas, totales=()):
+    """columnas: [(título, clave, tipo)] con tipo texto|num|peso|precio|pct|fecha; totales: claves a sumar en la última fila."""
+    return {"nombre": nombre, "columnas": [{"t": t, "k": k, "tipo": tp} for t, k, tp in columnas], "filas": filas, "totales": list(totales)}
+
+
+def informe_ventas(db, f):
+    """Consumo de las tiendas por ventas, valorizado al costo del momento: POS, sincronizaciones con Fudo y ventas
+    registradas a mano en Bodegas (salida con motivo Venta)."""
+    fa, aa = filtro_articulo(f)
+    ft, at = (" AND m.bodega_id=?", [f["tienda"]]) if f["tienda"] is not None else ("", [])
+    base = f"""FROM movimientos m JOIN articulos a ON a.id=m.articulo_id JOIN categorias ca ON ca.id=a.categoria_id
+        JOIN unidades u ON u.id=a.unidad_id JOIN tiendas t ON t.id=m.bodega_id
+        WHERE (m.doc_tipo IN ('POS','FUDO_VENTA') OR (m.doc_tipo='SALIDA' AND m.tipo='VENTA'))
+        AND substr(m.fecha,1,10) BETWEEN ? AND ?{ft}{fa}"""
+    args = [f["desde"], f["hasta"], *at, *aa]
+    valor = "SUM(-m.cantidad*m.costo_unit)"
+    por_tienda = rows(db, f"""SELECT t.id, t.nombre tienda, ROUND(SUM(CASE WHEN m.doc_tipo='POS' THEN -m.cantidad*m.costo_unit ELSE 0 END),2) pos,
+        ROUND(SUM(CASE WHEN m.doc_tipo='FUDO_VENTA' THEN -m.cantidad*m.costo_unit ELSE 0 END),2) fudo,
+        ROUND(SUM(CASE WHEN m.doc_tipo='SALIDA' THEN -m.cantidad*m.costo_unit ELSE 0 END),2) manual, ROUND({valor},2) valor {base}
+        GROUP BY t.id ORDER BY valor DESC""", *args)
+    ventas = {r["tienda_id"]: r["n"] for r in rows(db, f"""SELECT tienda_id, COUNT(*) n FROM pos_consumos WHERE estado='VIGENTE'
+        AND substr(fecha,1,10) BETWEEN ? AND ?{' AND tienda_id=?' if f['tienda'] is not None else ''} GROUP BY tienda_id""", f["desde"], f["hasta"], *at)}
+    for r in por_tienda:
+        r["ventas"] = ventas.get(r["id"], 0)
+    por_dia = rows(db, f"SELECT substr(m.fecha,1,10) fecha, t.nombre tienda, ROUND({valor},2) valor {base} GROUP BY 1, t.id ORDER BY 1, t.nombre", *args)
+    por_art = rows(db, f"""SELECT t.nombre tienda, a.codigo, a.nombre articulo, ca.nombre categoria, u.abreviatura unidad,
+        ROUND(SUM(CASE WHEN m.doc_tipo='POS' THEN -m.cantidad ELSE 0 END),5) cant_pos, ROUND(SUM(CASE WHEN m.doc_tipo='FUDO_VENTA' THEN -m.cantidad ELSE 0 END),5) cant_fudo,
+        ROUND(SUM(CASE WHEN m.doc_tipo='SALIDA' THEN -m.cantidad ELSE 0 END),5) cant_manual, ROUND(SUM(-m.cantidad),5) cantidad, ROUND({valor},2) valor {base} GROUP BY t.id, a.id ORDER BY t.nombre, valor DESC""", *args)
+    total = sum(r["valor"] for r in por_tienda)
+    return {
+        "resumen": [{"t": "Consumo por ventas, a costo", "v": total, "tipo": "peso"}, {"t": "Ventas del POS", "v": sum(ventas.values()), "tipo": "int"},
+                    {"t": "Tiendas con ventas", "v": len(por_tienda), "tipo": "int"}, {"t": "Artículos consumidos", "v": len({r["codigo"] for r in por_art}), "tipo": "int"}],
+        "grafico": {"titulo": "Consumo por tienda, a costo", "tipo": "peso", "filas": [{"nombre": r["tienda"], "valor": r["valor"]} for r in por_tienda]},
+        "hojas": [
+            hoja("Por tienda", [("Tienda", "tienda", "texto"), ("Ventas POS", "ventas", "int"), ("Consumo POS", "pos", "peso"),
+                                ("Consumo Fudo", "fudo", "peso"), ("Registradas a mano", "manual", "peso"), ("Total", "valor", "peso")],
+                 por_tienda, ("ventas", "pos", "fudo", "manual", "valor")),
+            hoja("Por día", [("Fecha", "fecha", "fecha"), ("Tienda", "tienda", "texto"), ("Consumo a costo", "valor", "peso")], por_dia, ("valor",)),
+            hoja("Por artículo", [("Tienda", "tienda", "texto"), ("Código", "codigo", "texto"), ("Artículo", "articulo", "texto"),
+                                  ("Categoría", "categoria", "texto"), ("Unidad", "unidad", "texto"), ("Cantidad POS", "cant_pos", "num"),
+                                  ("Cantidad Fudo", "cant_fudo", "num"), ("Cantidad a mano", "cant_manual", "num"), ("Cantidad total", "cantidad", "num"),
+                                  ("Valor a costo", "valor", "peso")], por_art, ("valor",)),
+        ],
+        "nota": "Incluye las ventas del POS, las sincronizaciones con Fudo y las ventas registradas a mano en Bodegas. El sistema recibe los artículos que consume "
+                "cada venta, no el monto vendido: las ventas en pesos por producto están en los informes del POS.",
+    }
+
+
+def stock_a_fecha(db, bodega, art_id, fecha):
+    """Stock al cierre de 'fecha': el actual menos lo que se movió después (robusto ante movimientos con fecha anterior)."""
+    despues = scalar(db, "SELECT SUM(cantidad) FROM movimientos WHERE articulo_id=? AND bodega_id=? AND substr(fecha,1,10)>?", art_id, bodega, fecha) or 0
+    return round(stock_de(db, bodega, art_id) - despues, 5)
+
+
+def informe_inventario(db, f):
+    """Stock valorizado a la fecha 'hasta' por bodega y categoría; con un artículo elegido, su kardex del período."""
+    bodegas = [f["tienda"]] if f["tienda"] is not None else [CENTRAL] + [t["id"] for t in rows(db, "SELECT id FROM tiendas WHERE activo=1 ORDER BY nombre")]
+    fa, aa = filtro_articulo(f)
+    memo, detalle = {}, []
+    for b in bodegas:
+        nb = nombre_bodega(db, b)
+        for a in rows(db, f"""SELECT a.id, a.codigo, a.nombre, ca.nombre categoria, u.abreviatura unidad FROM articulos a
+                JOIN categorias ca ON ca.id=a.categoria_id JOIN unidades u ON u.id=a.unidad_id
+                WHERE a.id IN (SELECT articulo_id FROM stock WHERE bodega_id=? UNION SELECT articulo_id FROM movimientos WHERE bodega_id=?){fa}
+                ORDER BY ca.nombre, a.nombre""", b, b, *aa):
+            s = stock_a_fecha(db, b, a["id"], f["hasta"])
+            if abs(s) < 1e-9:
+                continue
+            costo = costo_teorico(db, a["id"], memo)
+            detalle.append({"bodega": nb, "codigo": a["codigo"], "articulo": a["nombre"], "categoria": a["categoria"], "unidad": a["unidad"],
+                            "stock": s, "costo": round(costo, 4), "valor": round(s * costo, 2)})
+    resumen_bc = {}
+    for d in detalle:
+        r = resumen_bc.setdefault((d["bodega"], d["categoria"]), {"bodega": d["bodega"], "categoria": d["categoria"], "articulos": 0, "valor": 0})
+        r["articulos"] += 1
+        r["valor"] = round(r["valor"] + d["valor"], 2)
+    por_bodega = {}
+    for d in detalle:
+        por_bodega[d["bodega"]] = round(por_bodega.get(d["bodega"], 0) + d["valor"], 2)
+    hojas = [hoja("Por bodega y categoría", [("Bodega", "bodega", "texto"), ("Categoría", "categoria", "texto"), ("Artículos con stock", "articulos", "int"),
+                              ("Valor a costo", "valor", "peso")], list(resumen_bc.values()), ("articulos", "valor")),
+             hoja("Detalle", [("Bodega", "bodega", "texto"), ("Código", "codigo", "texto"), ("Artículo", "articulo", "texto"), ("Categoría", "categoria", "texto"),
+                              ("Unidad", "unidad", "texto"), ("Stock", "stock", "num"), ("Costo unitario", "costo", "precio"), ("Valor", "valor", "peso")], detalle, ("valor",))]
+    if f["articulo"]:
+        kardex = []
+        for b in bodegas:
+            movs = rows(db, """SELECT m.fecha, m.tipo, m.cantidad, m.costo_unit, m.referencia, m.obs, u.nombre usuario FROM movimientos m
+                LEFT JOIN usuarios u ON u.id=m.usuario_id WHERE m.articulo_id=? AND m.bodega_id=? AND substr(m.fecha,1,10) BETWEEN ? AND ?
+                ORDER BY m.fecha, m.id""", f["articulo"], b, f["desde"], f["hasta"])
+            inicial = stock_a_fecha(db, b, f["articulo"], (date.fromisoformat(f["desde"]) - timedelta(days=1)).isoformat())
+            if not movs and abs(inicial) < 1e-9:
+                continue
+            nb, saldo = nombre_bodega(db, b), inicial
+            kardex.append({"fecha": f["desde"], "bodega": nb, "tipo": "Saldo inicial", "referencia": "", "entrada": None, "salida": None, "saldo": inicial,
+                           "costo": None, "usuario": ""})
+            for m in movs:
+                saldo = round(saldo + m["cantidad"], 5)
+                kardex.append({"fecha": m["fecha"][:10], "bodega": nb, "tipo": TIPOS_MOV_NOMBRE.get(m["tipo"], m["tipo"]), "referencia": m["referencia"],
+                               "entrada": m["cantidad"] if m["cantidad"] > 0 else None, "salida": -m["cantidad"] if m["cantidad"] < 0 else None,
+                               "saldo": saldo, "costo": m["costo_unit"], "usuario": m["usuario"] or ""})
+        hojas.append(hoja("Kardex", [("Fecha", "fecha", "fecha"), ("Bodega", "bodega", "texto"), ("Movimiento", "tipo", "texto"),
+                                     ("Documento", "referencia", "texto"), ("Entrada", "entrada", "num"), ("Salida", "salida", "num"),
+                                     ("Saldo", "saldo", "num"), ("Costo unitario", "costo", "precio"), ("Usuario", "usuario", "texto")], kardex))
+    total = sum(d["valor"] for d in detalle)
+    return {
+        "resumen": [{"t": f"Valor del inventario al {f['hasta'][8:]}-{f['hasta'][5:7]}-{f['hasta'][:4]}", "v": total, "tipo": "peso"},
+                    {"t": "Artículos con stock", "v": len({d["codigo"] for d in detalle}), "tipo": "int"},
+                    {"t": "Bodegas", "v": len(por_bodega), "tipo": "int"}],
+        "grafico": {"titulo": "Valor por bodega", "tipo": "peso", "filas": [{"nombre": k, "valor": v} for k, v in sorted(por_bodega.items(), key=lambda x: -x[1])]},
+        "hojas": hojas,
+        "nota": "Stock al cierre de la fecha 'hasta', valorizado al costo actual de cada artículo. " +
+                ("El kardex muestra los movimientos del período con su saldo." if f["articulo"] else "Elige un artículo para ver además su kardex (entradas, salidas y saldo)."),
+    }
+
+
+def informe_produccion(db, f):
+    fa, aa = filtro_articulo(f)
+    prod = rows(db, f"""SELECT a.codigo, a.nombre producto, CASE a.tipo WHEN 'PRODUCTO' THEN 'Producto' ELSE 'Subproducto' END tipo, ca.nombre categoria,
+        u.abreviatura unidad, COUNT(*) lotes, ROUND(SUM(p.cantidad),5) cantidad, ROUND(SUM(p.costo_total),2) costo,
+        ROUND(SUM(p.costo_total)/SUM(p.cantidad),4) costo_unit
+        FROM producciones p JOIN articulos a ON a.id=p.articulo_id JOIN categorias ca ON ca.id=a.categoria_id JOIN unidades u ON u.id=a.unidad_id
+        WHERE p.estado='VIGENTE' AND p.fecha BETWEEN ? AND ?{fa} GROUP BY a.id ORDER BY costo DESC""", f["desde"], f["hasta"], *aa)
+    ft, at = (" AND d.tienda_id=?", [f["tienda"]]) if f["tienda"] not in (None, CENTRAL) else ("", [])
+    base = f"""FROM despacho_items i JOIN despachos d ON d.id=i.despacho_id JOIN tiendas t ON t.id=d.tienda_id JOIN articulos a ON a.id=i.articulo_id
+        JOIN categorias ca ON ca.id=a.categoria_id JOIN unidades u ON u.id=a.unidad_id
+        WHERE d.estado='VIGENTE' AND d.fecha BETWEEN ? AND ?{ft}{fa}"""
+    args = [f["desde"], f["hasta"], *at, *aa]
+    desp = rows(db, f"""SELECT t.nombre tienda, a.codigo, a.nombre articulo, ca.nombre categoria, u.abreviatura unidad, COUNT(DISTINCT d.id) guias,
+        ROUND(SUM(i.cantidad),5) cantidad, ROUND(SUM(i.cantidad*i.precio),2) neto {base} GROUP BY t.id, a.id ORDER BY t.nombre, neto DESC""", *args)
+    tiendas = rows(db, f"SELECT t.nombre tienda, COUNT(DISTINCT d.id) guias, ROUND(SUM(i.cantidad*i.precio),2) neto {base} GROUP BY t.id ORDER BY neto DESC", *args)
+    return {
+        "resumen": [{"t": "Costo de producción", "v": sum(r["costo"] for r in prod), "tipo": "peso"}, {"t": "Lotes producidos", "v": sum(r["lotes"] for r in prod), "tipo": "int"},
+                    {"t": "Despachado a tiendas (neto)", "v": sum(r["neto"] for r in tiendas), "tipo": "peso"}, {"t": "Guías", "v": sum(r["guias"] for r in tiendas), "tipo": "int"}],
+        "grafico": {"titulo": "Costo de producción por producto", "tipo": "peso", "filas": [{"nombre": r["producto"], "valor": r["costo"]} for r in prod[:10]]},
+        "hojas": [
+            hoja("Producción", [("Código", "codigo", "texto"), ("Producto", "producto", "texto"), ("Tipo", "tipo", "texto"), ("Categoría", "categoria", "texto"),
+                                ("Unidad", "unidad", "texto"), ("Lotes", "lotes", "int"), ("Cantidad", "cantidad", "num"), ("Costo total", "costo", "peso"),
+                                ("Costo unitario", "costo_unit", "precio")], prod, ("lotes", "costo")),
+            hoja("Despachos por tienda", [("Tienda", "tienda", "texto"), ("Guías", "guias", "int"), ("Neto", "neto", "peso")], tiendas, ("guias", "neto")),
+            hoja("Despachos por artículo", [("Tienda", "tienda", "texto"), ("Código", "codigo", "texto"), ("Artículo", "articulo", "texto"),
+                                            ("Categoría", "categoria", "texto"), ("Unidad", "unidad", "texto"), ("Guías", "guias", "int"),
+                                            ("Cantidad", "cantidad", "num"), ("Neto", "neto", "peso")], desp, ("neto",)),
+        ],
+        "nota": "Solo producciones y guías vigentes (sin anuladas). El filtro de tienda se aplica a los despachos.",
+    }
+
+
+def informe_compras(db, f):
+    fa, aa = filtro_articulo(f)
+    por_insumo = rows(db, f"""SELECT a.id, a.codigo, a.nombre insumo, ca.nombre categoria, u.abreviatura unidad, p.nombre proveedor,
+        COUNT(DISTINCT co.id) compras, ROUND(SUM(ci.cantidad),5) cantidad, ROUND(SUM(ci.cantidad*ci.precio),2) neto,
+        ROUND(SUM(ci.cantidad*ci.precio)/SUM(ci.cantidad),4) precio_prom,
+        (SELECT ci2.precio FROM compra_items ci2 JOIN compras c2 ON c2.id=ci2.compra_id WHERE ci2.articulo_id=a.id AND c2.proveedor_id=p.id
+           AND c2.estado='VIGENTE' AND c2.fecha BETWEEN ? AND ? ORDER BY c2.fecha DESC, c2.id DESC LIMIT 1) ultimo
+        FROM compra_items ci JOIN compras co ON co.id=ci.compra_id JOIN proveedores p ON p.id=co.proveedor_id JOIN articulos a ON a.id=ci.articulo_id
+        JOIN categorias ca ON ca.id=a.categoria_id JOIN unidades u ON u.id=a.unidad_id
+        WHERE co.estado='VIGENTE' AND co.fecha BETWEEN ? AND ?{fa} GROUP BY a.id, p.id ORDER BY a.nombre, neto DESC""",
+                      f["desde"], f["hasta"], f["desde"], f["hasta"], *aa)
+    ids = {r["id"] for r in por_insumo} if (f["categoria"] or f["articulo"]) else None
+    variacion = [v for v in variacion_precios(db, f["desde"], f["hasta"]) if ids is None or v["id"] in ids]
+    pendientes = rows(db, """SELECT co.id, co.fecha, p.nombre proveedor, co.documento, co.neto, co.total,
+        CAST(julianday(?) - julianday(co.fecha) AS INTEGER) dias FROM compras co JOIN proveedores p ON p.id=co.proveedor_id
+        WHERE co.tipo_documento='GUIA' AND co.estado='VIGENTE' AND co.factura_id IS NULL ORDER BY co.fecha""", hoy_d().isoformat())
+    por_prov = {}
+    for r in por_insumo:
+        por_prov[r["proveedor"]] = round(por_prov.get(r["proveedor"], 0) + r["neto"], 2)
+    return {
+        "resumen": [{"t": "Compras netas del período", "v": sum(r["neto"] for r in por_insumo), "tipo": "peso"},
+                    {"t": "Insumos comprados", "v": len({r["codigo"] for r in por_insumo}), "tipo": "int"},
+                    {"t": "Con alza de precio", "v": sum(1 for v in variacion if v["variacion"] > 0), "tipo": "int"},
+                    {"t": "Guías pendientes de factura", "v": len(pendientes), "tipo": "int"}],
+        "grafico": {"titulo": "Compras netas por proveedor", "tipo": "peso", "filas": [{"nombre": k, "valor": v} for k, v in sorted(por_prov.items(), key=lambda x: -x[1])[:10]]},
+        "hojas": [
+            hoja("Por insumo y proveedor", [("Código", "codigo", "texto"), ("Insumo", "insumo", "texto"), ("Categoría", "categoria", "texto"),
+                                            ("Unidad", "unidad", "texto"), ("Proveedor", "proveedor", "texto"), ("Compras", "compras", "int"),
+                                            ("Cantidad", "cantidad", "num"), ("Neto", "neto", "peso"), ("Precio promedio", "precio_prom", "precio"),
+                                            ("Último precio", "ultimo", "precio")], por_insumo, ("neto",)),
+            hoja("Variación de precios", [("Código", "codigo", "texto"), ("Insumo", "nombre", "texto"), ("Unidad", "unidad", "texto"), ("Compras", "compras", "int"),
+                                          ("Precio inicial", "inicial", "precio"), ("Último precio", "ultimo", "precio"), ("Mínimo", "minimo", "precio"),
+                                          ("Máximo", "maximo", "precio"), ("Variación %", "variacion", "pct"), ("Mejor precio con", "mejor_proveedor", "texto")], variacion),
+            hoja("Guías por facturar", [("Compra", "id", "int"), ("Fecha", "fecha", "fecha"), ("Proveedor", "proveedor", "texto"), ("N° guía", "documento", "texto"),
+                                        ("Neto", "neto", "peso"), ("Total", "total", "peso"), ("Días", "dias", "int")], pendientes, ("neto", "total")),
+        ],
+        "nota": "Compras vigentes del período (incluye guías de despacho). Las guías por facturar se muestran todas, sin importar el período.",
+    }
+
+
+INFORMES = {"ventas": ("Ventas y consumo de tiendas", informe_ventas), "inventario": ("Inventario valorizado", informe_inventario),
+            "produccion": ("Producción y despachos", informe_produccion), "compras": ("Compras por insumo", informe_compras)}
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+@ruta("GET", r"/api/informes/(ventas|inventario|produccion|compras)", "reportes")
+def informes(c, tipo):
+    f = filtros_informe(c)
+    titulo, fn = INFORMES[tipo]
+    r = fn(c.db, f)
+    if c.q.get("formato") == "xlsx":
+        partes = [f"Desde {f['desde']} hasta {f['hasta']}"]
+        if f["tienda"] is not None:
+            partes.append(nombre_bodega(c.db, f["tienda"]))
+        if f["categoria"]:
+            partes.append("Categoría: " + (scalar(c.db, "SELECT nombre FROM categorias WHERE id=?", f["categoria"]) or ""))
+        if f["articulo"]:
+            partes.append("Artículo: " + (scalar(c.db, "SELECT nombre FROM articulos WHERE id=?", f["articulo"]) or ""))
+        return Archivo(f"informe_{tipo}_{f['desde']}_{f['hasta']}.xlsx", libro_xlsx(titulo, " · ".join(partes), r), XLSX_MIME)
+    return {"titulo": titulo, "filtros": f, **r}
+
+
+def libro_xlsx(titulo, subtitulo, informe):
+    """Libro de Excel (.xlsx) con la biblioteca estándar: una hoja 'Resumen' y una por tabla del informe."""
+    import zipfile
+    from io import BytesIO
+    from xml.sax.saxutils import escape
+
+    def limpio(v):
+        return escape(re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", str(v)))
+
+    def col(n):
+        s = ""
+        while n:
+            n, r = divmod(n - 1, 26)
+            s = chr(65 + r) + s
+        return s
+
+    # estilos: 0 normal, 1 encabezado, 2 cantidad, 3 pesos, 4 porcentaje, 5 fecha, 6 título, 7 nota, 8 precio, 9 total texto, 10 total pesos, 11 total cantidad
+    estilo = {"num": 2, "peso": 3, "pct": 4, "fecha": 5, "precio": 8, "texto": 0, "int": 12}
+    estilo_total = {"peso": 10, "num": 11, "precio": 10, "int": 13}
+
+    def celda(ref, v, tipo, s=None):
+        if v is None or v == "":
+            return f'<c r="{ref}" s="{s or 0}"/>'
+        if tipo == "fecha":
+            try:
+                serial = (date.fromisoformat(str(v)[:10]) - date(1899, 12, 30)).days
+                return f'<c r="{ref}" s="{s or 5}"><v>{serial}</v></c>'
+            except ValueError:
+                tipo = "texto"
+        if tipo in ("num", "peso", "pct", "precio", "int") and isinstance(v, (int, float)):
+            return f'<c r="{ref}" s="{s if s is not None else estilo[tipo]}"><v>{v}</v></c>'
+        return f'<c r="{ref}" t="inlineStr" s="{s or 0}"><is><t xml:space="preserve">{limpio(v)}</t></is></c>'
+
+    def hoja_xml(cabecera, columnas, filas, totales=()):
+        out, fila = [], 1
+        for texto, s in cabecera:
+            out.append(f'<row r="{fila}">{celda(f"A{fila}", texto, "texto", s)}</row>')
+            fila += 1
+        fila += 1
+        enc = fila
+        out.append(f'<row r="{fila}">' + "".join(celda(f"{col(i + 1)}{fila}", c["t"], "texto", 1) for i, c in enumerate(columnas)) + "</row>")
+        for r in filas:
+            fila += 1
+            out.append(f'<row r="{fila}">' + "".join(celda(f"{col(i + 1)}{fila}", r.get(c["k"]), r.get("_tipo", "num") if c["tipo"] == "auto" else c["tipo"])
+                                                     for i, c in enumerate(columnas)) + "</row>")
+        if totales and filas:
+            fila += 1
+            cel = []
+            for i, c in enumerate(columnas):
+                ref = f"{col(i + 1)}{fila}"
+                if c["k"] in totales:
+                    cel.append(f'<c r="{ref}" s="{estilo_total.get(c["tipo"], 11)}"><f>SUM({col(i + 1)}{enc + 1}:{col(i + 1)}{fila - 1})</f></c>')
+                elif i == 0:
+                    cel.append(celda(ref, "Total", "texto", 9))
+            out.append(f'<row r="{fila}">{"".join(cel)}</row>')
+        anchos = []
+        for i, c in enumerate(columnas):
+            largo = max([len(str(c["t"]))] + [len(str(r.get(c["k"]) if r.get(c["k"]) is not None else "")) for r in filas[:500]])
+            anchos.append(f'<col min="{i + 1}" max="{i + 1}" width="{min(max(largo + 3, 10), 60)}" customWidth="1"/>')
+        ultima = col(max(len(columnas), 1))
+        return (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                f'<sheetViews><sheetView workbookViewId="0"><pane ySplit="{enc}" topLeftCell="A{enc + 1}" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
+                f'<cols>{"".join(anchos)}</cols><sheetData>{"".join(out)}</sheetData>'
+                + (f'<autoFilter ref="A{enc}:{ultima}{enc + len(filas)}"/>' if filas else "") + "</worksheet>")
+
+    hojas = [("Resumen", hoja_xml([(titulo, 6), (subtitulo, 7), (informe.get("nota", ""), 7)],
+                                  [{"t": "Indicador", "k": "t", "tipo": "texto"}, {"t": "Valor", "k": "v", "tipo": "auto"}],
+                                  [{"t": x["t"], "v": x["v"], "_tipo": x["tipo"]} for x in informe["resumen"]]))]
+    usados = {"Resumen"}
+    for h in informe["hojas"]:
+        nombre = re.sub(r"[\[\]:*?/\\]", "", h["nombre"])[:31] or "Hoja"
+        base, n = nombre, 2
+        while nombre in usados:
+            nombre = f"{base[:28]} {n}"
+            n += 1
+        usados.add(nombre)
+        hojas.append((nombre, hoja_xml([(f"{titulo} · {h['nombre']}", 6), (subtitulo, 7)], h["columnas"], h["filas"], h.get("totales", ()))))
+
+    estilos = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+               '<numFmts count="5"><numFmt numFmtId="164" formatCode="#,##0.00###"/><numFmt numFmtId="165" formatCode="&quot;$&quot;#,##0"/>'
+               '<numFmt numFmtId="166" formatCode="0.0&quot;%&quot;"/><numFmt numFmtId="167" formatCode="dd-mm-yyyy"/><numFmt numFmtId="168" formatCode="&quot;$&quot;#,##0.00"/></numFmts>'
+               '<fonts count="4"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font>'
+               '<font><b/><sz val="14"/><name val="Calibri"/></font><font><i/><sz val="10"/><color rgb="FF5C6167"/><name val="Calibri"/></font></fonts>'
+               '<fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>'
+               '<fill><patternFill patternType="solid"><fgColor rgb="FFBFE6F7"/><bgColor indexed="64"/></patternFill></fill></fills>'
+               '<borders count="2"><border><left/><right/><top/><bottom/><diagonal/></border><border><left/><right/><top/><bottom style="thin"/><diagonal/></border></borders>'
+               '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="14">'
+               '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+               '<xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1"/>'
+               '<xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
+               '<xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
+               '<xf numFmtId="166" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
+               '<xf numFmtId="167" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
+               '<xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+               '<xf numFmtId="0" fontId="3" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+               '<xf numFmtId="168" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
+               '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+               '<xf numFmtId="165" fontId="1" fillId="0" borderId="0" xfId="0" applyNumberFormat="1" applyFont="1"/>'
+               '<xf numFmtId="164" fontId="1" fillId="0" borderId="0" xfId="0" applyNumberFormat="1" applyFont="1"/>'
+               '<xf numFmtId="3" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
+               '<xf numFmtId="3" fontId="1" fillId="0" borderId="0" xfId="0" applyNumberFormat="1" applyFont="1"/>'
+               '</cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>')
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                   '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>'
+                   '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+                   '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+                   + "".join(f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+                             for i in range(1, len(hojas) + 1)) + "</Types>")
+        z.writestr("_rels/.rels", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                   '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>')
+        z.writestr("xl/workbook.xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+                   'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>'
+                   + "".join(f'<sheet name="{escape(n)}" sheetId="{i}" r:id="rId{i}"/>' for i, (n, _) in enumerate(hojas, 1)) + "</sheets></workbook>")
+        z.writestr("xl/_rels/workbook.xml.rels", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                   + "".join(f'<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{i}.xml"/>'
+                             for i in range(1, len(hojas) + 1))
+                   + f'<Relationship Id="rId{len(hojas) + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>')
+        z.writestr("xl/styles.xml", estilos)
+        for i, (_, x) in enumerate(hojas, 1):
+            z.writestr(f"xl/worksheets/sheet{i}.xml", x)
+    return buf.getvalue()
+
+
 def variacion_precios(db, desde, hasta):
     out = []
     for a in rows(db, """SELECT DISTINCT a.id, a.codigo, a.nombre, a.desechable, u.abreviatura unidad, c.nombre categoria FROM historial_precios h JOIN articulos a ON a.id=h.articulo_id
@@ -3459,7 +3832,7 @@ class Handler(BaseHTTPRequestHandler):
                     db.execute("COMMIT")
                     en_tx = False
                 if isinstance(resultado, Archivo):
-                    return self.responder(200, resultado.contenido, "application/octet-stream", descarga=resultado.nombre)
+                    return self.responder(200, resultado.contenido, resultado.tipo, descarga=resultado.nombre)
                 if isinstance(resultado, tuple):
                     return self.json(200, resultado[0], cookie=resultado[1])
                 if isinstance(resultado, dict) and isinstance(resultado.get("usuario"), dict):

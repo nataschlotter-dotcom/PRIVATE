@@ -20,7 +20,7 @@ const NAV = [
   ['Artículos', [['articulos', 'Productos e insumos'], ['inventario', 'Toma de inventario'], ['historial', 'Historial'], ['mermas', 'Mermas']]],
   ['Producción', [['recetas', 'Recetas'], ['produccion', 'Producción']]],
   ['Logística', [['despachos', 'Despachos a tiendas']]],
-  ['Gestión', [['reportes', 'Reportes']]],
+  ['Gestión', [['reportes', 'Reportes'], ['informes', 'Informes', ['reportes']]]],
   ['Administración', [['stock', 'Actualizar stock'], ['fudo', 'Integración Fudo', ['config']], ['usuarios', 'Usuarios y perfiles'], ['config', 'Configuración']]],
 ];
 
@@ -1592,6 +1592,60 @@ Vistas.despachos = async v => {
     });
   });
 };
+/* Guía en formato ticket para impresora térmica de 80 mm (Xprinter XP-80): 72 mm imprimibles, solo negro, sin logo
+   (en papel térmico sale como una mancha). Se imprime desde un iframe propio para usar su tamaño de página. */
+function imprimirTicketGuia(g) {
+  const num = String(g.id).padStart(6, '0');
+  const recibida = g.recepcion === 'RECIBIDA';
+  const fila = (a, b) => `<div class="f"><span>${a}</span><span>${b}</span></div>`;
+  const grupos = [...new Set(g.items.map(grupoDespacho))].map(titulo => `<div class="grupo">${esc(titulo)}</div>` + g.items.filter(i => grupoDespacho(i) === titulo).map(i =>
+    `<div class="it"><div class="nom">${esc(i.nombre)}</div>
+      <div class="f"><span>${esc(i.codigo)} · ${fCant(i.cantidad)} ${esc(i.unidad)} x ${fPrecio(i.precio)}</span><span>${fPeso(i.cantidad * i.precio)}</span></div>
+      ${recibida && i.recibido !== null && i.recibido < i.cantidad ? `<div class="f"><span>Recibido: ${fCant(i.recibido)} ${esc(i.unidad)}</span><span></span></div>` : ''}</div>`).join('')).join('');
+  const html = `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Guía ${num}</title><style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: #fff; color: #000; }
+    body { width: 72mm; margin: 0 auto; padding: 3mm 0 6mm; font: 12px/1.3 Arial, Helvetica, sans-serif; }
+    .c { text-align: center; } .b { font-weight: 700; }
+    .marca { font-size: 15px; font-weight: 700; letter-spacing: .5px; }
+    .tit { font-size: 12px; margin-top: 2px; } .num { font-size: 20px; font-weight: 700; margin: 2px 0 4px; }
+    .anulada { border: 2px solid #000; font-weight: 700; font-size: 14px; padding: 2px; margin: 4px 0; }
+    .sep { border-top: 1px dashed #000; margin: 5px 0; }
+    .f { display: flex; justify-content: space-between; gap: 6px; } .f span:last-child { text-align: right; white-space: nowrap; }
+    .dato { margin: 1px 0; word-wrap: break-word; }
+    .grupo { font-weight: 700; text-transform: uppercase; font-size: 11px; margin: 6px 0 2px; }
+    .it { margin-bottom: 4px; } .nom { font-weight: 700; word-wrap: break-word; }
+    .tot { font-size: 13px; } .tot.total { font-size: 15px; font-weight: 700; margin-top: 2px; }
+    .firma { margin-top: 16mm; border-top: 1px solid #000; text-align: center; padding-top: 2px; }
+    .legal { font-size: 9.5px; text-align: center; margin-top: 6mm; }
+  </style></head><body>
+    <div class="c"><div class="marca">NATA &amp; SCHLOTT</div><div class="tit">GUÍA DE DESPACHO INTERNA</div><div class="num">N° ${num}</div>
+      ${g.estado === 'ANULADO' ? '<div class="anulada">ANULADA</div>' : ''}</div>
+    <div class="sep"></div>
+    <div class="dato"><b>Fecha:</b> ${fFecha(g.fecha)}</div>
+    <div class="dato"><b>Origen:</b> Bodega central</div>
+    <div class="dato"><b>Destino:</b> ${esc(g.tienda)}</div>
+    <div class="dato"><b>Dirección:</b> ${esc(g.direccion)}, ${esc(g.comuna)}</div>
+    <div class="dato"><b>Transportista:</b> ${esc(g.transportista) || '—'} · <b>Patente:</b> ${esc(g.patente) || '—'}</div>
+    <div class="dato"><b>Emitida por:</b> ${esc(g.usuario)}</div>
+    <div class="sep"></div>${grupos}<div class="sep"></div>
+    <div class="f tot"><span>Neto</span><span>${fPeso(g.neto)}</span></div>
+    <div class="f tot"><span>IVA ${fNum(g.iva_pct, 0, 2)}%</span><span>${fPeso(g.iva)}</span></div>
+    <div class="f tot total"><span>TOTAL</span><span>${fPeso(g.total)}</span></div>
+    ${g.obs ? `<div class="sep"></div><div class="dato"><b>Observación:</b> ${esc(g.obs)}</div>` : ''}
+    <div class="firma">Entrega</div><div class="firma">Recibe conforme</div>
+    <div class="legal">Documento de control interno. No reemplaza la guía de despacho electrónica exigida por el SII.</div>
+  </body></html>`;
+  document.getElementById('ticket-80')?.remove();
+  const f = Object.assign(document.createElement('iframe'), { id: 'ticket-80', title: `Guía ${num} para impresora térmica` });
+  f.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0;visibility:hidden';
+  document.body.append(f);
+  f.contentDocument.open(); f.contentDocument.write(html); f.contentDocument.close();
+  // Página de 80 mm de ancho y tan alta como el ticket (el navegador no acepta alto "auto"): sin papel en blanco al final
+  const altoMm = Math.ceil(f.contentDocument.body.scrollHeight * 25.4 / 96) + 6;
+  f.contentDocument.head.insertAdjacentHTML('beforeend', `<style>@page { size: 80mm ${altoMm}mm; margin: 0; }</style>`);
+  setTimeout(() => { f.contentWindow.focus(); f.contentWindow.print(); }, 150);
+}
 async function verGuia(id) {
   const g = await api('GET', `/despachos/${id}`);
   const num = String(g.id).padStart(6, '0');
@@ -1605,8 +1659,9 @@ async function verGuia(id) {
     <div class="totales"><div><span>Neto</span><span>${fPeso(g.neto)}</span></div><div><span>IVA ${fNum(g.iva_pct, 0, 2)}%</span><span>${fPeso(g.iva)}</span></div><div class="total"><span>Total</span><span>${fPeso(g.total)}</span></div></div>
     ${g.obs ? `<p><b>Observación:</b> ${esc(g.obs)}</p>` : ''}<div class="firmas"><div>Entrega</div><div>Recibe conforme</div></div>
     <p class="legal">Documento de control interno. No reemplaza la guía de despacho electrónica exigida por el SII.</p>
-    <div class="modal-pie no-imprimir">${botonesGuiaFudo(g)}<button type="button" class="btn primario imprimir">Imprimir</button></div>`, true);
+    <div class="modal-pie no-imprimir">${botonesGuiaFudo(g)}<button type="button" class="btn imprimir-80">Imprimir en térmica (80 mm)</button><button type="button" class="btn primario imprimir">Imprimir</button></div>`, true);
   $('.imprimir', m.el).addEventListener('click', () => print());
+  $('.imprimir-80', m.el).addEventListener('click', () => imprimirTicketGuia(g));
   const rehacer = () => { m.cerrar(); render(); verGuia(id); };
   const llamar = async (ruta, cuerpo) => {
     const x = await api('POST', `/despachos/${id}${ruta}`, cuerpo || {});
@@ -1788,6 +1843,73 @@ const REP = {
   },
 };
 
+/* ---------- Informes (pantalla con filtros + Excel) ---------- */
+const INFORMES = [['ventas', 'Ventas y consumo de tiendas'], ['inventario', 'Inventario valorizado'], ['produccion', 'Producción y despachos'], ['compras', 'Compras por insumo']];
+let tabInf = 'ventas';
+const filtrosInf = { desde: haceDias(30), hasta: hoy(), tienda: '', categoria: '', articulo: '' };
+const fmtInf = {
+  texto: v => esc(v ?? ''), num: v => v == null ? '' : fCant(v), int: v => v == null ? '' : fNum(v), peso: v => v == null ? '' : fPeso(v),
+  precio: v => v == null ? '' : fPrecio(v), pct: v => v == null ? '' : fPct(v), fecha: v => v ? fFecha(String(v).slice(0, 10)) : '',
+};
+async function descargarInforme(tipo) {
+  const r = await fetch('/api/informes/' + tipo + qs({ ...filtrosInf, formato: 'xlsx' }), { credentials: 'same-origin', headers: zonaHoraria() });
+  if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || 'No se pudo generar el Excel.'); }
+  const nombre = (r.headers.get('Content-Disposition') || '').match(/filename="([^"]+)"/)?.[1] || `informe_${tipo}.xlsx`;
+  const url = URL.createObjectURL(await r.blob());
+  const a = Object.assign(document.createElement('a'), { href: url, download: nombre });
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+Vistas.informes = async v => {
+  v.innerHTML = cabecera('Informes', 'Elige el informe y los filtros. Puedes verlo aquí o descargarlo en Excel.');
+  v.append(pestanas(INFORMES, tabInf, k => { tabInf = k; render(); }));
+  const activas = S.cat.tiendas.filter(t => t.activo);
+  const bodegas = tabInf === 'inventario' ? [{ id: 0, nombre: 'Bodega central' }, ...activas] : tabInf === 'compras' ? [] : activas;
+  if (!bodegas.some(b => String(b.id) === String(filtrosInf.tienda))) filtrosInf.tienda = '';
+  const etiquetaHasta = tabInf === 'inventario' ? 'Stock al' : 'Hasta';
+  const fr = v.appendChild(document.createElement('form'));
+  fr.className = 'filtros sobre-gris';
+  fr.innerHTML = `<label>Desde<input type="date" name="desde" value="${filtrosInf.desde}"></label>
+    <label>${etiquetaHasta}<input type="date" name="hasta" value="${filtrosInf.hasta}"></label>
+    ${bodegas.length ? `<label>${tabInf === 'inventario' ? 'Bodega' : 'Tienda'}<select name="tienda">${opciones(bodegas, filtrosInf.tienda, 'Todas')}</select></label>` : ''}
+    <label>Categoría<select name="categoria">${opciones(S.cat.categorias, filtrosInf.categoria, 'Todas')}</select></label>
+    <label>Artículo<select name="articulo">${opciones(S.cat.articulos.map(a => ({ id: a.id, nombre: `${a.codigo} · ${a.nombre}` })), filtrosInf.articulo, 'Todos')}</select></label>
+    <button class="btn">Aplicar</button><button type="button" class="btn primario" id="inf-xlsx">Descargar Excel</button>`;
+  fr.addEventListener('submit', e => {
+    e.preventDefault();
+    for (const k of ['desde', 'hasta', 'tienda', 'categoria', 'articulo']) if (fr.elements[k]) filtrosInf[k] = fr.elements[k].value;
+    render();
+  });
+  $('#inf-xlsx', fr).addEventListener('click', async e => {
+    const b = e.currentTarget; b.disabled = true; b.textContent = 'Generando…';
+    try {
+      for (const k of ['desde', 'hasta', 'tienda', 'categoria', 'articulo']) if (fr.elements[k]) filtrosInf[k] = fr.elements[k].value;
+      await descargarInforme(tabInf); aviso('Excel descargado.');
+    } catch (x) { aviso(x.message, 1); } finally { b.disabled = false; b.textContent = 'Descargar Excel'; }
+  });
+  const d = await api('GET', '/informes/' + tabInf + qs(filtrosInf));
+  const z = v.appendChild(document.createElement('div'));
+  const k = z.appendChild(document.createElement('div')); k.className = 'kpis';
+  k.innerHTML = d.resumen.map(x => `<div class="kpi"><span>${esc(x.t)}</span><strong>${fmtInf[x.tipo](x.v)}</strong></div>`).join('');
+  if (d.grafico?.filas?.length) {
+    const g = z.appendChild(Object.assign(document.createElement('div'), { className: 'tarjeta' }));
+    g.innerHTML = `<h2>${esc(d.grafico.titulo)}</h2>${barras(d.grafico.filas, r => r.nombre, r => r.valor, d.grafico.tipo === 'peso' ? fPeso : fCant)}`;
+  }
+  if (d.nota) z.insertAdjacentHTML('beforeend', `<p class="nota" style="color:#e9eaea;margin:4px 2px 12px">${esc(d.nota)}</p>`);
+  for (const h of d.hojas) {
+    const t = z.appendChild(Object.assign(document.createElement('div'), { className: 'tarjeta' }));
+    t.innerHTML = `<h2>${esc(h.nombre)}</h2><div></div><div class="inf-totales"></div>`;
+    tabla(t.children[1], { filas: h.filas, vacio: 'Sin datos con estos filtros.', cols: h.columnas.map(c => ({
+      t: c.t, n: c.tipo !== 'texto', v: r => r[c.k] ?? '', h: r => fmtInf[c.tipo](r[c.k]) })) });
+    if (h.totales.length && h.filas.length) {
+      t.lastElementChild.innerHTML = '<b>Totales:</b> ' + h.totales.map(key => {
+        const c = h.columnas.find(x => x.k === key);
+        return `${esc(c.t)} ${fmtInf[c.tipo](h.filas.reduce((s, r) => s + (Number(r[key]) || 0), 0))}`;
+      }).join(' · ');
+    }
+  }
+};
+
 /* ---------- Usuarios y perfiles ---------- */
 let tabUsu = 'usuarios';
 Vistas.usuarios = async v => {
@@ -1911,7 +2033,7 @@ async function tarjetaPos(v) {
 }
 
 /* ---------- arranque y rutas ---------- */
-const PERMISO_RUTA = { compras: ['compras', 'proveedores'], fudo: ['config'] };
+const PERMISO_RUTA = { compras: ['compras', 'proveedores'], fudo: ['config'], informes: ['reportes'] };
 let turno = 0;
 function primeraRuta() {
   for (const [, items] of NAV) for (const [m, , alt] of items) if ((alt || [m]).some(x => can(x))) return m;
