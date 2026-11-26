@@ -2118,7 +2118,9 @@ Vistas.mantenimiento = async v => {
   c.innerHTML = `<h2>Cambiar unidad de medida</h2>
     <p class="nota">Convierte un artículo que ya tiene movimientos a otra unidad, por ejemplo de <b>g</b> a <b>kg</b>. Se convierten el stock de todas las bodegas, el historial, las compras, las guías, las mermas, las tomas de inventario y las recetas. Los precios y costos pasan a la nueva unidad, y los totales en pesos no cambian.</p>
     <form novalidate class="mt-form"><div class="campos">
-      <label class="campo todo"><span>Artículo</span><select name="articulo_id">${opciones(arts.map(a => ({ id: a.id, nombre: `${a.codigo} · ${a.nombre} (${a.unidad})${a.activo ? '' : ' · inactivo'}` })), '', 'Selecciona…')}</select></label>
+      <label class="campo"><span>Categoría</span><select name="mt_cat">${opciones([...new Set(arts.map(a => a.categoria))].sort((x, y) => x.localeCompare(y)).map(x => ({ id: x, nombre: x })), '', 'Todas las categorías')}</select></label>
+      <label class="campo"><span>Buscar</span><input name="mt_q" type="search" placeholder="Nombre o código" autocomplete="off"></label>
+      <label class="campo todo"><span>Artículo <span class="tenue mt-cuenta"></span></span><select name="articulo_id"></select></label>
       <label class="campo"><span>Nueva unidad de medida</span><select name="unidad_id">${opciones(S.cat.unidades.map(u => ({ id: u.id, nombre: `${u.nombre} (${u.abreviatura})` })), '', 'Selecciona…')}</select></label>
       <label class="campo"><span>Equivalencia</span>${inputNum('', '', 6).replace('<input', '<input name="equivalencia"')}<small class="mt-eq">Elige el artículo y la nueva unidad.</small></label>
       <label class="campo check todo mt-rec"><input type="checkbox" name="receta_anterior" checked><span>Seguir escribiendo las recetas en la unidad actual (queda como unidad de receta)</span></label>
@@ -2139,6 +2141,18 @@ Vistas.mantenimiento = async v => {
     const n = aNum(f.equivalencia.value);
     $('.mt-eq', c).textContent = n > 0 ? `1 ${nu} = ${fNum(n, 0, 6)} ${vi}` : `¿Cuántos ${vi} hay en 1 ${nu}?`;
   };
+  // Filtro por categoría y búsqueda por nombre o código (sin tildes); con una sola coincidencia, queda elegida
+  const llenar = () => {
+    const previo = f.articulo_id.value, palabras = sinTilde(f.mt_q.value.trim()).split(/\s+/).filter(Boolean);
+    const lista = arts.filter(a => (!f.mt_cat.value || a.categoria === f.mt_cat.value) && palabras.every(p => sinTilde(`${a.codigo} ${a.nombre}`).includes(p)));
+    f.articulo_id.innerHTML = opciones(lista.map(a => ({ id: a.id, nombre: `${a.codigo} · ${a.nombre} (${a.unidad})${a.activo ? '' : ' · inactivo'}` })),
+      lista.length === 1 ? lista[0].id : lista.some(a => String(a.id) === previo) ? previo : '', lista.length ? 'Selecciona…' : 'Sin coincidencias');
+    $('.mt-cuenta', c).textContent = `(${fNum(lista.length)} de ${fNum(arts.length)})`;
+    if (f.articulo_id.value !== previo) pinta(true);
+  };
+  f.mt_cat.addEventListener('change', llenar); f.mt_q.addEventListener('input', llenar);
+  f.mt_q.addEventListener('keydown', e => { if (e.key === 'Enter') e.preventDefault(); });
+  llenar();
   f.articulo_id.addEventListener('change', () => pinta(true)); f.unidad_id.addEventListener('change', () => pinta(true));
   f.equivalencia.addEventListener('input', () => pinta(false)); f.receta_anterior.addEventListener('change', () => { plan.innerHTML = ''; });
   const datos = () => {
