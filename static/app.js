@@ -540,7 +540,7 @@ Vistas.compras = async v => {
       { t: 'Factura', v: r => r.tipo_documento !== 'GUIA' || r.estado === 'ANULADO' ? '' : r.factura_doc ? 'Factura ' + r.factura_doc : 'Pendiente de factura',
         h: r => r.tipo_documento !== 'GUIA' || r.estado === 'ANULADO' ? '' : r.factura_doc ? etq('Factura ' + r.factura_doc, 'bien') : etq('Pendiente de factura', 'alerta') },
       { t: '', h: r => `<div class="acciones">${accion('ver', 'Ver')}${puedeEditarCompra(r) ? accion('editar', 'Editar') : ''}${r.estado !== 'ANULADO' && !r.factura_doc && can('compras', 2) && puede('anular_compras') ? accion('anular', 'Anular', 'peligro') : ''}</div>` }] });
-    $('#nueva', v)?.addEventListener('click', nuevaCompra);
+    $('#nueva', v)?.addEventListener('click', () => nuevaCompra());
   } else if (t === 'guias') {
     await vistaGuiasPorFacturar(v, c);
   } else if (t === 'proveedores') {
@@ -631,6 +631,7 @@ const puedeEditarCompra = c => c.estado === 'VIGENTE' && !c.factura_doc && can('
 async function editarCompra(id) { nuevaCompra(await api('GET', `/compras/${id}`)); }
 function nuevaCompra(c = null) {
   // c = compra existente: se edita (mismos campos y detalle; el stock y los precios se ajustan por la diferencia)
+  if (!c?.id || !Array.isArray(c.items)) c = null;  // cualquier otra cosa (ej. el evento de un clic) es una compra nueva
   const activos = S.cat.proveedores.filter(p => p.activo || (c && p.id === c.proveedor_id));
   const pct = c ? c.iva_pct : S.cat.iva;
   const m = modal(c ? `Editar compra #${c.id}` : 'Registrar compra', `<form novalidate>${c ? '<p class="nota">Cambia cantidades o precios, quita o agrega líneas. El stock de la bodega central se ajusta solo por la diferencia, y se recalculan el último precio y el costo promedio de cada insumo modificado.</p>' : ''}
@@ -1627,6 +1628,7 @@ const puedeEditarGuia = g => g.estado === 'VIGENTE' && g.recepcion !== 'RECIBIDA
   && (!g.fudo_stock_estado || g.fudo_stock_estado === 'REVERTIDO') && can('despachos', 2) && puede('editar_despachos') && !S.usuario.tienda_id;
 async function formularioGuia(g = null) {
   // g = guía existente: se edita (cantidades, precios, líneas y datos de transporte; la tienda no cambia)
+  if (!g?.id || !Array.isArray(g.items)) g = null;  // cualquier otra cosa (ej. el evento de un clic) es una guía nueva
   const central = await api('GET', '/stock/central');
   const stock = Object.fromEntries(central.map(a => [a.articulo_id, a.cantidad]));
   if (g) for (const i of g.items) stock[i.articulo_id] = (stock[i.articulo_id] || 0) + i.cantidad;  // lo de esta guía también está disponible
