@@ -1266,6 +1266,47 @@ A("PUT", f"/despachos/{gc}", {"items": [{"articulo_id": edv, "cantidad": 2}]}, 4
 perf = {p["nombre"]: p for p in A("GET", "/perfiles")}
 assert "acc_editar_compras" not in json.dumps(perf["Gerencia"]["permisos"])
 
+# Unidad de receta: se compra en kg, la receta se escribe en g y se descuenta en kg
+g_ = next(u["id"] for u in cat["unidades"] if u["abreviatura"] == "g")
+ml_ = next(u["id"] for u in cat["unidades"] if u["abreviatura"] == "ml")
+azu = A("POST", "/articulos", {"tipo": "INSUMO", "nombre": "Azúcar UR", "categoria_id": cid, "unidad_id": kg, "precio": 2000,
+                               "unidad_receta_id": g_, "factor_receta": 1000})["id"]
+A("POST", "/articulos", {"tipo": "INSUMO", "nombre": "Sin factor", "categoria_id": cid, "unidad_id": kg, "unidad_receta_id": g_}, 400)
+ficha = next(x for x in A("GET", "/articulos") if x["id"] == azu)
+assert ficha["unidad"] == "kg" and ficha["unidad_receta"] == "g" and ficha["factor_receta"] == 1000
+# la misma unidad, un producto o un desechable no llevan unidad de receta
+igual = A("POST", "/articulos", {"tipo": "INSUMO", "nombre": "Igual UR", "categoria_id": cid, "unidad_id": kg, "unidad_receta_id": kg, "factor_receta": 5})["id"]
+assert next(x for x in A("GET", "/articulos") if x["id"] == igual)["unidad_receta"] == "kg"
+gall = A("POST", "/articulos", {"tipo": "PRODUCTO", "nombre": "Galleta UR", "categoria_id": cid_prod, "unidad_id": un, "precio": 500,
+                                "unidad_receta_id": g_, "factor_receta": 1000})["id"]
+assert next(x for x in A("GET", "/articulos") if x["id"] == gall)["unidad_receta"] == "un"
+A("POST", "/compras", {"tipo_documento": "FACTURA", "proveedor_id": prov, "items": [{"articulo_id": azu, "cantidad": 2, "precio": 2000}]})  # 2 kg
+casi(stock()[azu], 2)
+A("PUT", f"/recetas/{gall}", {"rendimiento": 10, "items": [{"articulo_id": azu, "cantidad": 250}]})  # 250 g por 10 galletas
+rec = next(r for r in A("GET", "/recetas") if r["articulo_id"] == gall)
+it = rec["items"][0]
+casi(it["cantidad"], 0.25); casi(it["cantidad_receta"], 250); assert it["unidad"] == "kg" and it["unidad_receta"] == "g"
+casi(rec["costo_unit"], 0.25 * 2000 / 10)  # el costo sigue en pesos por kg
+casi(rec["max_producible"], 80)
+pr = A("POST", "/produccion", {"articulo_id": gall, "cantidad": 40})["id"]  # 4 × 250 g = 1 kg
+casi(stock()[azu], 1)
+imp = A("GET", "/produccion/impresion?desde=2000-01-01&hasta=2100-12-31")
+li = next(o for o in imp["ordenes"] if o["id"] == pr)["items"][0]
+casi(li["cantidad"], 1); assert li["unidad"] == "kg" and li["unidad_receta"] == "g" and li["factor_receta"] == 1000
+err = A("POST", "/produccion", {"articulo_id": gall, "cantidad": 60}, 409)  # 1,5 kg: falta 0,5 kg = 500 g
+assert "0.5 kg (500 g)" in json.dumps(err, ensure_ascii=False), err
+# corregir la equivalencia (misma unidad de receta) conserva lo escrito en la receta: 250 g
+A("PUT", f"/articulos/{azu}", {"tipo": "INSUMO", "nombre": "Azúcar UR", "categoria_id": cid, "unidad_id": kg, "precio": 2000, "unidad_receta_id": g_, "factor_receta": 500})
+it = next(r for r in A("GET", "/recetas") if r["articulo_id"] == gall)["items"][0]
+casi(it["cantidad_receta"], 250); casi(it["cantidad"], 0.5)
+# quitar la unidad de receta deja la receta en kg, con la misma cantidad real
+A("PUT", f"/articulos/{azu}", {"tipo": "INSUMO", "nombre": "Azúcar UR", "categoria_id": cid, "unidad_id": kg, "precio": 2000, "unidad_receta_id": ""})
+it = next(r for r in A("GET", "/recetas") if r["articulo_id"] == gall)["items"][0]
+casi(it["cantidad"], 0.5); casi(it["cantidad_receta"], 0.5); assert it["unidad_receta"] == "kg"
+# la unidad de stock no cambia si hay movimientos (compras e informes están en ella)
+A("PUT", f"/articulos/{azu}", {"tipo": "INSUMO", "nombre": "Azúcar UR", "categoria_id": cid, "unidad_id": g_, "precio": 2000}, 409)
+A("PUT", f"/articulos/{igual}", {"tipo": "INSUMO", "nombre": "Igual UR", "categoria_id": cid, "unidad_id": ml_})  # sin movimientos, sí
+
 # Datos de ejemplo: base nueva, y coherencia del historial
 os.environ["NS_DB"] = app.DB_PATH = os.path.join(tempfile.mkdtemp(), "demo.db")
 c = app.conectar()

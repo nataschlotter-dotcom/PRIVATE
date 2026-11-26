@@ -981,28 +981,57 @@ Vistas.articulos = async v => {
     const inicial = r || { tipo: despachable ? 'INSUMO' : tabArt, desechable: despachable };
     const esPuntoVenta = tabArt === 'PUNTO_VENTA';
     const categorias = S.cat.categorias.filter(x => inicial.tipo === 'INSUMO' ? !x.de_productos && !!x.punto_venta === esPuntoVenta : !!x.de_productos);
-    formulario(r ? `Editar artículo ${r.codigo}` : 'Nuevo artículo', [
+    const ingrediente = tabArt === 'INSUMO' || tabArt === 'SUBPRODUCTO';  // solo los ingredientes pueden ir en otra unidad en las recetas
+    const m = formulario(r ? `Editar artículo ${r.codigo}` : 'Nuevo artículo', [
       { k: 'nombre', t: 'Nombre', todo: 1, ayuda: r ? '' : 'El código se asigna automáticamente al guardar.' },
       { k: 'categoria_id', t: 'Clasificación o categoría', tipo: 'select', op: categorias, vacio: 'Selecciona…' },
-      { k: 'unidad_id', t: 'Unidad de medida', tipo: 'select', op: S.cat.unidades, vacio: 'Selecciona…' },
+      { k: 'unidad_id', t: 'Unidad de medida', tipo: 'select', op: S.cat.unidades, vacio: 'Selecciona…', ayuda: ingrediente ? 'La de compra y stock: los informes se ven en esta unidad.' : '' },
+      ...(ingrediente ? [
+        { k: 'unidad_receta_id', t: 'Unidad en recetas', tipo: 'select', op: S.cat.unidades, vacio: 'La misma unidad de medida', ayuda: 'Ej.: se compra en kg y la receta se escribe en g.' },
+        { k: 'factor_receta', t: 'Equivalencia', tipo: 'num', dec: 6, ayuda: 'Unidades de receta en 1 unidad de medida.' }] : []),
       { k: 'stock_minimo', t: 'Stock mínimo', tipo: 'num', dec: 5, min: 5, ayuda: 'Se muestra con miles y 5 decimales.' },
       { k: 'precio', t: inicial.tipo === 'INSUMO' ? 'Precio de compra neto' : inicial.tipo === 'PRODUCTO' ? 'Precio de venta neto' : 'Precio', tipo: 'num', dec: 2, ayuda: 'Con separador de miles.' },
       ...(r ? [{ k: 'activo', t: 'Artículo activo', tipo: 'check', todo: 1 }] : [])], inicial,
     async d => {
       const x = await api(r ? 'PUT' : 'POST', '/articulos' + (r ? '/' + r.id : ''), { ...d, tipo: inicial.tipo, desechable: inicial.desechable, punto_venta: esPuntoVenta });
-      aviso(x.codigo ? `Artículo creado con el código ${x.codigo}.` : 'Artículo guardado.'); render();
+      aviso(x.codigo ? `Artículo creado con el código ${x.codigo}.` : 'Artículo guardado.'); await cargarCat(); render();
     });
+    if (ingrediente) equivalenciaReceta(m.el);
   };
   $('#n', v)?.addEventListener('click', () => form());
   tabla(c, { filas, csv: 'articulos', vacio: 'Sin artículos en esta clasificación.', acciones: { editar: form,
     borrar: r => confirmar('Eliminar artículo', `¿Eliminar "${r.nombre}"? No se podrá si tiene stock, recetas, compras, despachos u otros registros.`, async () => { await api('DELETE', `/articulos/${r.id}`); aviso('Artículo eliminado.'); render(); }, 'Eliminar') }, cols: [
-    { t: 'Código', v: r => r.codigo }, { t: 'Nombre', v: r => r.nombre }, { t: 'Categoría', v: r => r.categoria }, { t: 'Unidad', v: r => r.unidad },
+    { t: 'Código', v: r => r.codigo }, { t: 'Nombre', v: r => r.nombre }, { t: 'Categoría', v: r => r.categoria },
+    { t: 'Unidad', v: r => r.unidad, h: r => r.unidad_receta !== r.unidad ? `${esc(r.unidad)} <span class="tenue">· receta en ${esc(r.unidad_receta)} (1 ${esc(r.unidad)} = ${fNum(r.factor_receta, 0, 6)} ${esc(r.unidad_receta)})</span>` : esc(r.unidad) },
     { t: 'Stock mínimo', n: 1, v: r => r.stock_minimo, h: r => fMin(r.stock_minimo) },
     { t: 'Stock central', n: 1, v: r => r.stock, h: r => `${fCant(r.stock)}${r.stock < r.stock_minimo ? ' ' + etq('Bajo mínimo', 'mal') : ''}` },
     { t: 'Precio', n: 1, v: r => r.precio, h: r => fPrecio(r.precio) },
     { t: 'Estado', v: r => r.activo ? 'Activo' : 'Inactivo', h: r => r.activo ? etq('Activo', 'bien') : etq('Inactivo') },
     { t: '', h: () => edita ? `<div class="acciones">${accion('editar', 'Editar')}${puede('eliminar_registros') ? accion('borrar', 'Eliminar', 'peligro') : ''}</div>` : '' }] });
 };
+
+/* Unidad de receta en el formulario de artículo: propone la equivalencia de pares conocidos (kg→g, L→ml…) y la explica */
+const EQUIVALENCIAS = { 'kg>g': 1000, 'g>mg': 1000, 'kg>mg': 1e6, 'l>ml': 1000, 'l>cc': 1000 };
+function equivalenciaReceta(raiz) {
+  const uni = $('[name="unidad_id"]', raiz), ur = $('[name="unidad_receta_id"]', raiz), fac = $('[name="factor_receta"]', raiz);
+  const abrev = s => S.cat.unidades.find(u => String(u.id) === s.value)?.abreviatura || '';
+  const ayuda = fac.closest('.campo').querySelector('small'), campo = fac.closest('.campo');
+  const pinta = sugerir => {
+    const a = abrev(uni), b = abrev(ur), usa = !!b && ur.value !== uni.value;
+    campo.style.display = usa ? '' : 'none';
+    if (!usa) return;
+    const sug = EQUIVALENCIAS[`${a.toLowerCase()}>${b.toLowerCase()}`];
+    if (sugerir && sug) fac.value = fNum(sug, 0, 6);
+    const n = aNum(fac.value);
+    ayuda.textContent = n > 0 ? `1 ${a || 'unidad'} = ${fNum(n, 0, 6)} ${b}. El stock, las compras y los informes quedan en ${a || 'la unidad de medida'}.` : `¿Cuántos ${b} hay en 1 ${a || 'unidad de medida'}?`;
+  };
+  uni.addEventListener('change', () => pinta(true)); ur.addEventListener('change', () => pinta(true)); fac.addEventListener('input', () => pinta(false));
+  if (!ur.value) fac.value = '';
+  pinta(!fac.value);
+}
+/* Cantidad de un ingrediente en su unidad de receta, con la de stock al lado cuando son distintas (ej. 250 g · 0,25 kg) */
+const cantReceta = (q, i) => i.unidad_receta && i.unidad_receta !== i.unidad
+  ? `${fNum(q * i.factor_receta, 0, 3)} ${esc(i.unidad_receta)} <span class="tenue">· ${fCant(q)} ${esc(i.unidad)}</span>` : `${fCant(q)} ${esc(i.unidad)}`;
 
 /* ---------- Toma de inventario ---------- */
 const nombreToma = r => {
@@ -1376,7 +1405,7 @@ Vistas.stock = async v => {
 /* ---------- Recetas ---------- */
 Vistas.recetas = async v => {
   const filas = await api('GET', '/recetas');
-  v.innerHTML = cabecera('Recetas', 'Al producir, se descuentan del stock los insumos y subproductos de la receta. Las cantidades van en la unidad de cada ingrediente.');
+  v.innerHTML = cabecera('Recetas', 'Al producir, se descuentan del stock los insumos y subproductos de la receta. Las cantidades van en la unidad de receta de cada ingrediente (ej. g) y se descuentan convertidas a su unidad de compra (ej. kg).');
   const c = v.appendChild(Object.assign(document.createElement('div'), { className: 'tarjeta' }));
   const edita = can('recetas', 2);
   tabla(c, { filas, csv: 'recetas', vacio: 'Primero crea productos o subproductos.', acciones: {
@@ -1391,12 +1420,12 @@ Vistas.recetas = async v => {
 };
 function verReceta(r) {
   modal(`Receta: ${r.nombre}`, `<p><b>Rendimiento:</b> ${fCant(r.rendimiento)} ${esc(r.unidad)} · <b>Costo unitario:</b> ${fPrecio(r.costo_unit)}</p>
-    <div class="tabla-marco"><table><thead><tr><th>Ingrediente</th><th class="n">Cantidad</th><th class="n">Costo</th><th class="n">Stock central</th></tr></thead><tbody>${r.items.map(i => `<tr><td>${esc(i.nombre)}</td><td class="n">${fCant(i.cantidad)} ${esc(i.unidad)}</td><td class="n">${fPeso(i.cantidad * i.costo_unit)}</td><td class="n">${fCant(i.stock)} ${esc(i.unidad)}</td></tr>`).join('')}</tbody></table></div>
+    <div class="tabla-marco"><table><thead><tr><th>Ingrediente</th><th class="n">Cantidad</th><th class="n">Costo</th><th class="n">Stock central</th></tr></thead><tbody>${r.items.map(i => `<tr><td>${esc(i.nombre)}</td><td class="n">${cantReceta(i.cantidad, i)}</td><td class="n">${fPeso(i.cantidad * i.costo_unit)}</td><td class="n">${fCant(i.stock)} ${esc(i.unidad)}</td></tr>`).join('')}</tbody></table></div>
     ${r.instrucciones ? `<h3 style="font-size:14px;margin:14px 0 4px">Preparación</h3><p style="white-space:pre-line;margin:0">${esc(r.instrucciones)}</p>` : ''}`, true);
 }
 function editarReceta(r, recetas) {
   const m = modal(`Receta: ${r.nombre}`, `<form novalidate><div class="campos"><label class="campo"><span>Rendimiento (${esc(r.unidad)})</span>${inputNum('', r.rendimiento ?? 1, 5).replace('<input', '<input name="rendimiento"')}<small>Cantidad de ${esc(r.nombre)} que resulta de estas cantidades.</small></label></div>
-    <h3 style="font-size:14px;margin:14px 0 6px">Ingredientes</h3><p class="tenue" style="margin:0 0 6px">Escribe la cantidad en la unidad del ingrediente: por ejemplo, 0,250 kg para 250 g. El costo se calcula con el último precio del insumo.</p><div id="lin"></div><div class="totales" id="tot"></div>
+    <h3 style="font-size:14px;margin:14px 0 6px">Ingredientes</h3><p class="tenue" style="margin:0 0 6px">Escribe la cantidad en la unidad de receta de cada ingrediente (la columna Unidad; ej. g para la harina que se compra en kg). Al producir se descuenta convertida a su unidad de stock. El costo se calcula con el último precio del insumo.</p><div id="lin"></div><div class="totales" id="tot"></div>
     <label class="campo" style="margin-top:12px"><span>Preparación</span><textarea name="instrucciones" rows="4">${esc(r.instrucciones || '')}</textarea></label><div class="error" hidden></div>
     <div class="modal-pie"><button type="button" class="btn cerrar">Cancelar</button><button class="btn primario">Guardar receta</button></div></form>`, true);
   $$('.cerrar', m.el).forEach(b => b.addEventListener('click', m.cerrar));
@@ -1407,12 +1436,14 @@ function editarReceta(r, recetas) {
     const total = ed ? ed.neto() : 0, rend = aNum(f.rendimiento.value) || 0;
     $('#tot', m.el).innerHTML = `<div><span>Costo de los ingredientes</span><span>${fPrecio(total)}</span></div><div class="total"><span>Costo por ${esc(r.unidad)}</span><span>${rend > 0 ? fPrecio(total / rend) : '—'}</span></div>`;
   };
-  const ingredientes = S.cat.articulos.filter(a => a.id !== r.articulo_id && (a.tipo === 'SUBPRODUCTO' || (a.tipo === 'INSUMO' && !a.desechable)));
+  // En la receta cada ingrediente se ve y se escribe en su unidad de receta; el precio, por esa unidad
+  const ingredientes = S.cat.articulos.filter(a => a.id !== r.articulo_id && (a.tipo === 'SUBPRODUCTO' || (a.tipo === 'INSUMO' && !a.desechable)))
+    .map(a => ({ ...a, unidad: a.unidad_receta || a.unidad, factor_receta: a.factor_receta || 1 }));
   const grupos = [{ nombre: 'Subproductos (rellenos y bases)', filtro: a => a.tipo === 'SUBPRODUCTO' },
     ...[...new Set(ingredientes.filter(a => a.tipo === 'INSUMO').map(a => a.categoria))].sort((x, y) => x.localeCompare(y)).map(cat => ({ nombre: `Insumos · ${cat}`, filtro: a => a.tipo === 'INSUMO' && a.categoria === cat }))];
-  ed = editorLineas($('#lin', m.el), { articulos: ingredientes, valores: r.items, grupos,
+  ed = editorLineas($('#lin', m.el), { articulos: ingredientes, valores: (r.items || []).map(i => ({ articulo_id: i.articulo_id, cantidad: i.cantidad_receta ?? i.cantidad })), grupos,
     precio: 'Precio', subtotal: 'Costo', porUnidad: true, fSubtotal: fPrecio, alCambiar: totales,
-    precioDe: a => a.tipo === 'SUBPRODUCTO' ? costoSub[a.id] || 0 : a.precio || 0 });
+    precioDe: a => (a.tipo === 'SUBPRODUCTO' ? costoSub[a.id] || 0 : a.precio || 0) / a.factor_receta });
   f.rendimiento.addEventListener('input', totales);
   totales();
   conEnvio(f, m, async () => {
@@ -1428,7 +1459,7 @@ function imprimirProduccion(d) {
   const periodo = d.desde === d.hasta ? fFecha(d.desde) : `${fFecha(d.desde)} al ${fFecha(d.hasta)}`;
   const orden = o => `<div class="orden"><h3>Orden N° ${String(o.id).padStart(6, '0')} · ${esc(o.codigo)} ${esc(o.nombre)}</h3>
     <div class="guia-datos"><div><b>Fecha:</b> ${fFecha(o.fecha)}</div><div><b>Cantidad:</b> ${fCant(o.cantidad)} ${esc(o.unidad)}</div><div><b>Costo total:</b> ${fPeso(o.costo_total)}</div><div><b>Registrada por:</b> ${esc(o.usuario) || '—'}</div>${o.obs ? `<div><b>Observación:</b> ${esc(o.obs)}</div>` : ''}</div>
-    <div class="tabla-marco"><table><thead><tr><th>Código</th><th>Ingrediente</th><th class="n">Cantidad usada</th><th class="n">Costo</th></tr></thead><tbody>${o.items.map(i => `<tr><td>${esc(i.codigo)}</td><td>${esc(i.nombre)}</td><td class="n">${fCant(i.cantidad)} ${esc(i.unidad)}</td><td class="n">${fPeso(i.cantidad * i.costo_unit)}</td></tr>`).join('') || '<tr><td colspan="4" class="vacio">Sin ingredientes registrados.</td></tr>'}</tbody></table></div></div>`;
+    <div class="tabla-marco"><table><thead><tr><th>Código</th><th>Ingrediente</th><th class="n">Cantidad usada</th><th class="n">Costo</th></tr></thead><tbody>${o.items.map(i => `<tr><td>${esc(i.codigo)}</td><td>${esc(i.nombre)}</td><td class="n">${cantReceta(i.cantidad, i)}</td><td class="n">${fPeso(i.cantidad * i.costo_unit)}</td></tr>`).join('') || '<tr><td colspan="4" class="vacio">Sin ingredientes registrados.</td></tr>'}</tbody></table></div></div>`;
   const m = modal('Órdenes de producción', `<div class="guia-cab"><div class="guia-marca"><img src="${esc(logo())}" alt=""><div><strong>Nata &amp; Schlott</strong><span class="tenue">Sistema de producción y logística</span></div></div>
     <div class="guia-num"><span>Órdenes de producción</span><strong>${periodo}</strong></div></div>
     ${d.ordenes.length ? `<h3 class="sub-imp">Resumen del período</h3><div class="tabla-marco"><table><thead><tr><th>Código</th><th>Artículo</th><th class="n">Órdenes</th><th class="n">Cantidad</th><th class="n">Costo total</th></tr></thead><tbody>${Object.values(resumen).map(r => `<tr><td>${esc(r.codigo)}</td><td>${esc(r.nombre)}</td><td class="n">${fNum(r.ordenes)}</td><td class="n">${fCant(r.cantidad)} ${esc(r.unidad)}</td><td class="n">${fPeso(r.costo)}</td></tr>`).join('')}</tbody></table></div>
@@ -1468,7 +1499,7 @@ Vistas.produccion = async v => {
       const fac = q / r.rendimiento;
       caja.innerHTML = `<p class="tenue" style="margin:0 0 6px">Con el stock actual se pueden fabricar hasta ${fCant(Math.floor(r.max_producible))} ${esc(r.unidad)}.</p><div class="tabla-marco"><table><thead><tr><th>Ingrediente</th><th class="n">Se descuenta</th><th class="n">Disponible</th><th></th></tr></thead><tbody>${r.items.map(i => {
         const req = i.cantidad * fac;
-        return `<tr><td>${esc(i.nombre)}</td><td class="n">${fCant(req)} ${esc(i.unidad)}</td><td class="n">${fCant(i.stock)} ${esc(i.unidad)}</td><td>${req > i.stock ? etq('Falta', 'mal') : q ? etq('Alcanza', 'bien') : ''}</td></tr>`;
+        return `<tr><td>${esc(i.nombre)}</td><td class="n">${cantReceta(req, i)}</td><td class="n">${fCant(i.stock)} ${esc(i.unidad)}</td><td>${req > i.stock ? etq('Falta', 'mal') : q ? etq('Alcanza', 'bien') : ''}</td></tr>`;
       }).join('')}</tbody></table></div>`;
     };
     f.addEventListener('input', pinta); f.articulo_id.addEventListener('change', pinta);

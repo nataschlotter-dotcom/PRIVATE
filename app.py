@@ -134,7 +134,8 @@ CREATE TABLE IF NOT EXISTS motivos_merma(id INTEGER PRIMARY KEY, nombre TEXT NOT
 CREATE TABLE IF NOT EXISTS articulos(id INTEGER PRIMARY KEY, tipo TEXT NOT NULL CHECK(tipo IN ('PRODUCTO','SUBPRODUCTO','INSUMO')),
   desechable INTEGER NOT NULL DEFAULT 0, categoria_id INTEGER NOT NULL REFERENCES categorias(id),
   unidad_id INTEGER NOT NULL REFERENCES unidades(id), codigo TEXT NOT NULL UNIQUE COLLATE NOCASE, nombre TEXT NOT NULL,
-  stock_minimo REAL NOT NULL DEFAULT 0, precio REAL NOT NULL DEFAULT 0, costo REAL NOT NULL DEFAULT 0, activo INTEGER NOT NULL DEFAULT 1);
+  stock_minimo REAL NOT NULL DEFAULT 0, precio REAL NOT NULL DEFAULT 0, costo REAL NOT NULL DEFAULT 0, activo INTEGER NOT NULL DEFAULT 1,
+  unidad_receta_id INTEGER REFERENCES unidades(id), factor_receta REAL NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS stock(bodega_id INTEGER NOT NULL, articulo_id INTEGER NOT NULL REFERENCES articulos(id),
   cantidad REAL NOT NULL DEFAULT 0, PRIMARY KEY(bodega_id, articulo_id));
 CREATE TABLE IF NOT EXISTS recetas(articulo_id INTEGER PRIMARY KEY REFERENCES articulos(id), rendimiento REAL NOT NULL, instrucciones TEXT NOT NULL DEFAULT '');
@@ -328,8 +329,15 @@ def stock_de(db, bodega, articulo):
     return float(scalar(db, "SELECT cantidad FROM stock WHERE bodega_id=? AND articulo_id=?", bodega, articulo))
 
 
+# Unidad de receta: el stock, las compras y los informes van en la unidad del artículo (ej. kg); las recetas se escriben
+# en la unidad de receta (ej. g) y se guardan convertidas: 1 unidad del artículo = factor_receta unidades de receta.
+SQL_UNI_RECETA = ("COALESCE(ur.abreviatura, u.abreviatura) unidad_receta, "
+                  "CASE WHEN a.unidad_receta_id IS NULL THEN 1 ELSE a.factor_receta END factor_receta")
+JOIN_UNI_RECETA = "LEFT JOIN unidades ur ON ur.id=a.unidad_receta_id"
+
+
 def articulo(db, art_id):
-    a = row(db, "SELECT a.*, u.abreviatura unidad FROM articulos a JOIN unidades u ON u.id=a.unidad_id WHERE a.id=?", art_id)
+    a = row(db, f"SELECT a.*, u.abreviatura unidad, {SQL_UNI_RECETA} FROM articulos a JOIN unidades u ON u.id=a.unidad_id {JOIN_UNI_RECETA} WHERE a.id=?", art_id)
     if not a:
         raise ApiError(404, "Artículo no encontrado.")
     return a
@@ -490,9 +498,11 @@ def crear_devolucion(db, uid, d):
 def receta_de(db, art_id):
     r = row(db, "SELECT * FROM recetas WHERE articulo_id=?", art_id)
     if r:
-        r["items"] = rows(db, "SELECT ri.articulo_id, ri.cantidad, a.codigo, a.nombre, a.tipo, a.costo, a.precio, u.abreviatura unidad "
-                              "FROM receta_items ri JOIN articulos a ON a.id=ri.articulo_id JOIN unidades u ON u.id=a.unidad_id "
+        r["items"] = rows(db, f"SELECT ri.articulo_id, ri.cantidad, a.codigo, a.nombre, a.tipo, a.costo, a.precio, u.abreviatura unidad, {SQL_UNI_RECETA} "
+                              f"FROM receta_items ri JOIN articulos a ON a.id=ri.articulo_id JOIN unidades u ON u.id=a.unidad_id {JOIN_UNI_RECETA} "
                               "WHERE ri.receta_id=? ORDER BY a.nombre", art_id)
+        for i in r["items"]:  # cantidad: en la unidad del artículo (la que descuenta stock); cantidad_receta: en la unidad de receta
+            i["cantidad_receta"] = round(i["cantidad"] * i["factor_receta"], 6)
     return r
 
 
@@ -524,7 +534,10 @@ def crear_produccion(db, uid, d):
         req = round(i["cantidad"] * factor, 5)
         hay = stock_de(db, CENTRAL, i["articulo_id"])
         if hay < req:
-            faltantes.append(f"{i['nombre']}: faltan {round(req - hay, 5):g} {i['unidad']}")
+            falta = f"{round(req - hay, 5):g} {i['unidad']}"
+            if i["unidad_receta"] != i["unidad"]:
+                falta += f" ({round((req - hay) * i['factor_receta'], 3):g} {i['unidad_receta']})"
+            faltantes.append(f"{i['nombre']}: faltan {falta}")
     if faltantes:
         raise ApiError(409, "No hay stock suficiente para producir. " + "; ".join(faltantes) + ".")
     memo = {}  # ingredientes al último precio de compra (subproductos: su receta a últimos precios)
@@ -998,8 +1011,8 @@ def catalogos(c):
         "categorias": rows(db, "SELECT * FROM categorias ORDER BY nombre"),
         "unidades": rows(db, "SELECT * FROM unidades ORDER BY nombre"),
         "motivos": rows(db, "SELECT * FROM motivos_merma ORDER BY nombre"),
-        "articulos": rows(db, "SELECT a.id,a.codigo,a.nombre,a.tipo,a.desechable,a.precio,c.punto_venta,c.nombre categoria,u.abreviatura unidad FROM articulos a "
-                              "JOIN categorias c ON c.id=a.categoria_id JOIN unidades u ON u.id=a.unidad_id WHERE a.activo=1 ORDER BY a.nombre"),
+        "articulos": rows(db, f"SELECT a.id,a.codigo,a.nombre,a.tipo,a.desechable,a.precio,c.punto_venta,c.nombre categoria,u.abreviatura unidad,{SQL_UNI_RECETA} FROM articulos a "
+                              f"JOIN categorias c ON c.id=a.categoria_id JOIN unidades u ON u.id=a.unidad_id {JOIN_UNI_RECETA} WHERE a.activo=1 ORDER BY a.nombre"),
     }
 
 
@@ -1237,10 +1250,26 @@ def datos_articulo(db, d, codigo=None):
             txt(d.get("nombre"), "El nombre", True, 120), num(d.get("stock_minimo", 0), "El stock mínimo"), num(d.get("precio", 0), "El precio"))
 
 
+def datos_unidad_receta(db, d, v):
+    """(unidad_receta_id, factor_receta) a partir del cuerpo y de los datos ya validados del artículo (v).
+    Solo los ingredientes (insumos de receta y subproductos) usan otra unidad en las recetas."""
+    tipo, desechable, unidad_id = v[0], v[1], v[3]
+    urid = d.get("unidad_receta_id")
+    if urid in (None, "", 0, "0") or tipo == "PRODUCTO" or desechable:
+        return None, 1
+    urid = entero(urid, "la unidad de receta")
+    if not scalar(db, "SELECT COUNT(*) FROM unidades WHERE id=?", urid):
+        raise ApiError(400, "Unidad de receta no válida.")
+    if urid == unidad_id:
+        return None, 1
+    factor = num(d.get("factor_receta"), "La equivalencia de la unidad de receta", 0, True)
+    return urid, factor
+
+
 @ruta("GET", "/api/articulos", "articulos")
 def articulos_lista(c):
-    return rows(c.db, """SELECT a.*, c.punto_venta, c.nombre categoria, u.abreviatura unidad, COALESCE(s.cantidad,0) stock
-        FROM articulos a JOIN categorias c ON c.id=a.categoria_id JOIN unidades u ON u.id=a.unidad_id
+    return rows(c.db, f"""SELECT a.*, c.punto_venta, c.nombre categoria, u.abreviatura unidad, {SQL_UNI_RECETA}, COALESCE(s.cantidad,0) stock
+        FROM articulos a JOIN categorias c ON c.id=a.categoria_id JOIN unidades u ON u.id=a.unidad_id {JOIN_UNI_RECETA}
         LEFT JOIN stock s ON s.articulo_id=a.id AND s.bodega_id=0 ORDER BY a.nombre""")
 
 
@@ -1248,8 +1277,8 @@ def articulos_lista(c):
 def articulos_crear(c):
     v = datos_articulo(c.db, c.body)
     costo = v[7] if v[0] == "INSUMO" else 0
-    return {"id": c.db.execute("INSERT INTO articulos(tipo,desechable,categoria_id,unidad_id,codigo,nombre,stock_minimo,precio,costo) VALUES(?,?,?,?,?,?,?,?,?)",
-                               (*v, costo)).lastrowid, "codigo": v[4]}
+    return {"id": c.db.execute("INSERT INTO articulos(tipo,desechable,categoria_id,unidad_id,codigo,nombre,stock_minimo,precio,costo,unidad_receta_id,factor_receta) "
+                               "VALUES(?,?,?,?,?,?,?,?,?,?,?)", (*v, costo, *datos_unidad_receta(c.db, c.body, v))).lastrowid, "codigo": v[4]}
 
 
 @ruta("PUT", r"/api/articulos/(\d+)", "articulos", 2)
@@ -1261,8 +1290,15 @@ def articulos_editar(c, i):
         raise ApiError(409, "No se puede cambiar el tipo de un artículo con movimientos.")
     if v[1] and scalar(c.db, "SELECT COUNT(*) FROM receta_items WHERE articulo_id=?", i):
         raise ApiError(409, "Este insumo está en una receta: quítalo de ella antes de marcarlo como desechable o de punto de venta.")
-    c.db.execute("UPDATE articulos SET tipo=?,desechable=?,categoria_id=?,unidad_id=?,codigo=?,nombre=?,stock_minimo=?,precio=?,activo=? WHERE id=?",
-                 (*v, 1 if c.body.get("activo", True) else 0, i))
+    if a["unidad_id"] != v[3] and scalar(c.db, "SELECT COUNT(*) FROM movimientos WHERE articulo_id=?", i):
+        raise ApiError(409, "No se puede cambiar la unidad de un artículo con movimientos: su stock, compras e informes están en esa unidad. "
+                            "Si las recetas se escriben en otra unidad, usa la unidad de receta.")
+    urid, factor = datos_unidad_receta(c.db, c.body, v)
+    # Misma unidad de receta con otra equivalencia (se corrige un error): las recetas conservan lo escrito en esa unidad (ej. 250 g)
+    if urid and urid == a["unidad_receta_id"] and factor != a["factor_receta"]:
+        c.db.execute("UPDATE receta_items SET cantidad=cantidad*?/? WHERE articulo_id=?", (a["factor_receta"], factor, i))
+    c.db.execute("UPDATE articulos SET tipo=?,desechable=?,categoria_id=?,unidad_id=?,codigo=?,nombre=?,stock_minimo=?,precio=?,activo=?,unidad_receta_id=?,factor_receta=? WHERE id=?",
+                 (*v, 1 if c.body.get("activo", True) else 0, urid, factor, i))
     return {"ok": True}
 
 
@@ -1348,8 +1384,9 @@ def receta_guardar(c, art_id):
     c.db.execute("INSERT INTO recetas VALUES(?,?,?) ON CONFLICT(articulo_id) DO UPDATE SET rendimiento=excluded.rendimiento, instrucciones=excluded.instrucciones",
                  (art_id, rend, txt(c.body.get("instrucciones"), "Las instrucciones", False, 4000)))
     c.db.execute("DELETE FROM receta_items WHERE receta_id=?", (art_id,))
-    for i in items:
-        c.db.execute("INSERT INTO receta_items VALUES(?,?,?)", (art_id, i["articulo_id"], i["cantidad"]))
+    for i in items:  # la cantidad llega en la unidad de receta del ingrediente y se guarda en su unidad de stock
+        factor = articulo(c.db, i["articulo_id"])["factor_receta"] or 1
+        c.db.execute("INSERT INTO receta_items VALUES(?,?,?)", (art_id, i["articulo_id"], round(i["cantidad"] / factor, 9)))
     return {"ok": True}
 
 
@@ -1377,8 +1414,9 @@ def produccion_impresion(c):
         JOIN articulos a ON a.id=p.articulo_id JOIN unidades un ON un.id=a.unidad_id LEFT JOIN usuarios u ON u.id=p.usuario_id
         WHERE p.estado='VIGENTE' AND p.fecha BETWEEN ? AND ? ORDER BY p.fecha, p.id""", d, h)
     for o in ordenes:
-        o["items"] = rows(c.db, """SELECT a.codigo, a.nombre, un.abreviatura unidad, -m.cantidad cantidad, m.costo_unit FROM movimientos m
-            JOIN articulos a ON a.id=m.articulo_id JOIN unidades un ON un.id=a.unidad_id
+        o["items"] = rows(c.db, f"""SELECT a.codigo, a.nombre, un.abreviatura unidad, -m.cantidad cantidad, m.costo_unit,
+            {SQL_UNI_RECETA.replace('u.abreviatura', 'un.abreviatura')} FROM movimientos m
+            JOIN articulos a ON a.id=m.articulo_id JOIN unidades un ON un.id=a.unidad_id {JOIN_UNI_RECETA}
             WHERE m.doc_tipo='PRODUCCION' AND m.doc_id=? AND m.tipo='CONSUMO_PRODUCCION' ORDER BY a.nombre""", o["id"])
     return {"desde": d, "hasta": h, "ordenes": ordenes}
 
@@ -3808,6 +3846,9 @@ def sembrar(db):
                       ("obs_recepcion", "TEXT NOT NULL DEFAULT ''"), ("referencia_recepcion", "TEXT")):
         if col not in columnas_despacho:
             db.execute(f"ALTER TABLE despachos ADD COLUMN {col} {tipo}")
+    if "unidad_receta_id" not in [col[1] for col in db.execute("PRAGMA table_info(articulos)")]:  # recetas en otra unidad (ej. g) que la de stock (kg)
+        db.execute("ALTER TABLE articulos ADD COLUMN unidad_receta_id INTEGER REFERENCES unidades(id)")
+        db.execute("ALTER TABLE articulos ADD COLUMN factor_receta REAL NOT NULL DEFAULT 1")
     if "recibido" not in [col[1] for col in db.execute("PRAGMA table_info(despacho_items)")]:
         db.execute("ALTER TABLE despacho_items ADD COLUMN recibido REAL")
     if "recibe_pos" not in [col[1] for col in db.execute("PRAGMA table_info(tiendas)")]:  # la tienda recibe los despachos en el POS
