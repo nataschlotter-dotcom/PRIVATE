@@ -1307,6 +1307,44 @@ casi(it["cantidad"], 0.5); casi(it["cantidad_receta"], 0.5); assert it["unidad_r
 A("PUT", f"/articulos/{azu}", {"tipo": "INSUMO", "nombre": "Azúcar UR", "categoria_id": cid, "unidad_id": g_, "precio": 2000}, 409)
 A("PUT", f"/articulos/{igual}", {"tipo": "INSUMO", "nombre": "Igual UR", "categoria_id": cid, "unidad_id": ml_})  # sin movimientos, sí
 
+# Mantenimiento: un insumo cargado en g pasa a kg con todo su historial; las recetas siguen en g
+sal = A("POST", "/articulos", {"tipo": "INSUMO", "nombre": "Sal MT", "categoria_id": cid, "unidad_id": g_, "precio": 1, "stock_minimo": 500})["id"]
+cs = A("POST", "/compras", {"tipo_documento": "FACTURA", "proveedor_id": prov, "items": [{"articulo_id": sal, "cantidad": 5000, "precio": 1.2}]})["id"]
+pan = A("POST", "/articulos", {"tipo": "PRODUCTO", "nombre": "Pan MT", "categoria_id": cid_prod, "unidad_id": un, "precio": 300})["id"]
+A("PUT", f"/recetas/{pan}", {"rendimiento": 10, "items": [{"articulo_id": sal, "cantidad": 20}]})  # 20 g por 10 panes
+A("POST", "/produccion", {"articulo_id": pan, "cantidad": 100})  # 200 g
+casi(stock()[sal], 4800)
+A("PUT", f"/articulos/{sal}", {"tipo": "INSUMO", "nombre": "Sal MT", "categoria_id": cid, "unidad_id": kg}, 409)
+mt = {"unidad_id": kg, "equivalencia": 1000, "receta_anterior": 1}
+A("GET", f"/mantenimiento/unidad/{sal}?unidad_id={g_}&equivalencia=1", esperado=400)  # ya está en g
+plan = A("GET", f"/mantenimiento/unidad/{sal}?unidad_id={kg}&equivalencia=1000&receta_anterior=1")
+assert plan["unidad_actual"] == "g" and plan["unidad_nueva"] == "kg" and plan["despues"]["unidad_receta"] == "g"
+casi(plan["stock"][0]["nuevo"], 4.8)
+assert {r["tabla"] for r in plan["registros"]} >= {"stock", "movimientos", "compra_items", "receta_items", "historial_precios"}
+casi(stock()[sal], 4800)  # la vista previa no cambia nada
+neto_antes = A("GET", f"/compras/{cs}")["neto"]
+A("POST", f"/mantenimiento/unidad/{sal}", mt)
+ficha = next(x for x in A("GET", "/articulos") if x["id"] == sal)
+assert ficha["unidad"] == "kg" and ficha["unidad_receta"] == "g" and ficha["factor_receta"] == 1000
+casi(ficha["stock"], 4.8); casi(ficha["precio"], 1200); casi(ficha["stock_minimo"], 0.5)
+co = A("GET", f"/compras/{cs}")
+casi(co["items"][0]["cantidad"], 5); casi(co["items"][0]["precio"], 1200); casi(co["neto"], neto_antes)
+it = next(r for r in A("GET", "/recetas") if r["articulo_id"] == pan)["items"][0]
+casi(it["cantidad"], 0.02); casi(it["cantidad_receta"], 20); assert it["unidad_receta"] == "g"
+c = app.conectar()
+saldos = [r[0] for r in c.execute("SELECT saldo FROM movimientos WHERE articulo_id=? ORDER BY id", (sal,))]
+c.close()
+casi(saldos[0], 5); casi(saldos[-1], 4.8)
+A("POST", "/produccion", {"articulo_id": pan, "cantidad": 50})  # 100 g = 0,1 kg
+casi(stock()[sal], 4.7)
+assert any("g → kg" in h["detalle"] for h in A("GET", "/mantenimiento/historial"))
+# volver atrás con la conversión inversa deja todo como antes (las recetas siguen en g)
+A("POST", f"/mantenimiento/unidad/{sal}", {"unidad_id": g_, "equivalencia": 0.001})
+ficha = next(x for x in A("GET", "/articulos") if x["id"] == sal)
+assert ficha["unidad"] == "g" and ficha["unidad_receta"] == "g"
+casi(ficha["stock"], 4700); casi(ficha["precio"], 1.2)
+assert "acc_mantenimiento" not in json.dumps(perf["Gerencia"]["permisos"])
+
 # Datos de ejemplo: base nueva, y coherencia del historial
 os.environ["NS_DB"] = app.DB_PATH = os.path.join(tempfile.mkdtemp(), "demo.db")
 c = app.conectar()

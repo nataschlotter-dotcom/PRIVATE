@@ -24,7 +24,7 @@ const NAV = [
   ['Producción', [['recetas', 'Recetas'], ['produccion', 'Producción']]],
   ['Logística', [['despachos', 'Despachos a tiendas']]],
   ['Gestión', [['reportes', 'Reportes'], ['informes', 'Informes', ['reportes']]]],
-  ['Administración', [['stock', 'Actualizar stock'], ['fudo', 'Integración Fudo', ['config']], ['usuarios', 'Usuarios y perfiles'], ['config', 'Configuración']]],
+  ['Administración', [['stock', 'Actualizar stock'], ['fudo', 'Integración Fudo', ['config']], ['usuarios', 'Usuarios y perfiles'], ['config', 'Configuración'], ['mantenimiento', 'Mantenimiento', ['config']]]],
 ];
 
 /* ---------- utilidades ---------- */
@@ -2106,7 +2106,78 @@ async function tarjetaPos(v) {
 }
 
 /* ---------- arranque y rutas ---------- */
-const PERMISO_RUTA = { compras: ['compras', 'proveedores'], fudo: ['config'], informes: ['reportes'] };
+/* ---------- Mantenimiento: cambiar la unidad de medida de un artículo con historial ---------- */
+Vistas.mantenimiento = async v => {
+  v.innerHTML = cabecera('Mantenimiento', 'Herramientas para corregir datos que no se pueden cambiar desde las pantallas normales. Descarga un respaldo en Configuración antes de usarlas.');
+  if (!puede('mantenimiento')) {
+    v.insertAdjacentHTML('beforeend', '<div class="tarjeta"><p class="nota">Tu perfil no tiene la acción crítica <b>Mantenimiento</b>. Pídela al administrador en Usuarios y perfiles.</p></div>');
+    return;
+  }
+  const [arts, hist] = await Promise.all([api('GET', '/articulos'), api('GET', '/mantenimiento/historial')]);
+  const c = v.appendChild(Object.assign(document.createElement('div'), { className: 'tarjeta' }));
+  c.innerHTML = `<h2>Cambiar unidad de medida</h2>
+    <p class="nota">Convierte un artículo que ya tiene movimientos a otra unidad, por ejemplo de <b>g</b> a <b>kg</b>. Se convierten el stock de todas las bodegas, el historial, las compras, las guías, las mermas, las tomas de inventario y las recetas. Los precios y costos pasan a la nueva unidad, y los totales en pesos no cambian.</p>
+    <form novalidate class="mt-form"><div class="campos">
+      <label class="campo todo"><span>Artículo</span><select name="articulo_id">${opciones(arts.map(a => ({ id: a.id, nombre: `${a.codigo} · ${a.nombre} (${a.unidad})${a.activo ? '' : ' · inactivo'}` })), '', 'Selecciona…')}</select></label>
+      <label class="campo"><span>Nueva unidad de medida</span><select name="unidad_id">${opciones(S.cat.unidades.map(u => ({ id: u.id, nombre: `${u.nombre} (${u.abreviatura})` })), '', 'Selecciona…')}</select></label>
+      <label class="campo"><span>Equivalencia</span>${inputNum('', '', 6).replace('<input', '<input name="equivalencia"')}<small class="mt-eq">Elige el artículo y la nueva unidad.</small></label>
+      <label class="campo check todo mt-rec"><input type="checkbox" name="receta_anterior" checked><span>Seguir escribiendo las recetas en la unidad actual (queda como unidad de receta)</span></label>
+    </div><div class="error" hidden></div><div class="modal-pie"><button class="btn primario">Ver qué cambia</button></div></form><div class="mt-plan"></div>`;
+  const f = $('.mt-form', c), plan = $('.mt-plan', c), err = $('.error', f);
+  const art = () => arts.find(a => String(a.id) === f.articulo_id.value);
+  const uni = () => S.cat.unidades.find(u => String(u.id) === f.unidad_id.value);
+  const pinta = sugerir => {
+    plan.innerHTML = '';
+    const a = art(), u = uni();
+    $('.mt-rec', c).style.display = a && a.unidad_receta !== a.unidad ? 'none' : '';
+    if (!a || !u) { $('.mt-eq', c).textContent = 'Elige el artículo y la nueva unidad.'; return; }
+    const nu = u.abreviatura, vi = a.unidad, clave = (x, y) => `${x.toLowerCase()}>${y.toLowerCase()}`;
+    if (sugerir) {
+      const s = EQUIVALENCIAS[clave(nu, vi)] || (EQUIVALENCIAS[clave(vi, nu)] ? 1 / EQUIVALENCIAS[clave(vi, nu)] : null);
+      f.equivalencia.value = s ? fNum(s, 0, 6) : '';
+    }
+    const n = aNum(f.equivalencia.value);
+    $('.mt-eq', c).textContent = n > 0 ? `1 ${nu} = ${fNum(n, 0, 6)} ${vi}` : `¿Cuántos ${vi} hay en 1 ${nu}?`;
+  };
+  f.articulo_id.addEventListener('change', () => pinta(true)); f.unidad_id.addEventListener('change', () => pinta(true));
+  f.equivalencia.addEventListener('input', () => pinta(false)); f.receta_anterior.addEventListener('change', () => { plan.innerHTML = ''; });
+  const datos = () => {
+    const eq = aNum(f.equivalencia.value);
+    if (!art()) throw new Error('Elige el artículo.');
+    if (!uni()) throw new Error('Elige la nueva unidad.');
+    if (!(eq > 0)) throw new Error('Indica la equivalencia: cuántas unidades actuales hay en 1 unidad nueva.');
+    return { unidad_id: f.unidad_id.value, equivalencia: eq, receta_anterior: f.receta_anterior.checked ? 1 : 0 };
+  };
+  f.addEventListener('submit', async e => {
+    e.preventDefault(); err.hidden = true;
+    try {
+      const d = datos(), p = await api('GET', `/mantenimiento/unidad/${art().id}` + qs(d));
+      const an = p.antes, de = p.despues, va = p.unidad_actual, nu = p.unidad_nueva;
+      const fila = (t, x, y) => `<tr><td>${t}</td><td class="n">${x}</td><td class="n">${y}</td></tr>`;
+      plan.innerHTML = `<h3 style="font-size:14px;margin:16px 0 6px">${esc(p.articulo.codigo)} · ${esc(p.articulo.nombre)}: de ${esc(va)} a ${esc(nu)} (1 ${esc(nu)} = ${fNum(p.equivalencia, 0, 6)} ${esc(va)})</h3>
+        <div class="tabla-marco"><table><thead><tr><th></th><th class="n">Antes</th><th class="n">Después</th></tr></thead><tbody>
+        ${p.stock.map(s => fila(`Stock ${esc(s.bodega)}`, `${fCant(s.cantidad)} ${esc(va)}`, `${fCant(s.nuevo)} ${esc(nu)}`)).join('')}
+        ${fila('Último precio', `${fPrecio(an.precio)} / ${esc(va)}`, `${fPrecio(de.precio)} / ${esc(nu)}`)}
+        ${fila('Costo promedio', `${fPrecio(an.costo)} / ${esc(va)}`, `${fPrecio(de.costo)} / ${esc(nu)}`)}
+        ${fila('Stock mínimo', `${fCant(an.stock_minimo)} ${esc(va)}`, `${fCant(de.stock_minimo)} ${esc(nu)}`)}
+        ${fila('Recetas se escriben en', an.unidad_receta === va ? esc(va) : `${esc(an.unidad_receta)} (1 ${esc(va)} = ${fNum(an.factor_receta, 0, 6)} ${esc(an.unidad_receta)})`,
+               de.unidad_receta_id ? `${esc(de.unidad_receta)} (1 ${esc(nu)} = ${fNum(de.factor_receta, 0, 6)} ${esc(de.unidad_receta)})` : esc(nu))}
+        </tbody></table></div>
+        <p class="tenue" style="margin:8px 0">${p.registros.length ? 'Se convertirán: ' + p.registros.map(r => `${fNum(r.registros)} ${esc(r.nombre)}`).join(', ') + '.' : 'No hay registros que convertir.'} ${de.unidad_receta === an.unidad_receta ? `Las recetas se siguen viendo en ${esc(de.unidad_receta)}, con las mismas cantidades.` : `Las cantidades de las recetas se mostrarán convertidas a ${esc(de.unidad_receta)}.`} El cambio queda en el historial de mantenimiento.</p>
+        <div class="modal-pie"><button type="button" class="btn primario mt-aplicar">Aplicar cambio</button></div>`;
+      $('.mt-aplicar', plan).addEventListener('click', () => confirmar('Cambiar unidad de medida', `${p.articulo.nombre} pasará de ${va} a ${nu} y se convertirá todo su historial. No se puede deshacer desde el sistema (solo volviendo a convertir). ¿Continuar?`, async () => {
+        await api('POST', `/mantenimiento/unidad/${p.articulo.id}`, datos());
+        aviso(`${p.articulo.nombre} ahora está en ${nu}.`); render();
+      }, 'Aplicar cambio'));
+    } catch (x) { err.textContent = x.message; err.hidden = false; }
+  });
+  pinta(false);
+  const h = v.appendChild(Object.assign(document.createElement('div'), { className: 'tarjeta' }));
+  h.innerHTML = '<h2>Historial de mantenimiento</h2><div></div>';
+  tabla(h.lastElementChild, { filas: hist, csv: 'mantenimiento', vacio: 'Aún no hay cambios de unidad.', cols: [
+    { t: 'Fecha', v: r => r.fecha, h: r => fFecha(r.fecha) }, { t: 'Artículo', v: r => `${r.codigo} · ${r.nombre}` }, { t: 'Cambio', v: r => r.detalle }, { t: 'Usuario', v: r => r.usuario }] });
+};
+const PERMISO_RUTA = { compras: ['compras', 'proveedores'], fudo: ['config'], informes: ['reportes'], mantenimiento: ['config'] };
 let turno = 0;
 function primeraRuta() {
   for (const [, items] of NAV) for (const [m, , alt] of items) if ((alt || [m]).some(x => can(x))) return m;

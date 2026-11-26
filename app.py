@@ -106,6 +106,7 @@ ACCIONES = [
     ("eliminar_registros", "Eliminar artículos, recetas, categorías, unidades, proveedores y tiendas", None),  # aplica a varios módulos
     ("stock_fudo", "Sincronizar, igualar y ajustar stock con Fudo", "config"),
     ("respaldo", "Descargar respaldo de la base de datos", "config"),
+    ("mantenimiento", "Mantenimiento: cambiar la unidad de medida de artículos con historial", "config"),
 ]
 ACCIONES_IDS = [a for a, _, _ in ACCIONES]
 PERFIL_ADMIN = "Administrador"  # "stock" no está en MODULOS: solo este perfil lo recibe, y no se puede asignar a otros
@@ -1292,7 +1293,8 @@ def articulos_editar(c, i):
         raise ApiError(409, "Este insumo está en una receta: quítalo de ella antes de marcarlo como desechable o de punto de venta.")
     if a["unidad_id"] != v[3] and scalar(c.db, "SELECT COUNT(*) FROM movimientos WHERE articulo_id=?", i):
         raise ApiError(409, "No se puede cambiar la unidad de un artículo con movimientos: su stock, compras e informes están en esa unidad. "
-                            "Si las recetas se escriben en otra unidad, usa la unidad de receta.")
+                            "Si las recetas se escriben en otra unidad, usa la unidad de receta. Para convertir el artículo y su historial "
+                            "a otra unidad, usa Administración → Mantenimiento → Cambiar unidad de medida.")
     urid, factor = datos_unidad_receta(c.db, c.body, v)
     # Misma unidad de receta con otra equivalencia (se corrige un error): las recetas conservan lo escrito en esa unidad (ej. 250 g)
     if urid and urid == a["unidad_receta_id"] and factor != a["factor_receta"]:
@@ -1323,6 +1325,103 @@ def articulos_borrar(c, i):
     c.db.execute("DELETE FROM stock WHERE articulo_id=?", (i,))
     c.db.execute("DELETE FROM articulos WHERE id=?", (i,))
     return {"ok": True}
+
+
+# ---------------------------------------------------------------- mantenimiento: cambio de unidad de medida
+
+# Columnas que se convierten: cantidades se multiplican por k = 1/equivalencia; precios y costos unitarios, por la equivalencia.
+# (tabla, columnas de cantidad, columnas de precio unitario, condición extra). Los totales en pesos no cambian.
+CONVERSION_UNIDAD = (
+    ("stock", ("cantidad",), (), "articulo_id=?"),
+    ("movimientos", ("cantidad", "saldo"), ("costo_unit",), "articulo_id=?"),
+    ("compra_items", ("cantidad",), ("precio",), "articulo_id=?"),
+    ("devolucion_items", ("cantidad",), ("precio",), "articulo_id=?"),
+    ("historial_precios", (), ("precio",), "articulo_id=?"),
+    ("despacho_items", ("cantidad", "recibido"), ("precio",), "articulo_id=?"),
+    ("salida_interna_items", ("cantidad",), ("costo_unit",), "articulo_id=?"),
+    ("mermas", ("cantidad",), ("costo_unit",), "articulo_id=?"),
+    ("salidas_tienda", ("cantidad",), (), "articulo_id=?"),
+    ("inventario_items", ("stock_sistema", "conteo", "diferencia"), (), "articulo_id=?"),
+    ("producciones", ("cantidad",), (), "articulo_id=?"),
+    ("recetas", ("rendimiento",), (), "articulo_id=?"),            # su propia receta: lo que rinde, en su unidad
+    ("receta_items", ("cantidad",), (), "articulo_id=?"),          # como ingrediente de otras recetas
+    ("fudo_equivalencias", ("factor",), (), "articulo_id=?"),      # unidades del sistema por unidad de Fudo
+)
+NOMBRES_CONVERSION = {"stock": "saldos de stock por bodega", "movimientos": "movimientos del historial", "compra_items": "líneas de compras",
+                      "devolucion_items": "líneas de devoluciones a proveedores", "historial_precios": "precios del historial",
+                      "despacho_items": "líneas de guías de despacho", "salida_interna_items": "líneas de devoluciones de tiendas y consumos",
+                      "mermas": "mermas", "salidas_tienda": "ventas o consumos de tienda", "inventario_items": "líneas de tomas de inventario",
+                      "producciones": "producciones", "recetas": "receta propia (rendimiento)", "receta_items": "recetas donde es ingrediente",
+                      "fudo_equivalencias": "equivalencias con Fudo"}
+
+
+def plan_cambio_unidad(db, art_id, d):
+    """Valida y describe la conversión sin modificar nada. equivalencia = unidades actuales en 1 unidad nueva (1 kg = 1000 g)."""
+    a = articulo(db, art_id)
+    nueva_id = entero(d.get("unidad_id"), "la nueva unidad")
+    nueva = row(db, "SELECT * FROM unidades WHERE id=?", nueva_id)
+    if not nueva:
+        raise ApiError(400, "Unidad no válida.")
+    if nueva_id == a["unidad_id"]:
+        raise ApiError(400, f"{a['nombre']} ya está en {nueva['abreviatura']}.")
+    eq = num(d.get("equivalencia"), "La equivalencia", 0, True)
+    if scalar(db, """SELECT COUNT(*) FROM despacho_items di JOIN despachos de ON de.id=di.despacho_id JOIN tiendas t ON t.id=de.tienda_id
+                     WHERE di.articulo_id=? AND t.recibe_pos=1""", art_id):
+        raise ApiError(409, f"{a['nombre']} se despacha a tiendas que reciben en el POS: el POS guarda su stock en la unidad actual y no se puede convertir desde aquí.")
+    vieja = a["unidad"]
+    # Unidad de receta después del cambio
+    if a["unidad_receta_id"]:
+        urid, factor = a["unidad_receta_id"], a["factor_receta"] * eq
+    elif d.get("receta_anterior", True) not in (False, 0, "0", "false", ""):
+        urid, factor = a["unidad_id"], eq          # las recetas siguen escribiéndose en la unidad anterior
+    else:
+        urid, factor = None, 1
+    if urid == nueva_id:
+        urid, factor = None, 1
+    ur = scalar(db, "SELECT abreviatura FROM unidades WHERE id=?", urid) if urid else nueva["abreviatura"]
+    filas = []
+    for tabla, cant, prec, cond in CONVERSION_UNIDAD:
+        n = scalar(db, f"SELECT COUNT(*) FROM {tabla} WHERE {cond}", art_id)
+        if n:
+            filas.append({"tabla": tabla, "nombre": NOMBRES_CONVERSION[tabla], "registros": n})
+    stock = rows(db, "SELECT s.bodega_id, COALESCE(t.nombre,'Bodega central') bodega, s.cantidad FROM stock s LEFT JOIN tiendas t ON t.id=s.bodega_id "
+                     "WHERE s.articulo_id=? AND s.cantidad<>0 ORDER BY s.bodega_id", art_id)
+    return {"articulo": {"id": a["id"], "codigo": a["codigo"], "nombre": a["nombre"]}, "unidad_actual": vieja, "unidad_nueva": nueva["abreviatura"],
+            "unidad_id": nueva_id, "equivalencia": eq, "k": 1 / eq,
+            "antes": {"precio": a["precio"], "costo": a["costo"], "stock_minimo": a["stock_minimo"], "unidad_receta": a["unidad_receta"], "factor_receta": a["factor_receta"]},
+            "despues": {"precio": a["precio"] * eq, "costo": a["costo"] * eq, "stock_minimo": a["stock_minimo"] / eq, "unidad_receta": ur, "factor_receta": factor,
+                        "unidad_receta_id": urid},
+            "stock": [{**s, "nuevo": s["cantidad"] / eq} for s in stock], "registros": filas}
+
+
+@ruta("GET", r"/api/mantenimiento/unidad/(\d+)", "config", 2, accion="mantenimiento")
+def mantenimiento_unidad_ver(c, i):
+    return plan_cambio_unidad(c.db, int(i), c.q)
+
+
+@ruta("POST", r"/api/mantenimiento/unidad/(\d+)", "config", 2, accion="mantenimiento")
+def mantenimiento_unidad(c, i):
+    i = int(i)
+    p = plan_cambio_unidad(c.db, i, c.body)
+    eq, k = p["equivalencia"], p["k"]
+    for tabla, cant, prec, cond in CONVERSION_UNIDAD:
+        sets = [f"{col}=ROUND({col}*?,9)" for col in cant] + [f"{col}=ROUND({col}*?,6)" for col in prec]
+        if sets:
+            c.db.execute(f"UPDATE {tabla} SET {', '.join(sets)} WHERE {cond}", (*[k] * len(cant), *[eq] * len(prec), i))
+    dp = p["despues"]
+    c.db.execute("UPDATE articulos SET unidad_id=?, precio=ROUND(precio*?,6), costo=ROUND(costo*?,6), stock_minimo=ROUND(stock_minimo*?,9), "
+                 "unidad_receta_id=?, factor_receta=? WHERE id=?", (p["unidad_id"], eq, eq, k, dp["unidad_receta_id"], dp["factor_receta"], i))
+    detalle = [f"Unidad de medida: {p['unidad_actual']} → {p['unidad_nueva']} (1 {p['unidad_nueva']} = {eq:g} {p['unidad_actual']})",
+               f"Recetas en {dp['unidad_receta']}" + (f" (1 {p['unidad_nueva']} = {dp['factor_receta']:g} {dp['unidad_receta']})" if dp["unidad_receta_id"] else ""),
+               "Convertidos: " + ", ".join(f"{r['registros']} {r['nombre']}" for r in p["registros"]) if p["registros"] else "Sin registros que convertir"]
+    registrar_edicion(c.db, c.uid, "ARTICULO", i, detalle)
+    return {**p, "detalle": detalle}
+
+
+@ruta("GET", "/api/mantenimiento/historial", "config", 2, accion="mantenimiento")
+def mantenimiento_historial(c):
+    return rows(c.db, """SELECT e.fecha, e.detalle, a.codigo, a.nombre, u.nombre usuario FROM ediciones e JOIN articulos a ON a.id=e.doc_id
+        LEFT JOIN usuarios u ON u.id=e.usuario_id WHERE e.doc_tipo='ARTICULO' ORDER BY e.id DESC LIMIT 100""")
 
 
 # ---------------------------------------------------------------- recetas y producción
