@@ -286,3 +286,4 @@ body:not(:has(#lateral)) #ay-boton, body:not(:has(#lateral)) .ay-panel { display
 @media (max-width: 600px) { .ay-panel { right: 16px; left: 16px; width: auto; bottom: 76px; } #ay-boton { right: 16px; bottom: 16px; } }
 @media print { #ay-boton, .ay-panel { display: none !important; } }
 .inf-totales { margin-top: 8px; font-size: 13px; color: var(--tinta-2); }
+.ediciones { margin-top: 12px; padding: 8px 12px; background: var(--suave); border-radius: 6px; font-size: 13px; } .ediciones ul { margin: 4px 0 0; padding-left: 18px; } .ediciones li { margin-bottom: 3px; }

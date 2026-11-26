@@ -1195,6 +1195,77 @@ assert este == (_utc + _td(hours=14)).date() and oeste == (_utc - _td(hours=11))
 assert abs((h_este - (_dt.now(_tz.utc) + _td(hours=14)).replace(tzinfo=None)).total_seconds()) < 60
 zona_por_http("180")
 
+# Edición de compras: el stock se mueve solo por la diferencia; precio, costo promedio e historial se recalculan
+ea, eb, ec = art("INSUMO", "EDA"), art("INSUMO", "EDB"), art("INSUMO", "EDC")
+ce = A("POST", "/compras", {"tipo_documento": "FACTURA", "documento": "F-77", "proveedor_id": prov, "items": [
+    {"articulo_id": ea, "cantidad": 10, "precio": 1000}, {"articulo_id": eb, "cantidad": 4, "precio": 500}]})["id"]
+casi(stock()[ea], 10); casi(stock()[eb], 4)
+A("PUT", f"/compras/{ce}", {"items": [{"articulo_id": ea, "cantidad": 10, "precio": 1000}, {"articulo_id": eb, "cantidad": 4, "precio": 500}]}, 400)  # sin cambios
+r = A("PUT", f"/compras/{ce}", {"documento": "F-77B", "items": [{"articulo_id": ea, "cantidad": 8, "precio": 1200}, {"articulo_id": ec, "cantidad": 3, "precio": 300}]})
+assert len(r["cambios"]) == 4, r["cambios"]  # ea cambia, eb se quita, ec se agrega, y el N° de documento
+casi(stock()[ea], 8); casi(stock().get(eb, 0), 0); casi(stock()[ec], 3)
+de = A("GET", f"/compras/{ce}")
+casi(de["neto"], 8 * 1200 + 3 * 300); casi(de["total"], round((8 * 1200 + 3 * 300) * 1.19, 2))
+assert de["documento"] == "F-77B" and {i["articulo_id"] for i in de["items"]} == {ea, ec}
+assert de["ediciones"] and "F-77 → F-77B" in de["ediciones"][0]["detalle"] and de["ediciones"][0]["usuario"]
+arts_e = {x["id"]: x for x in A("GET", "/articulos")}
+casi(arts_e[ea]["precio"], 1200); casi(arts_e[ea]["costo"], 1200); casi(arts_e[ec]["precio"], 300)  # solo esta compra: el promedio es el nuevo precio
+c = app.conectar()
+assert c.execute("SELECT COUNT(*) FROM historial_precios WHERE compra_id=? AND articulo_id=?", (ce, eb)).fetchone()[0] == 0
+assert c.execute("SELECT precio FROM historial_precios WHERE compra_id=? AND articulo_id=?", (ce, ea)).fetchone()[0] == 1200
+assert c.execute("SELECT COUNT(*) FROM movimientos WHERE doc_tipo='COMPRA' AND doc_id=? AND tipo='EDICION_COMPRA'", (ce,)).fetchone()[0] == 3
+c.close()
+# no se puede quitar lo que ya se usó: la edición se rechaza entera y no cambia nada
+A("POST", "/mermas", {"articulo_id": ea, "cantidad": 7, "motivo_id": A("GET", "/catalogos")["motivos"][0]["id"], "bodega_id": 0})
+A("PUT", f"/compras/{ce}", {"items": [{"articulo_id": ea, "cantidad": 2, "precio": 1200}, {"articulo_id": ec, "cantidad": 3, "precio": 300}]}, 409)
+casi(stock()[ea], 1); assert len(A("GET", f"/compras/{ce}")["items"]) == 2
+# anular después de editar revierte el NETO (10 − 2 − 1 = 7), no cada movimiento por separado (−10 fallaría con 7 en stock)
+A("PUT", f"/compras/{ce}", {"items": [{"articulo_id": ea, "cantidad": 7, "precio": 1200}, {"articulo_id": ec, "cantidad": 3, "precio": 300}]})
+casi(stock()[ea], 0)
+A("POST", "/compras", {"tipo_documento": "BOLETA", "proveedor_id": prov, "items": [{"articulo_id": ea, "cantidad": 7, "precio": 1200}]})
+casi(stock()[ea], 7)
+A("POST", f"/compras/{ce}/anular", {})
+casi(stock()[ea], 0); casi(stock().get(ec, 0), 0)
+A("PUT", f"/compras/{ce}", {"items": [{"articulo_id": ec, "cantidad": 1, "precio": 1}]}, 409)  # anulada
+# una guía neteada con su factura no se edita
+gn = A("POST", "/compras", {"tipo_documento": "GUIA", "documento": "G-9", "proveedor_id": prov, "items": [{"articulo_id": eb, "cantidad": 2, "precio": 10}]})["id"]
+fn = A("POST", "/compras/facturas", {"proveedor_id": prov, "documento": "F-999", "guias": [gn]})["id"]
+A("PUT", f"/compras/{gn}", {"items": [{"articulo_id": eb, "cantidad": 1, "precio": 10}]}, 409)
+A("POST", f"/compras/facturas/{fn}/anular", {})
+A("PUT", f"/compras/{gn}", {"items": [{"articulo_id": eb, "cantidad": 1, "precio": 10}]})
+casi(stock()[eb], 1)
+A("PUT", f"/compras/{gn}", {"items": [{"articulo_id": torta, "cantidad": 1, "precio": 10}]}, 400)  # solo insumos
+
+# Edición de guías de despacho: la diferencia se mueve entre la central y la tienda
+edv = art("INSUMO", "EDV", un, desechable=True)
+A("POST", "/compras", {"tipo_documento": "FACTURA", "proveedor_id": prov, "items": [{"articulo_id": edv, "cantidad": 50, "precio": 100}]})
+ge = A("POST", "/despachos", {"tienda_id": tienda2, "items": [{"articulo_id": edv, "cantidad": 10}]})["id"]
+casi(stock()[edv], 40); casi(stock(tienda2)[edv], 10)
+r = A("PUT", f"/despachos/{ge}", {"transportista": "Pedro", "items": [{"articulo_id": edv, "cantidad": 15, "precio": 120}]})
+casi(stock()[edv], 35); casi(stock(tienda2)[edv], 15)
+dg = A("GET", f"/despachos/{ge}")
+casi(dg["neto"], 15 * 120); assert dg["transportista"] == "Pedro" and dg["ediciones"]
+A("PUT", f"/despachos/{ge}", {"items": [{"articulo_id": edv, "cantidad": 6, "precio": 120}]})
+casi(stock()[edv], 44); casi(stock(tienda2)[edv], 6)
+A("PUT", f"/despachos/{ge}", {"tienda_id": tienda, "items": [{"articulo_id": edv, "cantidad": 6}]}, 400)  # no se cambia la tienda
+A("PUT", f"/despachos/{ge}", {"items": [{"articulo_id": edv, "cantidad": 999}]}, 409)  # no hay tanto en la central
+A("POST", f"/despachos/{ge}/anular", {})
+casi(stock()[edv], 50); casi(stock(tienda2).get(edv, 0), 0)
+A("PUT", f"/despachos/{ge}", {"items": [{"articulo_id": edv, "cantidad": 1}]}, 409)  # anulada
+# guía en camino (tienda que recibe en el POS): solo se mueve la central; recibida: ya no se edita
+tpos = A("POST", "/tiendas", {"nombre": "TPOS", "direccion": "D", "comuna": "C", "region": "R", "recibe_pos": True})["id"]
+gc = A("POST", "/despachos", {"tienda_id": tpos, "items": [{"articulo_id": edv, "cantidad": 5}]})["id"]
+A("PUT", f"/despachos/{gc}", {"items": [{"articulo_id": edv, "cantidad": 8}]})
+casi(stock()[edv], 42); casi(stock(tpos).get(edv, 0), 0)
+c = app.conectar()
+app.recibir_despacho(c, gc, tpos, {}, "Ana", "", "REC-EDIT-1")
+c.commit(); c.close()
+casi(stock(tpos)[edv], 8)
+A("PUT", f"/despachos/{gc}", {"items": [{"articulo_id": edv, "cantidad": 2}]}, 409)
+# sin el permiso de edición (acción crítica), el perfil no puede editar
+perf = {p["nombre"]: p for p in A("GET", "/perfiles")}
+assert "acc_editar_compras" not in json.dumps(perf["Gerencia"]["permisos"])
+
 # Datos de ejemplo: base nueva, y coherencia del historial
 os.environ["NS_DB"] = app.DB_PATH = os.path.join(tempfile.mkdtemp(), "demo.db")
 c = app.conectar()

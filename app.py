@@ -93,6 +93,8 @@ TODOS = [m for m, _ in MODULOS]
 # Acciones críticas: además del nivel "editar" en su módulo, requieren este permiso propio (clave "acc_<id>" en perfiles.permisos).
 ACCIONES = [
     ("anular_compras", "Anular compras", "compras"),
+    ("editar_compras", "Editar compras (ítems, cantidades y precios)", "compras"),
+    ("editar_despachos", "Editar guías de despacho (ítems y cantidades)", "despachos"),
     ("anular_devoluciones", "Anular devoluciones a proveedores", "devoluciones"),
     ("anular_produccion", "Anular producciones", "produccion"),
     ("anular_despachos", "Anular guías de despacho", "despachos"),
@@ -189,6 +191,9 @@ CREATE TABLE IF NOT EXISTS fudo_stock_envios(despacho_id INTEGER PRIMARY KEY REF
 CREATE TABLE IF NOT EXISTS fudo_sincronizaciones(id INTEGER PRIMARY KEY, tienda_id INTEGER NOT NULL REFERENCES tiendas(id), fecha TEXT NOT NULL,
   creado TEXT NOT NULL, usuario_id INTEGER REFERENCES usuarios(id), estado TEXT NOT NULL DEFAULT 'VIGENTE', detalle TEXT NOT NULL DEFAULT '[]');
 CREATE TABLE IF NOT EXISTS pos_inventarios(referencia TEXT PRIMARY KEY, inventario_id INTEGER NOT NULL REFERENCES inventarios(id));
+CREATE TABLE IF NOT EXISTS ediciones(id INTEGER PRIMARY KEY, doc_tipo TEXT NOT NULL, doc_id INTEGER NOT NULL, usuario_id INTEGER REFERENCES usuarios(id),
+  fecha TEXT NOT NULL, detalle TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS ix_ediciones_doc ON ediciones(doc_tipo, doc_id);
 CREATE TABLE IF NOT EXISTS inventario_items(inventario_id INTEGER NOT NULL REFERENCES inventarios(id) ON DELETE CASCADE,
   articulo_id INTEGER NOT NULL REFERENCES articulos(id), stock_sistema REAL NOT NULL, conteo REAL, diferencia REAL,
   PRIMARY KEY(inventario_id, articulo_id));
@@ -603,6 +608,207 @@ def recibir_despacho(db, did, tienda_id, recibidos, responsable, obs, referencia
                (hoy, responsable, obs, referencia, did))
 
 
+# ---------------------------------------------------------------- edición de compras y guías
+# Se compara el detalle anterior con el nuevo artículo por artículo: el stock se mueve solo por la diferencia
+# (movimientos EDICION_COMPRA / EDICION_DESPACHO, con el mismo documento: anular después revierte todo junto),
+# y cada edición queda registrada en 'ediciones' con quién, cuándo y qué cambió.
+
+def registrar_edicion(db, uid, doc_tipo, doc_id, cambios):
+    db.execute("INSERT INTO ediciones(doc_tipo,doc_id,usuario_id,fecha,detalle) VALUES(?,?,?,?,?)",
+               (doc_tipo, doc_id, uid, ahora_dt().strftime("%Y-%m-%d %H:%M:%S"), "; ".join(cambios)[:2000]))
+
+
+def ediciones_de(db, doc_tipo, doc_id):
+    return rows(db, "SELECT e.fecha, e.detalle, u.nombre usuario FROM ediciones e LEFT JOIN usuarios u ON u.id=e.usuario_id "
+                    "WHERE e.doc_tipo=? AND e.doc_id=? ORDER BY e.id", doc_tipo, doc_id)
+
+
+def ajustar_cpp_edicion(db, art_id, q0, p0, q1, p1):
+    """Costo promedio: deshace el efecto de la línea anterior (q0 a p0) y aplica la nueva (q1 a p1) sobre el stock actual."""
+    a = articulo(db, art_id)
+    s, c = max(stock_de(db, CENTRAL, art_id), 0), costo_de(a)
+    s1 = s - q0
+    if s1 > 1e-9:
+        c1 = (s * c - q0 * p0) / s1
+        if c1 < 0:  # otras compras o ajustes posteriores: no se puede deshacer exacto, se conserva el costo actual
+            c1 = c
+    else:
+        s1, c1 = 0, 0
+    s2 = s1 + q1
+    nuevo = (s1 * c1 + q1 * p1) / s2 if s2 > 1e-9 else c
+    db.execute("UPDATE articulos SET costo=? WHERE id=?", (round(nuevo, 5), art_id))
+
+
+def cambio_linea(a, q0, p0, q1, p1, con_precio=True):
+    u = a["unidad"]
+    if not q0:
+        return f"+ {a['nombre']}: {q1:g} {u}" + (f" a ${p1:g}" if con_precio else "")
+    if not q1:
+        return f"− {a['nombre']} (quitado; tenía {q0:g} {u})"
+    partes = []
+    if abs(q0 - q1) > 1e-9:
+        partes.append(f"cantidad {q0:g} → {q1:g} {u}")
+    if con_precio and abs(p0 - p1) > 1e-9:
+        partes.append(f"precio {p0:g} → {p1:g}")
+    return f"{a['nombre']}: " + ", ".join(partes)
+
+
+def editar_compra(db, uid, cid, d):
+    co = row(db, "SELECT * FROM compras WHERE id=?", cid)
+    if not co:
+        raise ApiError(404, "Compra no encontrada.")
+    if co["estado"] != "VIGENTE":
+        raise ApiError(409, "La compra está anulada: no se puede editar.")
+    fac = row(db, "SELECT documento FROM compra_facturas WHERE id=? AND estado='VIGENTE'", co["factura_id"]) if co["factura_id"] else None
+    if fac:
+        raise ApiError(409, f"Esta guía ya fue neteada con la factura {fac['documento']}. Anula primero esa factura para editarla.")
+    fecha = fecha_valida(d.get("fecha") or co["fecha"])
+    tipo_doc = d.get("tipo_documento", co["tipo_documento"]) or co["tipo_documento"]
+    if tipo_doc != co["tipo_documento"] and tipo_doc not in TIPOS_DOC_COMPRA:
+        raise ApiError(400, "Indica si el documento es factura, boleta o guía de despacho.")
+    prov = entero(d.get("proveedor_id", co["proveedor_id"]), "el proveedor")
+    if prov != co["proveedor_id"] and not row(db, "SELECT id FROM proveedores WHERE id=? AND activo=1", prov):
+        raise ApiError(400, "Proveedor no válido o inactivo.")
+    documento = txt(d.get("documento", co["documento"]), "El documento", False, 40)
+    if tipo_doc == "GUIA" and not documento:
+        documento = f"SN-{cid:06d}"
+    obs = txt(d.get("obs", co["obs"]), "La observación", False, 500)
+    items = lineas(d.get("items"), "El precio")
+    arts = {}
+    for i in items:
+        a = articulo(db, i["articulo_id"])
+        if a["tipo"] != "INSUMO":
+            raise ApiError(400, f"{a['nombre']} no es un insumo: solo los insumos se compran a proveedores.")
+        arts[a["id"]] = a
+    viejos = {r["articulo_id"]: r for r in rows(db, "SELECT * FROM compra_items WHERE compra_id=?", cid)}
+    nuevos = {i["articulo_id"]: i for i in items}
+    for aid in viejos:
+        arts.setdefault(aid, articulo(db, aid))
+    hoy = hoy_d().isoformat()
+    ref = f"Edición compra #{cid}"
+    cambios = []
+    for aid in sorted(set(viejos) | set(nuevos), key=lambda x: arts[x]["nombre"]):
+        q0, p0 = (viejos[aid]["cantidad"], viejos[aid]["precio"]) if aid in viejos else (0, 0)
+        q1, p1 = (nuevos[aid]["cantidad"], nuevos[aid]["precio"]) if aid in nuevos else (0, 0)
+        if abs(q0 - q1) < 1e-9 and abs(p0 - p1) < 1e-9:
+            continue
+        ajustar_cpp_edicion(db, aid, q0, p0, q1, p1)
+        delta = round(q1 - q0, 5)
+        if delta:
+            # bajar o quitar una línea saca ese stock de la central: si ya se usó, mover() lo impide (409)
+            mover(db, aid, CENTRAL, delta, "EDICION_COMPRA", uid, hoy, "COMPRA", cid, ref, proveedor=prov, costo=p1 if q1 else p0,
+                  obs=cambio_linea(arts[aid], q0, p0, q1, p1))
+        cambios.append(cambio_linea(arts[aid], q0, p0, q1, p1))
+    for campo, antes, despues in (("fecha", co["fecha"], fecha), ("proveedor", co["proveedor_id"], prov),
+                                  ("tipo de documento", co["tipo_documento"], tipo_doc), ("N° de documento", co["documento"], documento),
+                                  ("observación", co["obs"], obs)):
+        if antes != despues:
+            if campo == "proveedor":
+                antes = scalar(db, "SELECT nombre FROM proveedores WHERE id=?", antes)
+                despues = scalar(db, "SELECT nombre FROM proveedores WHERE id=?", despues)
+            cambios.append(f"{campo}: {antes or '—'} → {despues or '—'}")
+    if not cambios:
+        raise ApiError(400, "No hay cambios para guardar.")
+    db.execute("DELETE FROM compra_items WHERE compra_id=?", (cid,))
+    for i in items:
+        db.execute("INSERT INTO compra_items VALUES(?,?,?,?)", (cid, i["articulo_id"], i["cantidad"], i["precio"]))
+    # historial de precios de esta compra: se actualiza en su lugar (conserva su orden respecto de otras compras)
+    for aid in set(viejos) - set(nuevos):
+        db.execute("DELETE FROM historial_precios WHERE compra_id=? AND articulo_id=?", (cid, aid))
+    for aid, i in nuevos.items():
+        if row(db, "SELECT id FROM historial_precios WHERE compra_id=? AND articulo_id=?", cid, aid):
+            db.execute("UPDATE historial_precios SET precio=?, fecha=?, proveedor_id=? WHERE compra_id=? AND articulo_id=?", (i["precio"], fecha, prov, cid, aid))
+        else:
+            db.execute("INSERT INTO historial_precios(articulo_id,proveedor_id,compra_id,fecha,precio) VALUES(?,?,?,?,?)", (aid, prov, cid, fecha, i["precio"]))
+    for aid in set(viejos) | set(nuevos):  # último precio de compra de cada artículo tocado
+        ultimo = scalar(db, "SELECT precio FROM historial_precios WHERE articulo_id=? ORDER BY fecha DESC, id DESC LIMIT 1", aid)
+        if ultimo is not None:
+            db.execute("UPDATE articulos SET precio=? WHERE id=?", (ultimo, aid))
+    neto = round(sum(i["cantidad"] * i["precio"] for i in items), 2)
+    iva = round(neto * co["iva_pct"] / 100, 2)
+    db.execute("UPDATE compras SET fecha=?, proveedor_id=?, tipo_documento=?, documento=?, obs=?, neto=?, iva=?, total=? WHERE id=?",
+               (fecha, prov, tipo_doc, documento, obs, neto, iva, round(neto + iva, 2), cid))
+    registrar_edicion(db, uid, "COMPRA", cid, cambios)
+    return {"id": cid, "cambios": cambios}
+
+
+def editar_despacho(db, uid, did, d):
+    g = row(db, "SELECT * FROM despachos WHERE id=?", did)
+    if not g:
+        raise ApiError(404, "Guía no encontrada.")
+    if g["estado"] != "VIGENTE":
+        raise ApiError(409, "La guía está anulada: no se puede editar.")
+    if g["recepcion"] == "RECIBIDA":
+        raise ApiError(409, "La tienda ya recibió esta guía en el POS: corrige la diferencia con una devolución de tienda o una toma de inventario.")
+    if g["fudo_estado"] in ("ENVIADO", "ENVIANDO", "REVISAR"):
+        raise ApiError(409, "Esta guía ya se envió a Fudo como gasto. Anúlala en Fudo primero para editarla.")
+    envio = row(db, "SELECT estado FROM fudo_stock_envios WHERE despacho_id=?", did)
+    if envio and envio["estado"] not in ("REVERTIDO",):
+        raise ApiError(409, "El stock de esta guía ya se sumó en Fudo. Réstalo en Fudo primero para editarla.")
+    if d.get("tienda_id") not in (None, "") and entero(d.get("tienda_id"), "la tienda") != g["tienda_id"]:
+        raise ApiError(400, "No se puede cambiar la tienda de una guía: anúlala y emite una nueva.")
+    fecha = fecha_valida(d.get("fecha") or g["fecha"])
+    transp = txt(d.get("transportista", g["transportista"]), "El transportista", False, 100)
+    patente = txt(d.get("patente", g["patente"]), "La patente", False, 12).upper()
+    obs = txt(d.get("obs", g["obs"]), "La observación", False, 500)
+    items = d.get("items")
+    if not isinstance(items, list) or not items:
+        raise ApiError(400, "Debes dejar al menos una línea en la guía.")
+    viejos = {r["articulo_id"]: r for r in rows(db, "SELECT * FROM despacho_items WHERE despacho_id=?", did)}
+    nuevos, arts = {}, {}
+    for i in items:
+        if not isinstance(i, dict):
+            raise ApiError(400, "Detalle inválido.")
+        aid = entero(i.get("articulo_id"), "el artículo en cada línea")
+        if aid in nuevos:
+            raise ApiError(400, "Hay un artículo repetido en el detalle.")
+        a = articulo(db, aid)
+        if not (a["tipo"] == "PRODUCTO" or a["desechable"]):
+            raise ApiError(400, f"{a['nombre']} no se despacha a tiendas: solo productos terminados, desechables o de aseo e insumos de puntos de venta.")
+        precio = i.get("precio")
+        precio = num(precio, "El precio") if precio not in (None, "") else (viejos[aid]["precio"] if aid in viejos else a["precio"])
+        nuevos[aid] = {"cantidad": num(i.get("cantidad"), "La cantidad", 0, True), "precio": precio}
+        arts[aid] = a
+    for aid in viejos:
+        arts.setdefault(aid, articulo(db, aid))
+    en_camino = g["recepcion"] == "EN_CAMINO"
+    tienda = g["tienda_id"]
+    hoy = hoy_d().isoformat()
+    ref = f"Edición guía {did:06d}"
+    cambios = []
+    for aid in sorted(set(viejos) | set(nuevos), key=lambda x: arts[x]["nombre"]):
+        q0, p0 = (viejos[aid]["cantidad"], viejos[aid]["precio"]) if aid in viejos else (0, 0)
+        q1, p1 = (nuevos[aid]["cantidad"], nuevos[aid]["precio"]) if aid in nuevos else (0, 0)
+        if abs(q0 - q1) < 1e-9 and abs(p0 - p1) < 1e-9:
+            continue
+        delta = round(q1 - q0, 5)
+        nota = cambio_linea(arts[aid], q0, p0, q1, p1)
+        if delta > 0:  # sale más de la central (y entra a la tienda si no va en camino)
+            mover(db, aid, CENTRAL, -delta, "EDICION_DESPACHO", uid, hoy, "DESPACHO", did, ref, destino=tienda, obs=nota)
+            if not en_camino:
+                mover(db, aid, tienda, delta, "EDICION_DESPACHO", uid, hoy, "DESPACHO", did, ref, destino=tienda, obs=nota)
+        elif delta < 0:  # vuelve a la central (la tienda debe tener todavía ese stock)
+            if not en_camino:
+                mover(db, aid, tienda, delta, "EDICION_DESPACHO", uid, hoy, "DESPACHO", did, ref, destino=tienda, obs=nota)
+            mover(db, aid, CENTRAL, -delta, "EDICION_DESPACHO", uid, hoy, "DESPACHO", did, ref, destino=tienda, obs=nota)
+        cambios.append(nota)
+    for campo, antes, despues in (("fecha", g["fecha"], fecha), ("transportista", g["transportista"], transp),
+                                  ("patente", g["patente"], patente), ("observación", g["obs"], obs)):
+        if antes != despues:
+            cambios.append(f"{campo}: {antes or '—'} → {despues or '—'}")
+    if not cambios:
+        raise ApiError(400, "No hay cambios para guardar.")
+    db.execute("DELETE FROM despacho_items WHERE despacho_id=?", (did,))
+    for aid, i in nuevos.items():
+        db.execute("INSERT INTO despacho_items(despacho_id,articulo_id,cantidad,precio) VALUES(?,?,?,?)", (did, aid, i["cantidad"], i["precio"]))
+    neto = round(sum(i["cantidad"] * i["precio"] for i in nuevos.values()), 2)
+    iva = round(neto * g["iva_pct"] / 100, 2)
+    db.execute("UPDATE despachos SET fecha=?, transportista=?, patente=?, obs=?, neto=?, iva=?, total=? WHERE id=?",
+               (fecha, transp, patente, obs, neto, iva, round(neto + iva, 2), did))
+    registrar_edicion(db, uid, "DESPACHO", did, cambios)
+    return {"id": did, "cambios": cambios}
+
+
 def crear_merma(db, uid, d, bodega):
     fecha = fecha_valida(d.get("fecha"))
     a = articulo(db, entero(d.get("articulo_id"), "el artículo"))
@@ -627,7 +833,17 @@ def anular(db, uid, tabla, doc_tipo, doc_id, negativo=False, cuando=None):
     if doc["estado"] == "ANULADO":
         raise ApiError(409, "El documento ya está anulado.")
     hoy = cuando or ahora_dt().strftime("%Y-%m-%d %H:%M:%S")
-    for m in rows(db, "SELECT * FROM movimientos WHERE doc_tipo=? AND doc_id=? AND tipo<>'ANULACION'", doc_tipo, doc_id):
+    # Se revierte el NETO de cada artículo en cada bodega: un documento editado tiene varios movimientos del mismo artículo
+    # (+10 y luego −2), y revertirlos uno a uno podría pedir más stock del que realmente hay que devolver.
+    netos = {}
+    for m in rows(db, "SELECT * FROM movimientos WHERE doc_tipo=? AND doc_id=? AND tipo<>'ANULACION' ORDER BY id", doc_tipo, doc_id):
+        k = (m["articulo_id"], m["bodega_id"])
+        if k not in netos:
+            netos[k] = dict(m, cantidad=0)
+        netos[k]["cantidad"] = round(netos[k]["cantidad"] + m["cantidad"], 5)
+    for m in netos.values():
+        if abs(m["cantidad"]) < 1e-9:
+            continue
         mover(db, m["articulo_id"], m["bodega_id"], -m["cantidad"], "ANULACION", uid, hoy, doc_tipo, doc_id, "Anula " + m["referencia"],
               proveedor=m["proveedor_id"], destino=m["tienda_destino_id"], motivo=m["motivo_id"], costo=m["costo_unit"], negativo=negativo)
     db.execute(f"UPDATE {tabla} SET estado='ANULADO' WHERE id=?", (doc_id,))
@@ -1268,7 +1484,13 @@ def compras_detalle(c, i):
         raise ApiError(404, "Compra no encontrada.")
     r["items"] = rows(c.db, "SELECT ci.*, a.codigo, a.nombre, u.abreviatura unidad FROM compra_items ci JOIN articulos a ON a.id=ci.articulo_id "
                             "JOIN unidades u ON u.id=a.unidad_id WHERE ci.compra_id=?", int(i))
+    r["ediciones"] = ediciones_de(c.db, "COMPRA", int(i))
     return r
+
+
+@ruta("PUT", r"/api/compras/(\d+)", "compras", 2, accion="editar_compras")
+def compras_editar(c, i):
+    return editar_compra(c.db, c.uid, int(i), c.body)
 
 
 @ruta("POST", "/api/compras", "compras", 2)
@@ -2288,7 +2510,8 @@ def despachos_detalle(c, i):
     envio = row(c.db, "SELECT estado, error, manual FROM fudo_stock_envios WHERE despacho_id=?", int(i)) or {}
     r.update(fudo_stock_estado=envio.get("estado", ""), fudo_stock_error=envio.get("error", ""), fudo_stock_manual=envio.get("manual", 0),
              fudo_stock_lineas=len(despacho_lineas_fudo(c.db, r)),
-             fudo_lista=bool(row(c.db, "SELECT 1 FROM fudo_tiendas WHERE tienda_id=? AND api_secret<>'' AND categoria_id<>''", r["tienda_id"])))
+             fudo_lista=bool(row(c.db, "SELECT 1 FROM fudo_tiendas WHERE tienda_id=? AND api_secret<>'' AND categoria_id<>''", r["tienda_id"])),
+             ediciones=ediciones_de(c.db, "DESPACHO", int(i)))
     return r
 
 
@@ -2296,6 +2519,12 @@ def despachos_detalle(c, i):
 def despachos_crear(c):
     c.sin_tienda()
     return {"id": crear_despacho(c.db, c.uid, c.body)}
+
+
+@ruta("PUT", r"/api/despachos/(\d+)", "despachos", 2, accion="editar_despachos")
+def despachos_editar(c, i):
+    c.sin_tienda()
+    return editar_despacho(c.db, c.uid, int(i), c.body)
 
 
 @ruta("POST", r"/api/despachos/(\d+)/anular", "despachos", 2, accion="anular_despachos")
@@ -3032,6 +3261,7 @@ TIPOS_MOV_NOMBRE = {
     "CONSUMO_CENTRAL": "Consumo interno central", "VENTA_FUDO": "Ventas en Fudo", "TRANSFERENCIA_SALIDA": "Transferencia enviada",
     "TRANSFERENCIA_ENTRADA": "Transferencia recibida", "FALTANTE_DESPACHO": "Faltante de despacho",
     "ENTRADA_CAMBIO": "Entrada por cambio (POS)", "SALIDA_CAMBIO": "Salida por cambio (POS)",
+    "EDICION_COMPRA": "Edición de compra", "EDICION_DESPACHO": "Edición de guía",
 }
 
 

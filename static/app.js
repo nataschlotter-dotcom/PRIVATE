@@ -12,7 +12,10 @@ const TIPOS_MOV = {
   VENTA_FUDO: ['Ventas en Fudo', ''], TRANSFERENCIA_SALIDA: ['Transferencia enviada a otra tienda', ''], TRANSFERENCIA_ENTRADA: ['Transferencia recibida de otra tienda', 'bien'],
   FALTANTE_DESPACHO: ['Faltante de despacho (vuelve a la central)', 'alerta'],
   ENTRADA_CAMBIO: ['Entrada por cambio de producto (POS)', 'bien'], SALIDA_CAMBIO: ['Salida por cambio de producto (POS)', ''],
+  EDICION_COMPRA: ['Edición de compra', 'dorada'], EDICION_DESPACHO: ['Edición de guía', 'dorada'],
 };
+// Historial de cambios de un documento editado (compra o guía)
+const htmlEdiciones = l => l?.length ? `<div class="ediciones"><b>Modificaciones</b><ul>${l.map(e => `<li><span class="tenue">${fFecha(e.fecha.slice(0, 10))} ${e.fecha.slice(11, 16)} · ${esc(e.usuario || '—')}:</span> ${esc(e.detalle)}</li>`).join('')}</ul></div>` : '';
 const NAV = [
   ['', [['panel', 'Panel de inicio']]],
   ['Compras', [['compras', 'Compras y proveedores', ['compras', 'proveedores']], ['devoluciones', 'Devoluciones a proveedores']]],
@@ -528,6 +531,7 @@ Vistas.compras = async v => {
     const filas = await api('GET', '/compras');
     tabla(c, { filas, csv: 'compras', vacio: 'Aún no hay compras.', acciones: {
       ver: async r => verCompra(r.id),
+      editar: r => editarCompra(r.id),
       anular: r => confirmar('Anular compra', `Se revertirá el stock de la compra #${r.id}. Solo es posible si el stock aún está disponible.`, async () => { await api('POST', `/compras/${r.id}/anular`, {}); aviso('Compra anulada.'); render(); }, 'Anular compra'),
     }, cols: [
       { t: 'N°', v: r => r.id }, { t: 'Fecha', v: r => r.fecha, h: r => fFecha(r.fecha) }, { t: 'Proveedor', v: r => r.proveedor }, { t: 'RUT', v: r => r.rut }, { t: 'Tipo', v: r => TIPOS_DOC[r.tipo_documento] || '—' }, { t: 'Documento', v: r => r.documento },
@@ -535,7 +539,7 @@ Vistas.compras = async v => {
       { t: 'Estado', v: r => r.estado, h: r => r.estado === 'ANULADO' ? etq('Anulada', 'mal') : etq('Vigente', 'bien') },
       { t: 'Factura', v: r => r.tipo_documento !== 'GUIA' || r.estado === 'ANULADO' ? '' : r.factura_doc ? 'Factura ' + r.factura_doc : 'Pendiente de factura',
         h: r => r.tipo_documento !== 'GUIA' || r.estado === 'ANULADO' ? '' : r.factura_doc ? etq('Factura ' + r.factura_doc, 'bien') : etq('Pendiente de factura', 'alerta') },
-      { t: '', h: r => `<div class="acciones">${accion('ver', 'Ver')}${r.estado !== 'ANULADO' && !r.factura_doc && can('compras', 2) && puede('anular_compras') ? accion('anular', 'Anular', 'peligro') : ''}</div>` }] });
+      { t: '', h: r => `<div class="acciones">${accion('ver', 'Ver')}${puedeEditarCompra(r) ? accion('editar', 'Editar') : ''}${r.estado !== 'ANULADO' && !r.factura_doc && can('compras', 2) && puede('anular_compras') ? accion('anular', 'Anular', 'peligro') : ''}</div>` }] });
     $('#nueva', v)?.addEventListener('click', nuevaCompra);
   } else if (t === 'guias') {
     await vistaGuiasPorFacturar(v, c);
@@ -623,24 +627,37 @@ function registrarFactura(provSel) {
   });
   cargar();
 }
-function nuevaCompra() {
-  const activos = S.cat.proveedores.filter(p => p.activo);
-  const m = modal('Registrar compra', `<form novalidate><div class="campos"><label class="campo"><span>Proveedor</span><select name="proveedor_id">${opciones(activos, '', 'Selecciona…')}</select></label>
-    <label class="campo"><span>Fecha</span><input type="date" name="fecha" value="${hoy()}"></label><label class="campo"><span>Tipo de documento</span><select name="tipo_documento">${opciones(Object.entries(TIPOS_DOC).map(([id, nombre]) => ({ id, nombre })), '', 'Selecciona…')}</select></label><label class="campo"><span>N° de documento</span><input name="documento"><small class="doc-ayuda" hidden>Si no tienes el número de la guía, déjalo vacío: se asigna uno automático (SN-…).</small></label></div>
+const puedeEditarCompra = c => c.estado === 'VIGENTE' && !c.factura_doc && can('compras', 2) && puede('editar_compras');
+async function editarCompra(id) { nuevaCompra(await api('GET', `/compras/${id}`)); }
+function nuevaCompra(c = null) {
+  // c = compra existente: se edita (mismos campos y detalle; el stock y los precios se ajustan por la diferencia)
+  const activos = S.cat.proveedores.filter(p => p.activo || (c && p.id === c.proveedor_id));
+  const pct = c ? c.iva_pct : S.cat.iva;
+  const m = modal(c ? `Editar compra #${c.id}` : 'Registrar compra', `<form novalidate>${c ? '<p class="nota">Cambia cantidades o precios, quita o agrega líneas. El stock de la bodega central se ajusta solo por la diferencia, y se recalculan el último precio y el costo promedio de cada insumo modificado.</p>' : ''}
+    <div class="campos"><label class="campo"><span>Proveedor</span><select name="proveedor_id">${opciones(activos, c?.proveedor_id ?? '', 'Selecciona…')}</select></label>
+    <label class="campo"><span>Fecha</span><input type="date" name="fecha" value="${c?.fecha ?? hoy()}"></label><label class="campo"><span>Tipo de documento</span><select name="tipo_documento">${opciones(Object.entries(TIPOS_DOC).map(([id, nombre]) => ({ id, nombre })), c?.tipo_documento ?? '', 'Selecciona…')}</select></label><label class="campo"><span>N° de documento</span><input name="documento" value="${esc(c?.documento ?? '')}"><small class="doc-ayuda" ${c?.tipo_documento === 'GUIA' ? '' : 'hidden'}>Si no tienes el número de la guía, déjalo vacío: se asigna uno automático (SN-…).</small></label></div>
     <h3 style="font-size:14px;margin:14px 0 6px">Detalle</h3><div id="lin"></div><div class="totales" id="tot"></div><div class="error" hidden></div>
-    <div class="modal-pie"><button type="button" class="btn cerrar">Cancelar</button><button class="btn primario">Registrar compra</button></div></form>`, true);
+    <div class="modal-pie"><button type="button" class="btn cerrar">Cancelar</button><button class="btn primario">${c ? 'Guardar cambios' : 'Registrar compra'}</button></div></form>`, true);
   $$('.cerrar', m.el).forEach(b => b.addEventListener('click', m.cerrar));
   $('select[name=tipo_documento]', m.el).addEventListener('change', e => { $('.doc-ayuda', m.el).hidden = e.target.value !== 'GUIA'; });
   const totales = () => {
-    const n = ed ? ed.neto() : 0, i = n * S.cat.iva / 100;
-    $('#tot', m.el).innerHTML = `<div><span>Neto</span><span>${fPeso(n)}</span></div><div><span>IVA ${fNum(S.cat.iva, 0, 2)}%</span><span>${fPeso(i)}</span></div><div class="total"><span>Total</span><span>${fPeso(n + i)}</span></div>`;
+    const n = ed ? ed.neto() : 0, i = n * pct / 100;
+    $('#tot', m.el).innerHTML = `<div><span>Neto</span><span>${fPeso(n)}</span></div><div><span>IVA ${fNum(pct, 0, 2)}%</span><span>${fPeso(i)}</span></div><div class="total"><span>Total</span><span>${fPeso(n + i)}</span></div>
+      ${c ? `<div><span class="tenue">Total anterior</span><span class="tenue">${fPeso(c.total)}</span></div>` : ''}`;
   };
   let ed = null;
-  ed = editorLineas($('#lin', m.el), { articulos: S.cat.articulos.filter(a => a.tipo === 'INSUMO'), precio: 'Precio neto', editaPrecio: true, alCambiar: totales });
+  ed = editorLineas($('#lin', m.el), { articulos: S.cat.articulos.filter(a => a.tipo === 'INSUMO'), precio: 'Precio neto', editaPrecio: true, alCambiar: totales,
+    valores: c ? c.items.map(i => ({ articulo_id: i.articulo_id, cantidad: i.cantidad, precio: i.precio })) : [] });
   totales();
   conEnvio($('form', m.el), m, async () => {
     const f = $('form', m.el);
-    await api('POST', '/compras', { proveedor_id: f.proveedor_id.value, fecha: f.fecha.value, tipo_documento: f.tipo_documento.value, documento: f.documento.value, items: ed.leer() });
+    const datos = { proveedor_id: f.proveedor_id.value, fecha: f.fecha.value, tipo_documento: f.tipo_documento.value, documento: f.documento.value, items: ed.leer() };
+    if (c) {
+      const r = await api('PUT', `/compras/${c.id}`, datos);
+      aviso(`Compra #${c.id} modificada (${r.cambios.length} cambio${r.cambios.length === 1 ? '' : 's'}): stock y precios actualizados.`); render();
+      return;
+    }
+    await api('POST', '/compras', datos);
     aviso(f.tipo_documento.value === 'GUIA' ? 'Guía registrada: el stock aumentó. Queda pendiente de factura.' : 'Compra registrada: el stock aumentó.'); render();
   });
 }
@@ -649,7 +666,10 @@ async function verCompra(id) {
   const m = modal(`Compra #${c.id}`, `<div class="guia-datos"><div><b>Proveedor:</b> ${esc(c.proveedor)}</div><div><b>RUT:</b> ${esc(c.rut)}</div><div><b>Fecha:</b> ${fFecha(c.fecha)}</div><div><b>Tipo de documento:</b> ${esc(TIPOS_DOC[c.tipo_documento]) || '—'}</div><div><b>Documento:</b> ${esc(c.documento) || '—'}</div><div><b>Registrada por:</b> ${esc(c.usuario)}</div>
     ${c.tipo_documento === 'GUIA' ? `<div><b>Factura:</b> ${c.factura_doc ? `${esc(c.factura_doc)} del ${fFecha(c.factura_fecha)}` : 'Pendiente'}</div>` : ''}</div>
     <div class="tabla-marco"><table><thead><tr><th>Código</th><th>Insumo</th><th class="n">Cantidad</th><th class="n">Precio neto</th><th class="n">Subtotal</th></tr></thead><tbody>${c.items.map(i => `<tr><td>${esc(i.codigo)}</td><td>${esc(i.nombre)}</td><td class="n">${fCant(i.cantidad)} ${esc(i.unidad)}</td><td class="n">${fPrecio(i.precio)}</td><td class="n">${fPeso(i.cantidad * i.precio)}</td></tr>`).join('')}</tbody></table></div>
-    <div class="totales"><div><span>Neto</span><span>${fPeso(c.neto)}</span></div><div><span>IVA ${fNum(c.iva_pct, 0, 2)}%</span><span>${fPeso(c.iva)}</span></div><div class="total"><span>Total</span><span>${fPeso(c.total)}</span></div></div>`, true);
+    <div class="totales"><div><span>Neto</span><span>${fPeso(c.neto)}</span></div><div><span>IVA ${fNum(c.iva_pct, 0, 2)}%</span><span>${fPeso(c.iva)}</span></div><div class="total"><span>Total</span><span>${fPeso(c.total)}</span></div></div>
+    ${htmlEdiciones(c.ediciones)}
+    ${puedeEditarCompra(c) ? '<div class="modal-pie"><button type="button" class="btn primario c-editar">Editar compra</button></div>' : ''}`, true);
+  $('.c-editar', m.el)?.addEventListener('click', () => { m.cerrar(); nuevaCompra(c); });
   return m;
 }
 
@@ -1551,7 +1571,7 @@ Vistas.despachos = async v => {
   };
   const estadoFudo = r => r.fudo_estado === 'ENVIADO' ? etq(r.estado === 'ANULADO' ? 'Gasto vigente' : `Gasto #${r.fudo_gasto_id}`, r.estado === 'ANULADO' ? 'alerta' : 'bien') +
       (r.estado === 'ANULADO' ? '' : r.fudo_pago && r.fudo_pago !== 'REVISAR' ? ' ' + etq('Pagado', 'bien') : ' ' + etq(r.fudo_pago === 'REVISAR' ? 'Pago por revisar' : 'Sin pago', 'alerta')) : r.fudo_estado === 'ANULADO' ? etq('Gasto anulado') : ['ENVIANDO', 'REVISAR'].includes(r.fudo_estado) ? etq('Revisar', 'alerta') : r.estado === 'VIGENTE' ? etq('Sin enviar') : '—';
-  tabla(c, { filas, csv: 'despachos', vacio: 'Aún no hay guías.', acciones: { ver: r => verGuia(r.id),
+  tabla(c, { filas, csv: 'despachos', vacio: 'Aún no hay guías.', acciones: { ver: r => verGuia(r.id), editar: async r => formularioGuia(await api('GET', `/despachos/${r.id}`)),
     fudo: r => confirmar('Enviar a Fudo', `Se creará un gasto del proveedor Nata & Schlott en la cuenta Fudo de ${r.tienda} por la guía ${nGuia(r)}${r.fudo_stock_lineas ? `, y se sumará el stock de sus ${r.fudo_stock_lineas} insumo(s) equivalentes` : ''}.`, () => fudoEnvio(r, '', {}, 'Gasto creado en Fudo.'), 'Enviar a Fudo'),
     fudorev: r => confirmar('Reenviar a Fudo', `No se sabe si el gasto de la guía ${nGuia(r)} llegó a Fudo. Busca el comprobante GD-${nGuia(r)} en Fudo: reenvía solo si NO está, para no duplicarlo.`, () => fudoEnvio(r, '', { confirmar_reenvio: true }, 'Gasto creado en Fudo.'), 'No está: reenviar'),
     fudoanula: r => confirmar('Anular gasto en Fudo', `Se anulará en Fudo el gasto #${r.fudo_gasto_id} de la guía ${nGuia(r)}${r.fudo_stock_estado === 'ENVIADO' ? ' y se restará el stock que se había sumado' : ''}.`, () => fudoEnvio(r, '/anular', {}, 'Gasto anulado en Fudo.'), 'Anular gasto'),
@@ -1568,30 +1588,48 @@ Vistas.despachos = async v => {
       h: r => r.estado === 'ANULADO' ? etq('Anulada', 'mal') : r.recepcion === 'EN_CAMINO' ? etq('En camino', 'alerta')
         : r.recepcion === 'RECIBIDA' ? etq(r.faltantes ? 'Recibida con faltantes' : 'Recibida', r.faltantes ? 'alerta' : 'bien') : etq('Emitida', 'bien') },
     ...(S.usuario.tienda_id ? [] : [{ t: 'Fudo', v: r => r.fudo_estado, h: estadoFudo }, { t: 'Stock Fudo', v: r => r.fudo_stock_estado, h: estadoStockFudo }]),
-    { t: '', h: r => `<div class="acciones">${accion('ver', 'Ver guía')}${crea ? accionStockFudo(r) : ''}${crea && puede('enviar_fudo') && r.estado === 'VIGENTE' && !r.fudo_estado ? accion('fudo', 'Enviar a Fudo') : ''}${crea && puede('enviar_fudo') && r.estado === 'VIGENTE' && ['ENVIANDO', 'REVISAR'].includes(r.fudo_estado) ? accion('fudorev', 'Revisar Fudo') : ''}${crea && puede('anular_fudo') && r.estado === 'ANULADO' && r.fudo_estado === 'ENVIADO' ? accion('fudoanula', 'Anular en Fudo', 'peligro') : ''}${r.estado === 'VIGENTE' && crea && puede('anular_despachos') ? accion('anular', 'Anular', 'peligro') : ''}</div>` }] });
-  $('#n', v)?.addEventListener('click', async () => {
-    const central = await api('GET', '/stock/central');
-    const stock = Object.fromEntries(central.map(a => [a.articulo_id, a.cantidad]));
-    const m = modal('Nueva guía de despacho', `<form novalidate><div class="campos"><label class="campo"><span>Tienda de destino</span><select name="tienda_id">${opciones(S.cat.tiendas.filter(t => t.activo), '', 'Selecciona…')}</select></label>
-      <label class="campo"><span>Fecha</span><input type="date" name="fecha" value="${hoy()}"></label><label class="campo"><span>Transportista</span><input name="transportista"></label><label class="campo"><span>Patente</span><input name="patente"></label></div>
-      <h3 style="font-size:14px;margin:14px 0 6px">Detalle</h3><div id="lin"></div><div class="totales" id="tot"></div>
-      <label class="campo" style="margin-top:8px"><span>Observación</span><input name="obs"></label><div class="error" hidden></div>
-      <div class="modal-pie"><button type="button" class="btn cerrar">Cancelar</button><button class="btn primario">Emitir guía</button></div></form>`, true);
-    $$('.cerrar', m.el).forEach(b => b.addEventListener('click', m.cerrar));
-    let ed = null;
-    const tot = () => { const n = ed ? ed.neto() : 0, i = n * S.cat.iva / 100; $('#tot', m.el).innerHTML = `<div><span>Neto</span><span>${fPeso(n)}</span></div><div><span>IVA ${fNum(S.cat.iva, 0, 2)}%</span><span>${fPeso(i)}</span></div><div class="total"><span>Total</span><span>${fPeso(n + i)}</span></div>`; };
-    ed = editorLineas($('#lin', m.el), { articulos: S.cat.articulos.filter(a => a.tipo === 'PRODUCTO' || a.desechable), stock, precio: 'Precio', alCambiar: tot,
-      grupos: [...new Set(S.cat.articulos.filter(a => a.tipo === 'PRODUCTO' || a.desechable).sort((x, y) => (x.desechable - y.desechable) || (x.punto_venta - y.punto_venta) || x.categoria.localeCompare(y.categoria)).map(grupoDespacho))].map(nombre => ({ nombre, filtro: a => grupoDespacho(a) === nombre })) });
-    tot();
-    const f = $('form', m.el);
-    conEnvio(f, m, async () => {
-      const r = await api('POST', '/despachos', { tienda_id: f.tienda_id.value, fecha: f.fecha.value, transportista: f.transportista.value, patente: f.patente.value, obs: f.obs.value, items: ed.leer() });
-      const t = S.cat.tiendas.find(x => String(x.id) === String(f.tienda_id.value));
-      aviso(t && t.recibe_pos ? 'Guía emitida: va en camino; entra al stock de la tienda cuando la reciban en el POS.' : 'Guía emitida: stock de la tienda actualizado.');
-      render(); verGuia(r.id);
-    });
-  });
+    { t: '', h: r => `<div class="acciones">${accion('ver', 'Ver guía')}${crea && puedeEditarGuia(r) ? accion('editar', 'Editar') : ''}${crea ? accionStockFudo(r) : ''}${crea && puede('enviar_fudo') && r.estado === 'VIGENTE' && !r.fudo_estado ? accion('fudo', 'Enviar a Fudo') : ''}${crea && puede('enviar_fudo') && r.estado === 'VIGENTE' && ['ENVIANDO', 'REVISAR'].includes(r.fudo_estado) ? accion('fudorev', 'Revisar Fudo') : ''}${crea && puede('anular_fudo') && r.estado === 'ANULADO' && r.fudo_estado === 'ENVIADO' ? accion('fudoanula', 'Anular en Fudo', 'peligro') : ''}${r.estado === 'VIGENTE' && crea && puede('anular_despachos') ? accion('anular', 'Anular', 'peligro') : ''}</div>` }] });
+  $('#n', v)?.addEventListener('click', () => formularioGuia());
 };
+// Una guía se puede editar si está vigente, no fue recibida en el POS y no está en Fudo (gasto ni stock)
+const puedeEditarGuia = g => g.estado === 'VIGENTE' && g.recepcion !== 'RECIBIDA' && !['ENVIADO', 'ENVIANDO', 'REVISAR'].includes(g.fudo_estado)
+  && (!g.fudo_stock_estado || g.fudo_stock_estado === 'REVERTIDO') && can('despachos', 2) && puede('editar_despachos') && !S.usuario.tienda_id;
+async function formularioGuia(g = null) {
+  // g = guía existente: se edita (cantidades, precios, líneas y datos de transporte; la tienda no cambia)
+  const central = await api('GET', '/stock/central');
+  const stock = Object.fromEntries(central.map(a => [a.articulo_id, a.cantidad]));
+  if (g) for (const i of g.items) stock[i.articulo_id] = (stock[i.articulo_id] || 0) + i.cantidad;  // lo de esta guía también está disponible
+  const num = g ? String(g.id).padStart(6, '0') : '';
+  const pct = g ? g.iva_pct : S.cat.iva;
+  const m = modal(g ? `Editar guía ${num}` : 'Nueva guía de despacho', `<form novalidate>${g ? `<p class="nota">Cambia cantidades o precios, quita o agrega líneas. La diferencia sale de la bodega central o vuelve a ella${g.recepcion === 'EN_CAMINO' ? ' (la guía va en camino: la tienda recibirá lo nuevo)' : ' y se ajusta el stock de la tienda'}.</p>` : ''}
+    <div class="campos"><label class="campo"><span>Tienda de destino</span><select name="tienda_id" ${g ? 'disabled' : ''}>${opciones(S.cat.tiendas.filter(t => t.activo || (g && t.id === g.tienda_id)), g?.tienda_id ?? '', 'Selecciona…')}</select></label>
+    <label class="campo"><span>Fecha</span><input type="date" name="fecha" value="${g?.fecha ?? hoy()}"></label><label class="campo"><span>Transportista</span><input name="transportista" value="${esc(g?.transportista ?? '')}"></label><label class="campo"><span>Patente</span><input name="patente" value="${esc(g?.patente ?? '')}"></label></div>
+    <h3 style="font-size:14px;margin:14px 0 6px">Detalle</h3><div id="lin"></div><div class="totales" id="tot"></div>
+    <label class="campo" style="margin-top:8px"><span>Observación</span><input name="obs" value="${esc(g?.obs ?? '')}"></label><div class="error" hidden></div>
+    <div class="modal-pie"><button type="button" class="btn cerrar">Cancelar</button><button class="btn primario">${g ? 'Guardar cambios' : 'Emitir guía'}</button></div></form>`, true);
+  $$('.cerrar', m.el).forEach(b => b.addEventListener('click', m.cerrar));
+  let ed = null;
+  const tot = () => { const n = ed ? ed.neto() : 0, i = n * pct / 100; $('#tot', m.el).innerHTML = `<div><span>Neto</span><span>${fPeso(n)}</span></div><div><span>IVA ${fNum(pct, 0, 2)}%</span><span>${fPeso(i)}</span></div><div class="total"><span>Total</span><span>${fPeso(n + i)}</span></div>${g ? `<div><span class="tenue">Total anterior</span><span class="tenue">${fPeso(g.total)}</span></div>` : ''}`; };
+  const despachables = S.cat.articulos.filter(a => a.tipo === 'PRODUCTO' || a.desechable);
+  ed = editorLineas($('#lin', m.el), { articulos: despachables, stock, precio: 'Precio', alCambiar: tot, editaPrecio: !!g,
+    valores: g ? g.items.map(i => ({ articulo_id: i.articulo_id, cantidad: i.cantidad, precio: i.precio })) : [],
+    grupos: [...new Set(despachables.sort((x, y) => (x.desechable - y.desechable) || (x.punto_venta - y.punto_venta) || x.categoria.localeCompare(y.categoria)).map(grupoDespacho))].map(nombre => ({ nombre, filtro: a => grupoDespacho(a) === nombre })) });
+  tot();
+  const f = $('form', m.el);
+  conEnvio(f, m, async () => {
+    const datos = { fecha: f.fecha.value, transportista: f.transportista.value, patente: f.patente.value, obs: f.obs.value, items: ed.leer() };
+    if (g) {
+      const r = await api('PUT', `/despachos/${g.id}`, datos);
+      aviso(`Guía ${num} modificada (${r.cambios.length} cambio${r.cambios.length === 1 ? '' : 's'}): stock actualizado.`);
+      render(); verGuia(g.id);
+      return;
+    }
+    const r = await api('POST', '/despachos', { tienda_id: f.tienda_id.value, ...datos });
+    const t = S.cat.tiendas.find(x => String(x.id) === String(f.tienda_id.value));
+    aviso(t && t.recibe_pos ? 'Guía emitida: va en camino; entra al stock de la tienda cuando la reciban en el POS.' : 'Guía emitida: stock de la tienda actualizado.');
+    render(); verGuia(r.id);
+  });
+}
 /* Guía en formato ticket para impresora térmica de 80 mm (Xprinter XP-80): 72 mm imprimibles, solo negro, sin logo
    (en papel térmico sale como una mancha). Se imprime desde un iframe propio para usar su tamaño de página. */
 function imprimirTicketGuia(g) {
@@ -1659,9 +1697,11 @@ async function verGuia(id) {
     <div class="totales"><div><span>Neto</span><span>${fPeso(g.neto)}</span></div><div><span>IVA ${fNum(g.iva_pct, 0, 2)}%</span><span>${fPeso(g.iva)}</span></div><div class="total"><span>Total</span><span>${fPeso(g.total)}</span></div></div>
     ${g.obs ? `<p><b>Observación:</b> ${esc(g.obs)}</p>` : ''}<div class="firmas"><div>Entrega</div><div>Recibe conforme</div></div>
     <p class="legal">Documento de control interno. No reemplaza la guía de despacho electrónica exigida por el SII.</p>
-    <div class="modal-pie no-imprimir">${botonesGuiaFudo(g)}<button type="button" class="btn imprimir-80">Imprimir en térmica (80 mm)</button><button type="button" class="btn primario imprimir">Imprimir</button></div>`, true);
+    <div class="no-imprimir">${htmlEdiciones(g.ediciones)}</div>
+    <div class="modal-pie no-imprimir">${puedeEditarGuia(g) ? '<button type="button" class="btn g-editar">Editar guía</button>' : ''}${botonesGuiaFudo(g)}<button type="button" class="btn imprimir-80">Imprimir en térmica (80 mm)</button><button type="button" class="btn primario imprimir">Imprimir</button></div>`, true);
   $('.imprimir', m.el).addEventListener('click', () => print());
   $('.imprimir-80', m.el).addEventListener('click', () => imprimirTicketGuia(g));
+  $('.g-editar', m.el)?.addEventListener('click', () => { m.cerrar(); formularioGuia(g); });
   const rehacer = () => { m.cerrar(); render(); verGuia(id); };
   const llamar = async (ruta, cuerpo) => {
     const x = await api('POST', `/despachos/${id}${ruta}`, cuerpo || {});
