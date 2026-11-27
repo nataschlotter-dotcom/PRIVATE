@@ -11,6 +11,7 @@ const TIPOS_MOV = {
   DEVOLUCION_TIENDA: ['Devolución de tienda', 'alerta'], RECEPCION_CENTRAL: ['Recepción en central', 'bien'], CONSUMO_CENTRAL: ['Consumo interno central', ''],
   VENTA_FUDO: ['Ventas en Fudo', ''], TRANSFERENCIA_SALIDA: ['Transferencia enviada a otra tienda', ''], TRANSFERENCIA_ENTRADA: ['Transferencia recibida de otra tienda', 'bien'],
   FALTANTE_DESPACHO: ['Faltante de despacho (vuelve a la central)', 'alerta'],
+  AJUSTE_RECEPCION: ['Corrección de recepción (POS)', 'alerta'],
   ENTRADA_CAMBIO: ['Entrada por cambio de producto (POS)', 'bien'], SALIDA_CAMBIO: ['Salida por cambio de producto (POS)', ''],
   EDICION_COMPRA: ['Edición de compra', 'dorada'], EDICION_DESPACHO: ['Edición de guía', 'dorada'],
 };
@@ -234,7 +235,7 @@ function editorLineas(caja, cfg) {
   const categorias = [...new Set(cfg.articulos.map(a => a.categoria))].sort((x, y) => x.localeCompare(y)).map(x => ({ id: x, nombre: x }));
   caja.innerHTML = `<div class="filtros"><label>Filtrar artículos por categoría<select class="cat-filtro">${opciones(categorias, '', 'Todas las categorías')}</select></label></div>
     <div class="tabla-marco"><table class="lineas"><thead><tr><th>Artículo</th><th class="n">Cantidad</th><th>Unidad</th>
-    ${cfg.stock ? '<th class="n">Disponible</th>' : ''}${cfg.precio ? `<th class="n">${esc(cfg.precio)}</th><th class="n">${esc(cfg.subtotal || 'Subtotal')}</th>` : ''}<th></th></tr></thead><tbody></tbody></table></div>
+    ${cfg.stock ? '<th class="n">Disponible</th>' : ''}${cfg.precio ? `<th class="n">${esc(cfg.precio)}</th><th class="n">${esc(cfg.subtotal || 'Subtotal')}</th>` : ''}${cfg.obs ? `<th>Observación <small class="tenue">(máx. ${cfg.obs})</small></th>` : ''}<th></th></tr></thead><tbody></tbody></table></div>
     <button type="button" class="btn mini agregar" style="margin-top:6px">+ Agregar línea</button><div class="combo-lista" role="listbox" hidden></div>`;
   const cuerpo = $('tbody', caja), lista = $('.combo-lista', caja), catFiltro = $('.cat-filtro', caja);
   const por = id => cfg.articulos.find(a => String(a.id) === String(id));
@@ -311,6 +312,7 @@ function editorLineas(caja, cfg) {
       <td class="n">${inputNum('q', v.cantidad ?? '', 5).replace('<input', '<input aria-label="Cantidad"')}</td><td class="u tenue"></td>
       ${cfg.stock ? '<td class="n d tenue"></td>' : ''}
       ${cfg.precio ? `<td class="n">${cfg.editaPrecio ? inputNum('p', v.precio ?? '', 2).replace('<input', '<input aria-label="Precio"') : '<span class="pf"></span>'}</td><td class="n s"></td>` : ''}
+      ${cfg.obs ? `<td><input class="o" type="text" maxlength="${cfg.obs}" value="${esc(v.obs ?? '')}" aria-label="Observación de la línea" placeholder="Opcional"></td>` : ''}
       <td><button type="button" class="btn mini peligro quitar" aria-label="Quitar línea">×</button></td>`;
     cuerpo.append(tr);
     if (v.articulo_id) { $('select', tr).value = v.articulo_id; $('.busca', tr).value = por(v.articulo_id) ? etiqueta(por(v.articulo_id)) : ''; }
@@ -364,6 +366,7 @@ function editorLineas(caja, cfg) {
     leer: () => $$('tr', cuerpo).filter(tr => $('select', tr).value || $('.q', tr).value).map(tr => {
       const o = { articulo_id: Number($('select', tr).value) || null, cantidad: aNum($('.q', tr).value) };
       if (cfg.editaPrecio) o.precio = aNum($('.p', tr).value);
+      if (cfg.obs) o.obs = $('.o', tr).value.trim();
       return o;
     }),
     neto: () => $$('tr', cuerpo).reduce((s, tr) => {
@@ -463,7 +466,7 @@ function pantallaAcceso() {
 
 function marco() {
   const nav = NAV.map(([g, items]) => {
-    const vis = items.filter(([m, , alt]) => (alt || [m]).some(x => can(x)));
+    const vis = items.filter(([m, , alt]) => (alt || [m]).some(x => can(x)) && (m !== 'fudo' || S.fudo));
     return vis.length ? `${g ? `<h4>${esc(g)}</h4>` : ''}${vis.map(([m, t]) => `<a href="#/${m}" data-m="${m}">${esc(t)}</a>`).join('')}` : '';
   }).join('');
   const u = S.usuario;
@@ -637,18 +640,18 @@ function nuevaCompra(c = null) {
   const m = modal(c ? `Editar compra #${c.id}` : 'Registrar compra', `<form novalidate>${c ? '<p class="nota">Cambia cantidades o precios, quita o agrega líneas. El stock de la bodega central se ajusta solo por la diferencia, y se recalculan el último precio y el costo promedio de cada insumo modificado.</p>' : ''}
     <div class="campos"><label class="campo"><span>Proveedor</span><select name="proveedor_id">${opciones(activos, c?.proveedor_id ?? '', 'Selecciona…')}</select></label>
     <label class="campo"><span>Fecha</span><input type="date" name="fecha" value="${c?.fecha ?? hoy()}"></label><label class="campo"><span>Tipo de documento</span><select name="tipo_documento">${opciones(Object.entries(TIPOS_DOC).map(([id, nombre]) => ({ id, nombre })), c?.tipo_documento ?? '', 'Selecciona…')}</select></label><label class="campo"><span>N° de documento</span><input name="documento" value="${esc(c?.documento ?? '')}"><small class="doc-ayuda" ${c?.tipo_documento === 'GUIA' ? '' : 'hidden'}>Si no tienes el número de la guía, déjalo vacío: se asigna uno automático (SN-…).</small></label></div>
+    ${c?.obs ? `<p class="nota"><b>Observación anterior de la compra:</b> ${esc(c.obs)}</p>` : ''}
     <h3 style="font-size:14px;margin:14px 0 6px">Detalle</h3><div id="lin"></div><div class="totales" id="tot"></div><div class="error" hidden></div>
     <div class="modal-pie"><button type="button" class="btn cerrar">Cancelar</button><button class="btn primario">${c ? 'Guardar cambios' : 'Registrar compra'}</button></div></form>`, true);
   $$('.cerrar', m.el).forEach(b => b.addEventListener('click', m.cerrar));
-  $('select[name=tipo_documento]', m.el).addEventListener('change', e => { $('.doc-ayuda', m.el).hidden = e.target.value !== 'GUIA'; });
-  const totales = () => {
+  $('select[name=tipo_documento]', m.el).addEventListener('change', e => { $('.doc-ayuda', m.el).hidden = e.target.value !== 'GUIA'; });  const totales = () => {
     const n = ed ? ed.neto() : 0, i = n * pct / 100;
     $('#tot', m.el).innerHTML = `<div><span>Neto</span><span>${fPeso(n)}</span></div><div><span>IVA ${fNum(pct, 0, 2)}%</span><span>${fPeso(i)}</span></div><div class="total"><span>Total</span><span>${fPeso(n + i)}</span></div>
       ${c ? `<div><span class="tenue">Total anterior</span><span class="tenue">${fPeso(c.total)}</span></div>` : ''}`;
   };
   let ed = null;
-  ed = editorLineas($('#lin', m.el), { articulos: S.cat.articulos.filter(a => a.tipo === 'INSUMO'), precio: 'Precio neto', editaPrecio: true, alCambiar: totales,
-    valores: c ? c.items.map(i => ({ articulo_id: i.articulo_id, cantidad: i.cantidad, precio: i.precio })) : [] });
+  ed = editorLineas($('#lin', m.el), { articulos: S.cat.articulos.filter(a => a.tipo === 'INSUMO'), precio: 'Precio neto', editaPrecio: true, alCambiar: totales, obs: 70,
+    valores: c ? c.items.map(i => ({ articulo_id: i.articulo_id, cantidad: i.cantidad, precio: i.precio, obs: i.obs || '' })) : [] });
   totales();
   conEnvio($('form', m.el), m, async () => {
     const f = $('form', m.el);
@@ -665,8 +668,9 @@ function nuevaCompra(c = null) {
 async function verCompra(id) {
   const c = await api('GET', `/compras/${id}`);
   const m = modal(`Compra #${c.id}`, `<div class="guia-datos"><div><b>Proveedor:</b> ${esc(c.proveedor)}</div><div><b>RUT:</b> ${esc(c.rut)}</div><div><b>Fecha:</b> ${fFecha(c.fecha)}</div><div><b>Tipo de documento:</b> ${esc(TIPOS_DOC[c.tipo_documento]) || '—'}</div><div><b>Documento:</b> ${esc(c.documento) || '—'}</div><div><b>Registrada por:</b> ${esc(c.usuario)}</div>
-    ${c.tipo_documento === 'GUIA' ? `<div><b>Factura:</b> ${c.factura_doc ? `${esc(c.factura_doc)} del ${fFecha(c.factura_fecha)}` : 'Pendiente'}</div>` : ''}</div>
-    <div class="tabla-marco"><table><thead><tr><th>Código</th><th>Insumo</th><th class="n">Cantidad</th><th class="n">Precio neto</th><th class="n">Subtotal</th></tr></thead><tbody>${c.items.map(i => `<tr><td>${esc(i.codigo)}</td><td>${esc(i.nombre)}</td><td class="n">${fCant(i.cantidad)} ${esc(i.unidad)}</td><td class="n">${fPrecio(i.precio)}</td><td class="n">${fPeso(i.cantidad * i.precio)}</td></tr>`).join('')}</tbody></table></div>
+    ${c.tipo_documento === 'GUIA' ? `<div><b>Factura:</b> ${c.factura_doc ? `${esc(c.factura_doc)} del ${fFecha(c.factura_fecha)}` : 'Pendiente'}</div>` : ''}
+    ${c.obs ? `<div class="todo"><b>Observación:</b> ${esc(c.obs)}</div>` : ''}</div>
+    <div class="tabla-marco"><table><thead><tr><th>Código</th><th>Insumo</th><th class="n">Cantidad</th><th class="n">Precio neto</th><th class="n">Subtotal</th>${c.items.some(i => i.obs) ? '<th>Observación</th>' : ''}</tr></thead><tbody>${c.items.map(i => `<tr><td>${esc(i.codigo)}</td><td>${esc(i.nombre)}</td><td class="n">${fCant(i.cantidad)} ${esc(i.unidad)}</td><td class="n">${fPrecio(i.precio)}</td><td class="n">${fPeso(i.cantidad * i.precio)}</td>${c.items.some(x => x.obs) ? `<td>${esc(i.obs || '')}</td>` : ''}</tr>`).join('')}</tbody></table></div>
     <div class="totales"><div><span>Neto</span><span>${fPeso(c.neto)}</span></div><div><span>IVA ${fNum(c.iva_pct, 0, 2)}%</span><span>${fPeso(c.iva)}</span></div><div class="total"><span>Total</span><span>${fPeso(c.total)}</span></div></div>
     ${htmlEdiciones(c.ediciones)}
     ${puedeEditarCompra(c) ? '<div class="modal-pie"><button type="button" class="btn primario c-editar">Editar compra</button></div>' : ''}`, true);
@@ -676,6 +680,7 @@ async function verCompra(id) {
 
 /* ---------- Integración con Fudo ---------- */
 Vistas.fudo = async v => {
+  if (!S.cat.fudo) { v.innerHTML = cabecera('Integración Fudo') + '<div class="tarjeta"><p class="nota">La integración con Fudo está <b>desactivada</b>. Se puede activar en <a href="#/config">Configuración</a>.</p></div>'; return; }
   if (!can('config', 2)) { v.innerHTML = cabecera('Integración Fudo') + '<div class="tarjeta">Tu perfil solo puede ver esta sección con permiso de edición en Configuración.</div>'; return; }
   const filas = await api('GET', '/fudo');
   v.innerHTML = cabecera('Integración Fudo', 'Cada tienda se conecta con su propia cuenta de Fudo. Las guías se envían como gastos desde Despachos a tiendas.');
@@ -1249,9 +1254,10 @@ Vistas.historial = async v => {
     { t: 'Fecha', v: r => r.fecha, h: r => fFecha(r.fecha) }, { t: 'Código', v: r => r.codigo }, { t: 'Artículo', v: r => r.nombre },
     { t: 'Clasificación', v: r => claseArticulo({ tipo: r.tipo_articulo, desechable: r.desechable, punto_venta: r.punto_venta }) },
     { t: 'Movimiento', v: r => TIPOS_MOV[r.tipo]?.[0] || r.tipo, h: r => etq(TIPOS_MOV[r.tipo]?.[0] || r.tipo, TIPOS_MOV[r.tipo]?.[1]) },
+    { t: 'Saldo anterior', n: 1, v: r => +(r.saldo - r.cantidad).toFixed(5), h: r => `<span class="tenue">${fCant(r.saldo - r.cantidad)}</span>` },
     { t: 'Entrada', n: 1, v: r => r.cantidad > 0 ? r.cantidad : '', h: r => r.cantidad > 0 ? `<span class="pos">${fCant(r.cantidad)}</span>` : '' },
     { t: 'Salida', n: 1, v: r => r.cantidad < 0 ? -r.cantidad : '', h: r => r.cantidad < 0 ? `<span class="neg">${fCant(-r.cantidad)}</span>` : '' },
-    { t: 'Saldo', n: 1, v: r => r.saldo, h: r => `${fCant(r.saldo)} ${esc(r.unidad)}` }, { t: 'Bodega', v: r => r.bodega },
+    { t: 'Stock actual', n: 1, v: r => r.saldo, h: r => `${fCant(r.saldo)} ${esc(r.unidad)}` }, { t: 'Bodega', v: r => r.bodega },
     { t: 'Proveedor', v: r => r.proveedor || '' }, { t: 'Tienda destino', v: r => r.tienda_destino || '' }, { t: 'Motivo merma', v: r => r.motivo || '' },
     { t: 'Referencia', v: r => r.referencia }, { t: 'Usuario', v: r => r.usuario || '' }] });
 };
@@ -1487,7 +1493,10 @@ Vistas.produccion = async v => {
     { t: '', h: r => r.estado === 'VIGENTE' && can('produccion', 2) && puede('anular_produccion') ? `<div class="acciones">${accion('anular', 'Anular', 'peligro')}</div>` : '' }] });
   $('#n', v)?.addEventListener('click', async () => {
     const recs = (await api('GET', '/produccion/recetas')).filter(r => r.tiene_receta);
-    const m = modal('Registrar producción', `<form novalidate><div class="campos"><label class="campo todo"><span>Artículo a fabricar</span><select name="articulo_id"><option value="">Selecciona…</option>${recs.map(r => `<option value="${r.articulo_id}">${esc(r.codigo)} · ${esc(r.nombre)}</option>`).join('')}</select></label>
+    const m = modal('Registrar producción', `<form novalidate><div class="campos">
+      <label class="campo"><span>Categoría</span><select name="p_cat">${opciones([...new Set(recs.map(r => r.categoria))].sort((x, y) => x.localeCompare(y)).map(x => ({ id: x, nombre: x })), '', 'Todas las categorías')}</select></label>
+      <label class="campo"><span>Buscar</span><input name="p_q" type="search" placeholder="Nombre o código" autocomplete="off"></label>
+      <label class="campo todo"><span>Artículo a fabricar <span class="tenue p-cuenta"></span></span><select name="articulo_id"></select></label>
       <label class="campo"><span>Cantidad <span id="u" class="tenue"></span></span>${inputNum('', '', 5).replace('<input', '<input name="cantidad"')}</label><label class="campo"><span>Fecha</span><input type="date" name="fecha" value="${hoy()}"></label>
       <label class="campo todo"><span>Observación</span><input name="obs"></label></div><div id="req" style="margin-top:12px"></div><div class="error" hidden></div>
       <div class="modal-pie"><button type="button" class="btn cerrar">Cancelar</button><button class="btn primario">Registrar y descontar insumos</button></div></form>`, true);
@@ -1503,7 +1512,19 @@ Vistas.produccion = async v => {
         return `<tr><td>${esc(i.nombre)}</td><td class="n">${cantReceta(req, i)}</td><td class="n">${fCant(i.stock)} ${esc(i.unidad)}</td><td>${req > i.stock ? etq('Falta', 'mal') : q ? etq('Alcanza', 'bien') : ''}</td></tr>`;
       }).join('')}</tbody></table></div>`;
     };
-    f.addEventListener('input', pinta); f.articulo_id.addEventListener('change', pinta);
+    // Filtro por categoría y búsqueda por nombre o código (sin tildes); con una sola coincidencia, queda elegido
+    const llenar = () => {
+      const previo = f.articulo_id.value, palabras = sinTilde(f.p_q.value.trim()).split(/\s+/).filter(Boolean);
+      const lista = recs.filter(r => (!f.p_cat.value || r.categoria === f.p_cat.value) && palabras.every(p => sinTilde(`${r.codigo} ${r.nombre}`).includes(p)));
+      f.articulo_id.innerHTML = opciones(lista.map(r => ({ id: r.articulo_id, nombre: `${r.codigo} · ${r.nombre}` })),
+        lista.length === 1 ? lista[0].articulo_id : lista.some(r => String(r.articulo_id) === previo) ? previo : '', lista.length ? 'Selecciona…' : 'Sin coincidencias');
+      $('.p-cuenta', m.el).textContent = `(${fNum(lista.length)} de ${fNum(recs.length)})`;
+      pinta();
+    };
+    f.p_cat.addEventListener('change', llenar); f.p_q.addEventListener('input', llenar);
+    f.p_q.addEventListener('keydown', e => { if (e.key === 'Enter') e.preventDefault(); });
+    llenar();
+    f.addEventListener('input', e => { if (e.target !== f.p_q) pinta(); }); f.articulo_id.addEventListener('change', pinta);
     conEnvio(f, m, async () => {
       await api('POST', '/produccion', { articulo_id: f.articulo_id.value, cantidad: aNum(f.cantidad.value), fecha: f.fecha.value, obs: f.obs.value });
       aviso('Producción registrada: stock actualizado.'); render();
@@ -1619,8 +1640,8 @@ Vistas.despachos = async v => {
     { t: 'Estado', v: r => r.estado === 'ANULADO' ? 'Anulada' : r.recepcion === 'EN_CAMINO' ? 'En camino' : r.recepcion === 'RECIBIDA' ? 'Recibida' : 'Emitida',
       h: r => r.estado === 'ANULADO' ? etq('Anulada', 'mal') : r.recepcion === 'EN_CAMINO' ? etq('En camino', 'alerta')
         : r.recepcion === 'RECIBIDA' ? etq(r.faltantes ? 'Recibida con faltantes' : 'Recibida', r.faltantes ? 'alerta' : 'bien') : etq('Emitida', 'bien') },
-    ...(S.usuario.tienda_id ? [] : [{ t: 'Fudo', v: r => r.fudo_estado, h: estadoFudo }, { t: 'Stock Fudo', v: r => r.fudo_stock_estado, h: estadoStockFudo }]),
-    { t: '', h: r => `<div class="acciones">${accion('ver', 'Ver guía')}${crea && puedeEditarGuia(r) ? accion('editar', 'Editar') : ''}${crea ? accionStockFudo(r) : ''}${crea && puede('enviar_fudo') && r.estado === 'VIGENTE' && !r.fudo_estado ? accion('fudo', 'Enviar a Fudo') : ''}${crea && puede('enviar_fudo') && r.estado === 'VIGENTE' && ['ENVIANDO', 'REVISAR'].includes(r.fudo_estado) ? accion('fudorev', 'Revisar Fudo') : ''}${crea && puede('anular_fudo') && r.estado === 'ANULADO' && r.fudo_estado === 'ENVIADO' ? accion('fudoanula', 'Anular en Fudo', 'peligro') : ''}${r.estado === 'VIGENTE' && crea && puede('anular_despachos') ? accion('anular', 'Anular', 'peligro') : ''}</div>` }] });
+    ...(S.usuario.tienda_id || !S.cat.fudo ? [] : [{ t: 'Fudo', v: r => r.fudo_estado, h: estadoFudo }, { t: 'Stock Fudo', v: r => r.fudo_stock_estado, h: estadoStockFudo }]),
+    { t: '', h: r => `<div class="acciones">${accion('ver', 'Ver guía')}${crea && puedeEditarGuia(r) ? accion('editar', 'Editar') : ''}${crea && S.cat.fudo ? accionStockFudo(r) : ''}${crea && S.cat.fudo && puede('enviar_fudo') && r.estado === 'VIGENTE' && !r.fudo_estado ? accion('fudo', 'Enviar a Fudo') : ''}${crea && puede('enviar_fudo') && r.estado === 'VIGENTE' && ['ENVIANDO', 'REVISAR'].includes(r.fudo_estado) ? accion('fudorev', 'Revisar Fudo') : ''}${crea && puede('anular_fudo') && r.estado === 'ANULADO' && r.fudo_estado === 'ENVIADO' ? accion('fudoanula', 'Anular en Fudo', 'peligro') : ''}${r.estado === 'VIGENTE' && crea && puede('anular_despachos') ? accion('anular', 'Anular', 'peligro') : ''}</div>` }] });
   $('#n', v)?.addEventListener('click', () => formularioGuia());
 };
 // Una guía se puede editar si está vigente, no fue recibida en el POS y no está en Fudo (gasto ni stock)
@@ -1769,7 +1790,7 @@ async function verGuia(id) {
     }, 'Anular guía'));
 }
 function botonesGuiaFudo(g) {
-  if (!can('despachos', 2) || S.usuario.tienda_id || g.estado !== 'VIGENTE') return '';
+  if (!S.cat.fudo || !can('despachos', 2) || S.usuario.tienda_id || g.estado !== 'VIGENTE') return '';
   let b = '';
   if (!puede('enviar_fudo')) { /* sin permiso: no se ofrece enviar */ }
   else if (g.fudo_lista && g.fudo_estado !== 'ENVIADO' && g.fudo_estado !== 'ANULADO')
@@ -2069,6 +2090,17 @@ Vistas.config = async v => {
   });
   $('#qt', v)?.addEventListener('click', async () => { await api('PUT', '/config/logo', { logo: '' }); S.logo = null; marco(); render(); });
   if (edita && !S.usuario.tienda_id) await tarjetaPos(v);
+  if (edita && !S.usuario.tienda_id) {
+    const t = v.appendChild(Object.assign(document.createElement('div'), { className: 'tarjeta' }));
+    t.innerHTML = `<h2>Integración con Fudo</h2><p class="nota">Envío de guías como gastos, stock y sincronización con cuentas Fudo. Desactivada, se ocultan el menú <b>Integración Fudo</b> y las columnas y botones de Fudo en las guías. Las claves y equivalencias guardadas se conservan.</p>
+      <p>${S.cat.fudo ? '<b>Activada.</b>' : '<b>Desactivada.</b>'}</p><button class="btn ${S.cat.fudo ? '' : 'primario'}" id="fudo-act">${S.cat.fudo ? 'Desactivar Fudo' : 'Activar Fudo'}</button>`;
+    $('#fudo-act', t).addEventListener('click', async () => {
+      try {
+        const r = await api('PUT', '/config/fudo', { activo: !S.cat.fudo });
+        S.fudo = r.activo; aviso(r.activo ? 'Integración con Fudo activada.' : 'Integración con Fudo desactivada.'); marco(); render();
+      } catch (x) { aviso(x.message, 1); }
+    });
+  }
 };
 
 async function tarjetaPos(v) {
@@ -2221,7 +2253,7 @@ async function render() {
 }
 async function iniciar() {
   S.estado = await api('GET', '/estado');
-  S.usuario = S.estado.usuario; S.modulos = S.estado.modulos; S.acciones = S.estado.acciones || []; S.logo = S.estado.logo;
+  S.usuario = S.estado.usuario; S.modulos = S.estado.modulos; S.acciones = S.estado.acciones || []; S.logo = S.estado.logo; S.fudo = !!S.estado.fudo;
   if (!S.usuario) return pantallaAcceso();
   S.menuSinMarca = true;  // recién ingresado: ninguna opción del menú aparece marcada
   marco();

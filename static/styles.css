@@ -153,6 +153,7 @@ tbody tr.grupo:hover td { background: var(--celeste-claro); }
 .modal-fondo { position: fixed; inset: 0; background: rgba(20,22,24,.55); display: flex; align-items: flex-start; justify-content: center; padding: 32px 16px; overflow-y: auto; z-index: 20; }
 .modal { background: #fff; border-radius: 10px; width: 100%; max-width: 520px; padding: 20px; }
 .modal.ancho { max-width: 900px; }
+.modal.ancho:has(.lineas input.o) { max-width: 1120px; } /* compras: cabe la observación por línea sin desplazarse */
 .modal-cab { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
 .modal-cab h2 { font-size: 18px; }
 .modal-cab button { background: none; border: 0; font-size: 22px; line-height: 1; cursor: pointer; color: var(--tinta-2); padding: 2px 6px; }
@@ -171,6 +172,8 @@ tbody tr.grupo:hover td { background: var(--celeste-claro); }
 .lineas select { min-width: 190px; }
 .lineas input.busca { min-width: 240px; }
 .lineas input.num { min-width: 90px; }
+.lineas input.num.q, .lineas input.num.p { min-width: 150px; }
+.lineas input.o { min-width: 220px; width: 100%; } /* observación por línea (compras) */ /* cantidad y precio: caben miles con decimales (ej. 1.234,56789) */
 .combo-lista { position: fixed; z-index: 30; background: #fff; border: 1px solid #b9bcc0; border-radius: 6px; box-shadow: 0 6px 20px rgba(0,0,0,.25); overflow-y: auto; color: var(--tinta); }
 .combo-grupo { position: sticky; top: 0; background: var(--suave); padding: 5px 10px; font-size: 12.5px; font-weight: 700; color: var(--tinta-2); }
 .combo-op { padding: 8px 10px; cursor: pointer; border-top: 1px solid var(--borde); }

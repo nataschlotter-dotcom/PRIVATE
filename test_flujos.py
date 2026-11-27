@@ -170,6 +170,17 @@ casi(A("GET", "/reportes/panel")["kpis"]["valor_central"], sum(x["cantidad"] * x
 A("POST", "/compras", {"tipo_documento": "FACTURA", "proveedor_id": prov, "items": [{"articulo_id": torta, "cantidad": 1, "precio": 1}]}, 400)  # solo insumos
 A("POST", "/compras", {"tipo_documento": "FACTURA", "proveedor_id": prov, "items": [{"articulo_id": harina, "cantidad": -1, "precio": 1}]}, 400)
 A("POST", "/compras", {"tipo_documento": "FACTURA", "proveedor_id": prov, "items": []}, 400)
+# observación por línea de la compra: hasta 70 caracteres, también al editar
+A("POST", "/compras", {"tipo_documento": "FACTURA", "proveedor_id": prov, "items": [{"articulo_id": harina, "cantidad": 1, "precio": 1, "obs": "x" * 71}]}, 400)
+co_obs = A("POST", "/compras", {"tipo_documento": "BOLETA", "proveedor_id": prov, "items": [{"articulo_id": vaso, "cantidad": 1, "precio": 50, "obs": "o" * 70},
+                                                                                         {"articulo_id": harina, "cantidad": 1, "precio": 1000}]})["id"]
+assert {i["articulo_id"]: i["obs"] for i in A("GET", f"/compras/{co_obs}")["items"]} == {vaso: "o" * 70, harina: ""}
+assert A("GET", f"/movimientos?desde=2000-01-01&articulo_id={vaso}&tipo=COMPRA")[0]["obs"] == "o" * 70  # se ve en el historial
+r_obs = A("PUT", f"/compras/{co_obs}", {"tipo_documento": "BOLETA", "proveedor_id": prov, "items": [{"articulo_id": vaso, "cantidad": 1, "precio": 50, "obs": "caja dañada"},
+                                                                                                {"articulo_id": harina, "cantidad": 1, "precio": 1000}]})
+assert any("observación" in x and "caja dañada" in x for x in r_obs["cambios"]), r_obs
+assert {i["articulo_id"]: i["obs"] for i in A("GET", f"/compras/{co_obs}")["items"]}[vaso] == "caja dañada"
+A("POST", f"/compras/{co_obs}/anular", {})
 
 # Recetas: desechable y producto no pueden ser ingrediente; sin ciclos
 A("PUT", f"/recetas/{base}", {"rendimiento": 1, "items": [{"articulo_id": vaso, "cantidad": 1}]}, 400)
@@ -482,6 +493,11 @@ threading.Thread(target=falso.serve_forever, daemon=True).start()
 app.FUDO_API = f"http://127.0.0.1:{falso.server_address[1]}/api"
 app.FUDO_AUTH = f"http://127.0.0.1:{falso.server_address[1]}/auth"
 gf = A("POST", "/despachos", {"tienda_id": tienda2, "fecha": "2026-03-04", "items": [{"articulo_id": vaso, "cantidad": 2}]})["id"]
+# Fudo viene desactivado: sus rutas responden 409 hasta activarlo en Configuración
+assert A("GET", "/estado")["fudo"] is False and A("GET", "/catalogos")["fudo"] is False
+A("GET", "/fudo", esperado=409); A("POST", f"/despachos/{gf}/fudo", {}, 409); A("POST", f"/despachos/{gf}/fudo-stock", {}, 409)
+assert A("PUT", "/config/fudo", {"activo": True})["activo"] is True
+assert A("GET", "/estado")["fudo"] is True
 for cli in (T, P):
     cli("POST", f"/despachos/{gf}/fudo", {}, 403); cli("GET", "/fudo", esperado=403)
     cli("PUT", f"/fudo/{tienda2}/credenciales", {"api_key": "k", "api_secret": "s"}, 403)
@@ -1262,6 +1278,57 @@ app.recibir_despacho(c, gc, tpos, {}, "Ana", "", "REC-EDIT-1")
 c.commit(); c.close()
 casi(stock(tpos)[edv], 8)
 A("PUT", f"/despachos/{gc}", {"items": [{"articulo_id": edv, "cantidad": 2}]}, 409)
+# Corrección en el POS de lo recibido: la diferencia va entre la tienda y la central, idempotente por referencia
+cr = {"referencia": "POSRED-T-1", "tienda_id": tpos, "despacho_id": gc, "responsable": "Ana", "motivo": "Se contó mal",
+      "items": [{"articulo_id": edv, "recibido": 6}]}
+clave = A("POST", "/config/pos/token", {})["token"]
+P("POST", "/pos/despachos/editar-recepcion", cr, token="mala", esperado=401)
+r = P("POST", "/pos/despachos/editar-recepcion", cr, token=clave)
+assert r["cambios"] and "8 → 6" in r["cambios"][0], r
+casi(stock(tpos)[edv], 6); casi(stock()[edv], 44)
+P("POST", "/pos/despachos/editar-recepcion", cr, token=clave)  # reintento: no se aplica dos veces
+casi(stock(tpos)[edv], 6); casi(stock()[edv], 44)
+P("POST", "/pos/despachos/editar-recepcion", {**cr, "referencia": "POSRED-T-2", "items": [{"articulo_id": edv, "recibido": 9}]}, token=clave, esperado=400)  # más de lo despachado
+P("POST", "/pos/despachos/editar-recepcion", {**cr, "referencia": "POSRED-T-3"}, token=clave, esperado=400)  # sin cambios (ya es 6)
+P("POST", "/pos/despachos/editar-recepcion", {**cr, "referencia": "POSRED-T-4", "motivo": "", "items": [{"articulo_id": edv, "recibido": 7}]}, token=clave, esperado=400)
+P("POST", "/pos/despachos/editar-recepcion", {**cr, "referencia": "POSRED-T-5", "items": [{"articulo_id": harina, "recibido": 1}]}, token=clave, esperado=400)
+r = P("POST", "/pos/despachos/editar-recepcion", {**cr, "referencia": "POSRED-T-6", "motivo": "Apareció una caja", "items": [{"articulo_id": edv, "recibido": 8}]}, token=clave)
+casi(stock(tpos)[edv], 8); casi(stock()[edv], 42)
+g_pos = next(g for g in P("GET", f"/pos/despachos?tienda_id={tpos}", token=clave)["guias"] if g["id"] == gc)
+assert len(g_pos["correcciones"]) == 2 and g_pos["correcciones"][0]["motivo"] == "Se contó mal"
+casi(next(i for i in g_pos["items"] if i["articulo_id"] == edv)["recibido"], 8)
+ed_guia = A("GET", f"/despachos/{gc}")["ediciones"]  # producción ve las correcciones en la guía (más la edición 5 → 8 de antes)
+assert len(ed_guia) == 3 and "Recepción corregida en el POS por Ana" in ed_guia[1]["detalle"], ed_guia
+c = app.conectar()
+assert c.execute("SELECT COUNT(*) FROM movimientos WHERE tipo='AJUSTE_RECEPCION' AND doc_id=?", (gc,)).fetchone()[0] == 4  # 2 correcciones × (tienda + central)
+c.close()
+gc2 = A("POST", "/despachos", {"tienda_id": tpos, "items": [{"articulo_id": edv, "cantidad": 1}]})["id"]  # en camino: aún no se corrige
+P("POST", "/pos/despachos/editar-recepcion", {**cr, "referencia": "POSRED-T-7", "despacho_id": gc2, "items": [{"articulo_id": edv, "recibido": 0}]}, token=clave, esperado=409)
+# Mermas registradas en el POS: bajan el stock de la tienda (aunque quede negativo), idempotentes, y se anulan
+mm = P("GET", f"/pos/mermas?tienda_id={tpos}", token=clave)
+assert mm["motivos"] and mm["mermas"] == []
+mot = mm["motivos"][0]["id"]
+casi(stock(tpos)[edv], 8)
+merma_pos = {"referencia": "POSMER-T-1", "tienda_id": tpos, "responsable": "Ana", "fecha_hora": "2026-11-27 10:15:00",
+             "items": [{"articulo_id": edv, "cantidad": 2, "motivo_id": mot, "obs": "se cayeron"}]}
+P("POST", "/pos/mermas", merma_pos, token="mala", esperado=401)
+r = P("POST", "/pos/mermas", merma_pos, token=clave)
+assert len(r["mermas"]) == 1 and r["mermas"][0]["obs"] == "POS · Ana · se cayeron"
+casi(stock(tpos)[edv], 6)
+assert P("POST", "/pos/mermas", merma_pos, token=clave)["repetido"] is True  # reintento: no descuenta dos veces
+casi(stock(tpos)[edv], 6)
+P("POST", "/pos/mermas", {**merma_pos, "referencia": "POSMER-T-2", "items": [{"articulo_id": harina, "cantidad": 1, "motivo_id": mot}]}, token=clave, esperado=404)  # no se maneja en tiendas
+P("POST", "/pos/mermas", {**merma_pos, "referencia": "POSMER-T-3", "items": [{"articulo_id": edv, "cantidad": 0, "motivo_id": mot}]}, token=clave, esperado=400)
+P("POST", "/pos/mermas", {**merma_pos, "referencia": "POSMER-T-4", "items": [{"articulo_id": edv, "cantidad": 1, "motivo_id": 99999}]}, token=clave, esperado=400)
+r2 = P("POST", "/pos/mermas", {**merma_pos, "referencia": "POSMER-T-5", "items": [{"articulo_id": edv, "cantidad": 9, "motivo_id": mot}]}, token=clave)
+casi(stock(tpos)[edv], -3)  # como las ventas del POS: la merma ya ocurrió
+lista_m = P("GET", f"/pos/mermas?tienda_id={tpos}&desde=2026-01-01&hasta=2026-12-31", token=clave)["mermas"]
+assert len(lista_m) == 2 and {x["referencia"] for x in lista_m} == {"POSMER-T-1", "POSMER-T-5"}
+P("POST", "/pos/mermas/anular", {"tienda_id": tienda2, "merma_id": r2["mermas"][0]["id"]}, token=clave, esperado=404)  # de otra tienda
+P("POST", "/pos/mermas/anular", {"tienda_id": tpos, "merma_id": r2["mermas"][0]["id"], "motivo": "error de digitación", "responsable": "Ana"}, token=clave)
+casi(stock(tpos)[edv], 6)
+assert P("POST", "/pos/mermas/anular", {"tienda_id": tpos, "merma_id": r2["mermas"][0]["id"]}, token=clave)["repetido"] is True
+assert any(m["id"] == r2["mermas"][0]["id"] and m["estado"] == "ANULADO" for m in A("GET", "/mermas?desde=2026-01-01&hasta=2026-12-31"))
 # sin el permiso de edición (acción crítica), el perfil no puede editar
 perf = {p["nombre"]: p for p in A("GET", "/perfiles")}
 assert "acc_editar_compras" not in json.dumps(perf["Gerencia"]["permisos"])
